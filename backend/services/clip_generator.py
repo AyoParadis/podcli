@@ -662,6 +662,7 @@ def generate_clip(
     intro_path: Optional[str] = None,
     clean_fillers: bool = True,
     keep_segments: list[dict] = None,
+    ordered_segments: list[dict] = None,
     trim_opening: Optional[bool] = None,
     allow_ass_fallback: bool = False,
     use_ass_captions: bool = False,
@@ -707,10 +708,18 @@ def generate_clip(
     if end_second <= start_second:
         raise ValueError("end_second must be greater than start_second")
 
+    requested_start_second, requested_end_second = start_second, end_second
+    ordered_mode = bool(ordered_segments)
+    if ordered_mode:
+        keep_segments = [dict(s) for s in ordered_segments if s["end"] > s["start"]]
+        if not keep_segments:
+            raise ValueError("ordered_segments must contain at least one valid range")
+        face_map = None
+
     spec = get_format(format)
 
     if trim_opening is None:
-        trim_opening = not (keep_segments and len(keep_segments) > 0)
+        trim_opening = not (keep_segments and len(keep_segments) > 0) and not ordered_mode
 
     llm_start_second, llm_end_second = start_second, end_second
     orig_keep_segments = None
@@ -727,9 +736,10 @@ def generate_clip(
     if keep_segments and len(keep_segments) > 0:
         # Validate segments from Claude
         keep_segments = [s for s in keep_segments if s["end"] > s["start"]]
-        keep_segments.sort(key=lambda s: s["start"])
+        if not ordered_mode:
+            keep_segments.sort(key=lambda s: s["start"])
 
-        if trim_opening and transcript_words:
+        if not ordered_mode and trim_opening and transcript_words:
             trimmed_start = _trim_weak_opening(
                 transcript_words,
                 keep_segments[0]["start"],
@@ -738,7 +748,7 @@ def generate_clip(
             if trimmed_start < keep_segments[0]["end"] - 0.5:
                 keep_segments[0]["start"] = trimmed_start
 
-        if transcript_words:
+        if not ordered_mode and transcript_words:
             snapped_end = _snap_to_sentence_end(
                 transcript_words,
                 keep_segments[-1]["start"],
@@ -752,7 +762,7 @@ def generate_clip(
 
         # If Claude returned a single segment, still auto-trim pauses within it.
         # Multiple segments means Claude made deliberate editorial cuts — trust those.
-        if len(keep_segments) == 1 and transcript_words and clean_fillers:
+        if not ordered_mode and len(keep_segments) == 1 and transcript_words and clean_fillers:
             auto_segments = _build_tight_segments(
                 transcript_words, start_second, end_second,
             )
@@ -782,7 +792,7 @@ def generate_clip(
             keep_segments = None
             duration = end_second - start_second
 
-    if duration < 0.75 * llm_total and llm_total >= 8.0:
+    if not ordered_mode and duration < 0.75 * llm_total and llm_total >= 8.0:
         print(
             f"  Boundary revert: post-trim duration {duration:.1f}s < "
             f"75% of asked {llm_total:.1f}s - using original range",
@@ -825,14 +835,15 @@ def generate_clip(
             progress_callback(10, msg)
 
         segment_path = os.path.join(work_dir, "segment.mp4")
-        if keep_segments and len(keep_segments) > 1:
-            cut_multi_segment(video_path, segment_path, keep_segments)
+        assembled_segments = bool(keep_segments and (ordered_mode or len(keep_segments) > 1))
+        if assembled_segments:
+            cut_multi_segment(video_path, segment_path, keep_segments, declick=ordered_mode)
         else:
             cut_segment(video_path, segment_path, start_second, end_second)
 
         # Remap transcript words for multi-segment clips.
         # Needed before crop (speaker detection) and captions.
-        if keep_segments and len(keep_segments) > 1 and transcript_words:
+        if assembled_segments and transcript_words:
             remapped_words = []
             cumulative_t = 0.0
             for seg in keep_segments:
@@ -888,7 +899,7 @@ def generate_clip(
             if progress_callback:
                 progress_callback(50, f"Adding {caption_style} captions (3/{total_steps})")
 
-            if keep_segments and len(keep_segments) > 1:
+            if assembled_segments:
                 clip_words = remapped_words
             else:
                 clip_words = [
@@ -1035,8 +1046,11 @@ def generate_clip(
             "duration": round(duration, 2),
             "file_size_mb": file_size_mb,
             "title": title,
-            "start_second": start_second,
-            "end_second": end_second,
+            # Ordered edits may start in a later source section and finish in an
+            # earlier one. Report the caller's edited coordinates, never a
+            # nonsensical source range such as 8s → 2s.
+            "start_second": requested_start_second if ordered_mode else start_second,
+            "end_second": requested_end_second if ordered_mode else end_second,
             "caption_style": caption_style,
             "crop_strategy": crop_strategy,
             "format": spec.name,

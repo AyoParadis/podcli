@@ -1,5 +1,5 @@
 import React from "react";
-import { NavLink, Link, Outlet } from "react-router-dom";
+import { NavLink, Link, Outlet, useLocation } from "react-router-dom";
 import {
   LayoutGrid,
   Play,
@@ -28,6 +28,7 @@ const icons: Record<string, typeof LayoutGrid> = {
   analytics: BarChart3,
   highlights: Scissors,
   assets: Package,
+  editor: Scissors,
 };
 
 function Icon({ name }: { name: string }) {
@@ -36,9 +37,12 @@ function Icon({ name }: { name: string }) {
 }
 
 export default function Layout() {
+  const location = useLocation();
+  const isFocusedEditor = /^\/editor\/[^/]+\/?$/.test(location.pathname);
+
   return (
-    <div className="shell">
-      <aside className="sidebar">
+    <div className={`shell ${isFocusedEditor ? "editor-focus-shell" : ""}`}>
+      {!isFocusedEditor && <aside className="sidebar">
         <Link to="/" className="sidebar-logo">
           <img src="/podcli-logo.svg" alt="podcli" />
         </Link>
@@ -52,6 +56,7 @@ export default function Layout() {
         <div className="sidebar-section">Studio</div>
         <NavLink to="/" end className="sidebar-link"><Icon name="library" /> Library</NavLink>
         <NavLink to="/episode" className="sidebar-link"><Icon name="episode" /> New episode</NavLink>
+        <NavLink to="/editor" className="sidebar-link"><Icon name="editor" /> Editor</NavLink>
         <NavLink to="/content" className="sidebar-link"><Icon name="content" /> Content</NavLink>
         <NavLink to="/highlights" className="sidebar-link"><Icon name="highlights" /> Highlights</NavLink>
         <NavLink to="/thumbnails" className="sidebar-link"><Icon name="thumbnail" /> Thumbnails</NavLink>
@@ -65,7 +70,7 @@ export default function Layout() {
 
         <div className="sidebar-section">Insights</div>
         <NavLink to="/analytics" className="sidebar-link"><Icon name="analytics" /> Analytics</NavLink>
-      </aside>
+      </aside>}
 
       <main className="shell-main">
         <Outlet />

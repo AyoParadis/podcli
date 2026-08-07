@@ -106,6 +106,8 @@ export interface SuggestedClip {
   timestamp_display?: string;
   content_type?: string;
   score?: number;
+  edit_project_id?: string;
+  edit_revision?: number;
 }
 
 export interface UIState {
@@ -114,6 +116,8 @@ export interface UIState {
   activeExportJobId?: string | null;
   transcript?: TranscriptResult | null;
   rawTranscriptText?: string;
+  activeEditProjectId?: string;
+  activeEditRevision?: number;
   silenceOriginal?: { videoPath: string; transcript: TranscriptResult } | null;
   silencePlan?: Record<string, unknown> | null;
   suggestions?: SuggestedClip[];
@@ -132,6 +136,64 @@ export interface UIState {
   };
   phase?: string;
   lastUpdated?: number;
+}
+
+// === Non-destructive episode editing ===
+
+export interface TimelineSegment {
+  id: string;
+  source_start: number;
+  source_end: number;
+}
+
+export interface EditProjectSource {
+  path: string;
+  fingerprint: string;
+  filename: string;
+  duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  has_audio: boolean;
+}
+
+export interface EditProject {
+  schema_version: 1;
+  id: string;
+  name: string;
+  source: EditProjectSource;
+  timeline: TimelineSegment[];
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  trashed_at?: string;
+}
+
+export type EditOperation =
+  | { type: "split"; segment_id: string; source_time: number }
+  | { type: "trim"; segment_id: string; edge: "start" | "end"; source_time: number }
+  | { type: "delete_range"; timeline_start: number; timeline_end: number }
+  | { type: "reorder"; segment_id: string; before_segment_id: string | null }
+  | { type: "undo" }
+  | { type: "redo" }
+  | { type: "rename"; name: string };
+
+export interface EditProjectSummary {
+  id: string;
+  name: string;
+  source_filename: string;
+  original_duration: number;
+  edited_duration: number;
+  removed_duration: number;
+  revision: number;
+  updated_at: string;
+  trashed_at?: string;
+  source_missing: boolean;
+}
+
+export interface OrderedSourceSlice {
+  start: number;
+  end: number;
 }
 
 export interface CreateClipInput {
@@ -164,6 +226,7 @@ export interface BatchClipSpec {
   allow_ass_fallback?: boolean;
   keep_caption_overlay?: boolean;
   keep_segments?: Array<{ start: number; end: number }>;
+  ordered_segments?: Array<{ start: number; end: number }>;
 }
 
 export interface BatchClipsInput {
@@ -176,6 +239,8 @@ export interface BatchClipsInput {
   clean_fillers?: boolean;
   allow_ass_fallback?: boolean;
   keep_caption_overlay?: boolean;
+  edit_project_id?: string;
+  edit_revision?: number;
   /**
    * When true, POST to the Web UI's /api/batch-clips and return a job_id
    * immediately so the caller can poll job_status and emit live progress.
@@ -273,6 +338,9 @@ export interface ClipHistoryEntry {
   content_type?: string;
   transcript_slice?: string;
   keep_segments?: Array<{ start: number; end: number }>;
+  ordered_segments?: Array<{ start: number; end: number }>;
+  edit_project_id?: string;
+  edit_revision?: number;
   thumbnail_config?: ClipThumbnailConfig;
   youtube_video_id?: string;
   metrics?: ClipPerformanceMetrics;

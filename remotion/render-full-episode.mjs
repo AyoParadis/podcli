@@ -5,8 +5,8 @@
  *
  * A full-length transparent ProRes overlay can consume tens of gigabytes. This
  * renderer instead creates one short overlay at a time, composites it, deletes
- * it, then losslessly concatenates the compressed video chunks and remuxes the
- * source audio.
+ * it, then losslessly concatenates compressed chunks. Unedited exports remux
+ * original audio once; edited exports assemble audio with each ordered slice.
  */
 
 import { renderMedia, selectComposition } from "@remotion/renderer";
@@ -17,6 +17,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { orderedDuration, outputSlicePlan } from "./ordered-segments.mjs";
 
 const parseArgs = () => {
   const out = {};
@@ -63,12 +64,14 @@ const styleName = args.style || "branded";
 const captionPosition = args["caption-position"] || "auto";
 const captionFontScale = Number(args["caption-font-scale"] || 100);
 const logoPosition = args["logo-position"] || "top-left";
+const segmentsPath = args.segments ? path.resolve(args.segments) : null;
 const fps = Number(args.fps || 30);
 const chunkSeconds = Number(args["chunk-seconds"] || 15);
 
 if (fs.existsSync(output)) throw new Error(`Refusing to overwrite existing output: ${output}`);
 if (!fs.existsSync(video)) throw new Error(`Video not found: ${video}`);
 if (!fs.existsSync(wordsPath)) throw new Error(`Words JSON not found: ${wordsPath}`);
+if (segmentsPath && !fs.existsSync(segmentsPath)) throw new Error(`Segments JSON not found: ${segmentsPath}`);
 if (logo && !fs.existsSync(logo)) throw new Error(`Logo not found: ${logo}`);
 if (!(fps > 0) || !(chunkSeconds > 0)) throw new Error("fps and chunk-seconds must be positive");
 
@@ -80,11 +83,32 @@ const dimensions = run(args.ffprobe, [
   "-of", "csv=s=x:p=0", video,
 ]);
 const [width, height] = dimensions.split("x").map(Number);
-const duration = Number(run(args.ffprobe, [
+const sourceDuration = Number(run(args.ffprobe, [
   "-v", "error", "-show_entries", "format=duration",
   "-of", "default=noprint_wrappers=1:nokey=1", video,
 ]));
-if (!(width > 0 && height > 0 && duration > 0)) throw new Error("Could not probe video");
+if (!(width > 0 && height > 0 && sourceDuration > 0)) throw new Error("Could not probe video");
+
+const orderedSegments = segmentsPath
+  ? JSON.parse(fs.readFileSync(segmentsPath, "utf8")).map((segment) => ({
+      start: Number(segment.start),
+      end: Number(segment.end),
+    }))
+  : null;
+if (orderedSegments && (!orderedSegments.length || orderedSegments.some((segment) =>
+  !(segment.start >= 0 && segment.end > segment.start && segment.end <= sourceDuration + 0.001)
+))) {
+  throw new Error("Invalid ordered source segments");
+}
+const duration = orderedSegments
+  ? orderedDuration(orderedSegments)
+  : sourceDuration;
+const audioProbe = run(args.ffprobe, [
+  "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+  "-of", "csv=p=0", video,
+]);
+const hasAudio = Boolean(audioProbe.trim());
+const assembleChunkAudio = Boolean(orderedSegments && hasAudio);
 
 const durationInFrames = Math.ceil(duration * fps);
 const framesPerChunk = Math.max(1, Math.round(chunkSeconds * fps));
@@ -92,6 +116,29 @@ const outputDir = path.dirname(output);
 fs.mkdirSync(outputDir, { recursive: true });
 const workDir = fs.mkdtempSync(path.join(outputDir, ".podcli-full-caption-work-"));
 let server;
+
+let preferredVideoCodec;
+try {
+  const encoders = run(args.ffmpeg, ["-hide_banner", "-encoders"]);
+  preferredVideoCodec = process.platform === "darwin" && encoders.includes("h264_videotoolbox")
+    ? "h264_videotoolbox"
+    : "libx264";
+} catch {
+  preferredVideoCodec = "libx264";
+}
+
+const encodeVideo = (baseArgs, outputPath) => {
+  const codecArgs = preferredVideoCodec === "h264_videotoolbox"
+    ? ["-c:v", "h264_videotoolbox", "-q:v", "65", "-allow_sw", "1"]
+    : ["-c:v", "libx264", "-crf", "18", "-preset", "fast"];
+  try {
+    run(args.ffmpeg, [...baseArgs, ...codecArgs, outputPath]);
+  } catch (error) {
+    if (preferredVideoCodec !== "h264_videotoolbox") throw error;
+    preferredVideoCodec = "libx264";
+    run(args.ffmpeg, [...baseArgs, "-c:v", "libx264", "-crf", "18", "-preset", "fast", outputPath]);
+  }
+};
 
 const cleanup = () => {
   try { server?.close(); } catch {}
@@ -181,16 +228,54 @@ try {
     });
 
     progress(5 + ((index + 1) / chunkCount) * 80, `Compositing section ${index + 1}/${chunkCount}`);
-    run(args.ffmpeg, [
+    const slices = outputSlicePlan(orderedSegments, startSeconds, startSeconds + sectionDuration);
+    if (!slices.length) throw new Error(`No source slices for output section ${index + 1}`);
+    const inputs = [];
+    for (const slice of slices) {
+      inputs.push(
+        "-ss", slice.start.toFixed(6),
+        "-t", (slice.end - slice.start).toFixed(6),
+        "-i", video,
+      );
+    }
+    inputs.push("-i", overlay);
+
+    const filters = [];
+    const videoLabels = [];
+    const audioLabels = [];
+    for (let sliceIndex = 0; sliceIndex < slices.length; sliceIndex++) {
+      videoLabels.push(`[sv${sliceIndex}]`);
+      filters.push(`[${sliceIndex}:v]setpts=PTS-STARTPTS[sv${sliceIndex}]`);
+      if (assembleChunkAudio) {
+        const sliceDuration = slices[sliceIndex].end - slices[sliceIndex].start;
+        const fades = [];
+        if (slices[sliceIndex].fadeIn) fades.push("afade=t=in:st=0:d=0.005");
+        if (slices[sliceIndex].fadeOut) fades.push(`afade=t=out:st=${Math.max(0, sliceDuration - 0.005)}:d=0.005`);
+        audioLabels.push(`[sa${sliceIndex}]`);
+        filters.push(`[${sliceIndex}:a]asetpts=PTS-STARTPTS${fades.length ? `,${fades.join(",")}` : ""}[sa${sliceIndex}]`);
+      }
+    }
+    let baseVideo = videoLabels[0];
+    let baseAudio = assembleChunkAudio ? audioLabels[0] : null;
+    if (slices.length > 1) {
+      if (assembleChunkAudio) {
+        filters.push(`${videoLabels.map((label, sliceIndex) => `${label}${audioLabels[sliceIndex]}`).join("")}concat=n=${slices.length}:v=1:a=1[basev][basea]`);
+        baseVideo = "[basev]";
+        baseAudio = "[basea]";
+      } else {
+        filters.push(`${videoLabels.join("")}concat=n=${slices.length}:v=1:a=0[basev]`);
+        baseVideo = "[basev]";
+      }
+    }
+    filters.push(`${baseVideo}[${slices.length}:v]overlay=0:0:shortest=1,format=yuv420p[v]`);
+    encodeVideo([
       "-y", "-hide_banner", "-loglevel", "error",
-      "-ss", startSeconds.toFixed(6), "-t", sectionDuration.toFixed(6), "-i", video,
-      "-i", overlay,
-      "-filter_complex", "[0:v][1:v]overlay=0:0:shortest=1,format=yuv420p[v]",
-      "-map", "[v]", "-an",
-      "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+      ...inputs,
+      "-filter_complex", filters.join(";"),
+      "-map", "[v]", ...(baseAudio ? ["-map", baseAudio, "-c:a", "aac", "-b:a", "192k"] : ["-an"]),
       "-r", String(fps), "-g", String(fps * 2),
-      "-movflags", "+faststart", chunk,
-    ]);
+      "-movflags", "+faststart",
+    ], chunk);
     fs.rmSync(overlay, { force: true });
     chunks.push(chunk);
   }
@@ -204,12 +289,17 @@ try {
     "-i", listPath, "-c", "copy", "-movflags", "+faststart", videoOnly,
   ]);
 
-  progress(96, "Adding original audio");
-  run(args.ffmpeg, [
-    "-y", "-hide_banner", "-loglevel", "error", "-i", videoOnly, "-i", video,
-    "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy", "-shortest",
-    "-movflags", "+faststart", partialOutput,
-  ]);
+  if (orderedSegments) {
+    progress(96, "Finalizing edited episode");
+    fs.renameSync(videoOnly, partialOutput);
+  } else {
+    progress(96, "Adding original audio");
+    run(args.ffmpeg, [
+      "-y", "-hide_banner", "-loglevel", "error", "-i", videoOnly, "-i", video,
+      "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy", "-shortest",
+      "-movflags", "+faststart", partialOutput,
+    ]);
+  }
   fs.renameSync(partialOutput, output);
   progress(100, "Full episode ready");
 } finally {

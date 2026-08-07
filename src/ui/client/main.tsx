@@ -14,6 +14,8 @@ import KnowledgePage from "./KnowledgePage";
 import ConfigPage from "./ConfigPage";
 import IntegrationsPage from "./IntegrationsPage";
 import McpSetupPage from "./McpSetupPage";
+import EpisodeEditor from "./EpisodeEditor";
+import EditProjectsPage from "./EditProjectsPage";
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
@@ -22,6 +24,8 @@ createRoot(document.getElementById("root")!).render(
         <Route element={<Layout />}>
           <Route path="/" element={<StudioHome />} />
           <Route path="/episode" element={<EpisodeWorkspace />} />
+          <Route path="/editor" element={<EditProjectsPage />} />
+          <Route path="/editor/:id" element={<EpisodeEditor />} />
           <Route path="/content" element={<ContentStudio />} />
           <Route path="/highlights" element={<HighlightsPage />} />
           <Route path="/reel" element={<Navigate to="/highlights" replace />} />

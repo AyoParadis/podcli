@@ -20,7 +20,7 @@ import {
   chmodSync,
   realpathSync,
 } from "fs";
-import { mkdir, readdir, unlink } from "fs/promises";
+import { mkdir, readdir, rm, unlink } from "fs/promises";
 import path from "path";
 import { join, dirname, basename, extname, resolve } from "path";
 import { execSync, execFileSync, spawn } from "child_process";
@@ -36,6 +36,7 @@ import { FileManager } from "../services/file-manager.js";
 import { AssetManager, inferType, safeName } from "../services/asset-manager.js";
 import { ClipsHistory } from "../services/clips-history.js";
 import { KnowledgeBase } from "../services/knowledge-base.js";
+import { EditProjectConflictError, EditProjectStore } from "../services/edit-project-store.js";
 import { paths, pythonEnv } from "../config/paths.js";
 import { webServerPort } from "../config/server.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
@@ -44,9 +45,10 @@ import { advanceProgress, tagSubmittedClip, tagSubmittedClips } from "../utils/c
 import { DEMO_ASSETS_DIR } from "./demo-fixtures.js";
 import { registerConfigIntegrationRoutes } from "../handlers/integrations.routes.js";
 import { childLogger } from "../utils/logger.js";
-import { sliceTranscript, sliceWords, findContentType, findSuggestionSegments } from "../utils/transcript.js";
+import { sliceTranscript, findContentType, findSuggestionSegments } from "../utils/transcript.js";
 import { errMsg } from "../utils/errors.js";
 import { resolveByteRange } from "../utils/http-range.js";
+import { editedDuration, mapEditedClipToSource, remapTranscript, retainSourceRanges } from "../utils/edit-project.js";
 import {
   FULL_EPISODE_CAPTION_STYLES,
   fullEpisodeOutputStem,
@@ -62,6 +64,7 @@ import type {
   SuggestedClip,
   TranscriptResult,
   WordTimestamp,
+  EditOperation,
 } from "../models/index.js";
 
 const log = childLogger("web-server");
@@ -83,6 +86,8 @@ const fileManager = new FileManager();
 const assetManager = new AssetManager();
 const clipsHistory = new ClipsHistory();
 const knowledgeBase = new KnowledgeBase();
+const editProjects = new EditProjectStore();
+editProjects.purgeExpiredTrash();
 
 // --- Path Traversal Protection ---
 function safePath(base: string, filename: string): string | null {
@@ -97,7 +102,7 @@ function safePath(base: string, filename: string): string | null {
 // Track active jobs so the UI can poll progress
 interface JobState {
   id: string;
-  type: "transcribe" | "create_clip" | "batch_clips" | "download_video" | "full_episode" | "silence_analysis" | "silence_render";
+  type: "transcribe" | "create_clip" | "batch_clips" | "download_video" | "full_episode" | "silence_analysis" | "silence_render" | "edit_preview";
   status: "pending" | "running" | "done" | "error";
   progress: number;
   message: string;
@@ -106,6 +111,8 @@ interface JobState {
   createdAt: number;
   finishedAt?: number;
   clip_results?: unknown[];
+  editProjectId?: string;
+  editRevision?: number;
 }
 
 const jobs = new Map<string, JobState>();
@@ -139,6 +146,14 @@ type SilencePlan = {
   cut_count: number;
   [key: string]: unknown;
 };
+type EditSilenceProposal = {
+  id: string;
+  projectId: string;
+  revision: number;
+  timeline: Array<{ id: string; source_start: number; source_end: number }>;
+  analysis: SilencePlan;
+};
+const editSilenceProposals = new Map<string, EditSilenceProposal>();
 
 // Store the latest transcript per uploaded file for the session
 const sessionTranscripts = new Map<string, ServerTranscript>();
@@ -150,6 +165,8 @@ interface UIState {
   activeExportJobId: string | null;
   transcript: ServerTranscript | null;
   rawTranscriptText: string;
+  activeEditProjectId?: string;
+  activeEditRevision?: number;
   silenceOriginal: SilenceOriginal | null;
   silencePlan: SilencePlan | null;
   suggestions: SuggestedClip[];
@@ -197,6 +214,8 @@ function loadPersistedState(): UIState {
         activeExportJobId: null,
         transcript: saved.transcript || null,
         rawTranscriptText: saved.rawTranscriptText || "",
+        activeEditProjectId: saved.activeEditProjectId || undefined,
+        activeEditRevision: Number.isInteger(saved.activeEditRevision) ? saved.activeEditRevision : undefined,
         silenceOriginal: saved.silenceOriginal || null,
         silencePlan: saved.silencePlan || null,
         suggestions: saved.suggestions || [],
@@ -239,6 +258,8 @@ function loadPersistedState(): UIState {
     activeExportJobId: null,
     transcript: null,
     rawTranscriptText: "",
+    activeEditProjectId: undefined,
+    activeEditRevision: undefined,
     silenceOriginal: null,
     silencePlan: null,
     suggestions: [],
@@ -305,6 +326,7 @@ function registerSourcePath(p: string | undefined | null): void {
 }
 registerSourcePath(uiState.videoPath);
 registerSourcePath(uiState.silenceOriginal?.videoPath);
+for (const projectSource of editProjects.loadSourcePaths()) registerSourcePath(projectSource);
 
 // Debounced save to disk
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -375,6 +397,64 @@ function setExportState(phase: string, activeExportJobId: string | null) {
   persistState();
 }
 
+function invalidateActiveEdit(projectId: string, newRevision: number): void {
+  invalidateProjectJobs(projectId, newRevision);
+  if (uiState.activeEditProjectId !== projectId || uiState.activeEditRevision === newRevision) return;
+  deactivateActiveEdit(projectId);
+}
+
+function invalidateProjectJobs(projectId: string, currentRevision?: number): void {
+  let invalidatedActiveExport = false;
+  for (const job of jobs.values()) {
+    if (job.editProjectId !== projectId || job.status !== "running") continue;
+    if (job.type === "edit_preview" && currentRevision !== undefined) continue;
+    if (currentRevision !== undefined && job.editRevision === currentRevision) continue;
+    job.status = "error";
+    job.error = "Edit project changed before this render finished";
+    job.message = job.error;
+    if (uiState.activeExportJobId === job.id) invalidatedActiveExport = true;
+  }
+  for (const [proposalId, proposal] of editSilenceProposals) {
+    if (proposal.projectId === projectId && (currentRevision === undefined || proposal.revision !== currentRevision)) {
+      editSilenceProposals.delete(proposalId);
+    }
+  }
+  if (invalidatedActiveExport) setExportState("review", null);
+}
+
+function deactivateActiveEdit(
+  projectId: string,
+  loaded?: ReturnType<EditProjectStore["get"]>,
+): void {
+  if (uiState.activeEditProjectId !== projectId) return;
+  try {
+    const current = loaded ?? editProjects.get(projectId);
+    uiState.videoPath = current.project.source.path;
+    uiState.filePath = current.project.source.path;
+    uiState.transcript = current.transcript as ServerTranscript;
+    sessionTranscripts.set(current.project.source.path, current.transcript as ServerTranscript);
+    registerSourcePath(current.project.source.path);
+  } catch {
+    uiState.transcript = null;
+  }
+  uiState.activeEditProjectId = undefined;
+  uiState.activeEditRevision = undefined;
+  uiState.suggestions = [];
+  uiState.deselectedIndices = [];
+  uiState.results = [];
+  uiState.silencePlan = null;
+  uiState.phase = "idle";
+  uiState.activeExportJobId = null;
+  uiState.lastUpdated = Date.now();
+  invalidateProjectJobs(projectId);
+  persistState();
+  broadcastSSE("state", {
+    ...uiState,
+    activeEditProjectId: null,
+    activeEditRevision: null,
+  });
+}
+
 function enrichClipWithSegments<T extends { start_second: number; end_second: number; keep_segments?: Array<{ start: number; end: number }> }>(
   clip: T,
 ): T {
@@ -396,6 +476,9 @@ function createBatchHistoryRecorder({
   outroPath,
   introPath,
   cleanFillers,
+  renderTranscriptWords,
+  editProjectId,
+  editRevision,
 }: {
   jobId: string;
   sourceVideo: string;
@@ -411,11 +494,15 @@ function createBatchHistoryRecorder({
     crop_strategy?: string;
     format?: Format;
     keep_segments?: Array<{ start: number; end: number }>;
+    ordered_segments?: Array<{ start: number; end: number }>;
   }>;
   logoPath?: string | null;
   outroPath?: string | null;
   introPath?: string | null;
   cleanFillers?: boolean;
+  renderTranscriptWords?: WordTimestamp[];
+  editProjectId?: string;
+  editRevision?: number;
 }) {
   const recordedClipIndexes = new Set<number>();
   const pendingWrites: Promise<void>[] = [];
@@ -428,6 +515,9 @@ function createBatchHistoryRecorder({
       defaultCropStrategy,
       defaultFormat,
       contentTypeFor: (s, e) => findContentType(uiState.suggestions, s, e),
+      editProjectId,
+      editRevision,
+      orderedSegmentsFor: (row) => typeof row.clip_index === "number" ? clipSpecs?.[row.clip_index]?.ordered_segments : undefined,
     });
     let recordedIdx = 0;
     for (const row of rows) {
@@ -438,12 +528,13 @@ function createBatchHistoryRecorder({
         typeof row.clip_index === "number" ? clipSpecs?.[row.clip_index] : undefined;
       try {
         await clipsHistory.persistClipRecipe(rec, {
-          transcriptWords,
+          transcriptWords: renderTranscriptWords ?? transcriptWords,
           logoPath,
           outroPath,
           introPath,
           cleanFillers,
           keepSegments: spec?.keep_segments,
+          orderedSegments: spec?.ordered_segments,
         });
       } catch (err) {
         log.warn(`Failed to save recipe for ${label} clip`, { err: errMsg(err) });
@@ -1045,6 +1136,7 @@ app.post("/api/transcribe", async (req, res) => {
       "transcribe",
       { file_path, model_size, engine, assemblyai_api_key, language, enable_diarization, num_speakers },
       (event) => {
+        if (job.status !== "running") return;
         job.progress = event.percent;
         job.message = event.message;
       },
@@ -1100,6 +1192,8 @@ app.post("/api/create-clip", async (req, res) => {
     caption_position = "auto",
     caption_font_scale = 100,
     logo_position = "top-left",
+    edit_project_id,
+    edit_revision,
   } = req.body;
 
   if (!video_path || !existsSync(video_path)) {
@@ -1181,6 +1275,25 @@ app.post("/api/create-clip", async (req, res) => {
     keep_segments: Array.isArray(keep_segments) ? keep_segments : undefined,
   });
 
+  let renderVideoPath = video_path as string;
+  let renderTranscriptWords = transcript_words as WordTimestamp[];
+  let historyTranscriptWords = transcript_words as WordTimestamp[];
+  let orderedSegments: Array<{ start: number; end: number }> | undefined;
+  let loadedEdit: ReturnType<EditProjectStore["get"]> | null = null;
+  if (edit_project_id) {
+    try {
+      loadedEdit = loadEditRevision(edit_project_id, edit_revision);
+      orderedSegments = mapEditedClipToSource(loadedEdit.project.timeline, enriched);
+      if (!orderedSegments.length) throw new Error("Clip does not overlap the edited episode");
+      renderVideoPath = loadedEdit.project.source.path;
+      renderTranscriptWords = loadedEdit.transcript.words;
+      historyTranscriptWords = remapTranscript(loadedEdit.transcript, loadedEdit.project.timeline).words;
+    } catch (err) {
+      editApiError(res, err);
+      return;
+    }
+  }
+
   const jobId = uuidv4();
   const job: JobState = {
     id: jobId,
@@ -1189,6 +1302,8 @@ app.post("/api/create-clip", async (req, res) => {
     progress: 0,
     message: "Preparing clip...",
     createdAt: Date.now(),
+    editProjectId: loadedEdit?.project.id,
+    editRevision: loadedEdit?.project.revision,
   };
   jobs.set(jobId, job);
 
@@ -1198,13 +1313,13 @@ app.post("/api/create-clip", async (req, res) => {
     .execute<ClipResult>(
       "create_clip",
       {
-        video_path,
+        video_path: renderVideoPath,
         start_second: enriched.start_second,
         end_second: enriched.end_second,
         caption_style,
         crop_strategy,
         format,
-        transcript_words,
+        transcript_words: renderTranscriptWords,
         title,
         output_dir: paths.output,
         logo_path,
@@ -1215,14 +1330,23 @@ app.post("/api/create-clip", async (req, res) => {
         caption_position,
         caption_font_scale: normalizedFontScale,
         logo_position,
-        ...(enriched.keep_segments?.length && { keep_segments: enriched.keep_segments }),
+        ...(orderedSegments?.length
+          ? { ordered_segments: orderedSegments }
+          : enriched.keep_segments?.length
+            ? { keep_segments: enriched.keep_segments }
+            : {}),
       },
       (event) => {
+        if (job.status !== "running") return;
         job.progress = event.percent;
         job.message = event.message;
       },
     )
     .then(async (result) => {
+      if (job.status === "error" && loadedEdit) {
+        if (result.data?.output_path) await unlink(result.data.output_path).catch(() => {});
+        return;
+      }
       job.status = "done";
       job.progress = 100;
       job.message = "Clip created!";
@@ -1231,7 +1355,7 @@ app.post("/api/create-clip", async (req, res) => {
       try {
         const d = result.data;
         const rec = await clipsHistory.record({
-          source_video: video_path,
+          source_video: renderVideoPath,
           start_second,
           end_second,
           caption_style,
@@ -1245,15 +1369,19 @@ app.post("/api/create-clip", async (req, res) => {
           file_size_mb: d?.file_size_mb || 0,
           duration: d?.duration || 0,
           content_type: content_type || undefined,
-          transcript_slice: sliceTranscript(transcript_words, start_second, end_second),
+          transcript_slice: sliceTranscript(historyTranscriptWords, start_second, end_second),
+          edit_project_id: loadedEdit?.project.id,
+          edit_revision: loadedEdit?.project.revision,
+          ordered_segments: orderedSegments,
         });
         await clipsHistory.persistClipRecipe(rec, {
-          transcriptWords: transcript_words,
+          transcriptWords: renderTranscriptWords,
           logoPath: logo_path,
           outroPath: outro_path,
           introPath: intro_path,
           cleanFillers: clean_fillers,
-          keepSegments: enriched.keep_segments,
+          keepSegments: loadedEdit ? undefined : enriched.keep_segments,
+          orderedSegments,
         });
         broadcastHistoryUpdated(jobId, [rec]);
       } catch (err) {
@@ -1265,6 +1393,7 @@ app.post("/api/create-clip", async (req, res) => {
       broadcastSSE("job-complete", { jobId, result: result.data });
     })
     .catch((err) => {
+      if (job.status === "error" && loadedEdit) return;
       job.status = "error";
       job.error = err.message;
       job.message = `Error: ${err.message}`;
@@ -1286,6 +1415,8 @@ app.post("/api/batch-clips", async (req, res) => {
     caption_position = "auto",
     caption_font_scale = 100,
     logo_position = "top-left",
+    edit_project_id,
+    edit_revision,
   } = req.body;
 
   if (!video_path || !existsSync(video_path)) {
@@ -1338,11 +1469,37 @@ app.post("/api/batch-clips", async (req, res) => {
     }
   }
 
+  let renderVideoPath = video_path as string;
+  let historyTranscriptWords = transcript_words as WordTimestamp[];
+  let renderTranscriptWords = transcript_words as WordTimestamp[];
+  let loadedEdit: ReturnType<EditProjectStore["get"]> | null = null;
+  if (edit_project_id) {
+    try {
+      loadedEdit = loadEditRevision(edit_project_id, edit_revision);
+      renderVideoPath = loadedEdit.project.source.path;
+      renderTranscriptWords = loadedEdit.transcript.words;
+      historyTranscriptWords = remapTranscript(loadedEdit.transcript, loadedEdit.project.timeline).words;
+    } catch (err) {
+      editApiError(res, err);
+      return;
+    }
+  }
+
   await fileManager.ensureDirectories();
 
-  const enrichedClips = clips.map((c: { start_second: number; end_second: number; keep_segments?: Array<{ start: number; end: number }> }) =>
-    enrichClipWithSegments(c),
-  );
+  let enrichedClips: any[];
+  try {
+    enrichedClips = clips.map((c: any) => {
+      if (!loadedEdit) return enrichClipWithSegments(c);
+      const ordered_segments = mapEditedClipToSource(loadedEdit.project.timeline, c);
+      if (!ordered_segments.length) throw new Error(`Clip “${c.title || "Untitled"}” does not overlap the edited episode`);
+      const { keep_segments: _legacy, ...clip } = c;
+      return { ...clip, ordered_segments };
+    });
+  } catch (err) {
+    res.status(400).json({ error: errMsg(err) });
+    return;
+  }
 
   const jobId = uuidv4();
   const job: JobState = {
@@ -1352,19 +1509,24 @@ app.post("/api/batch-clips", async (req, res) => {
     progress: 0,
     message: "Starting batch...",
     createdAt: Date.now(),
+    editProjectId: loadedEdit?.project.id,
+    editRevision: loadedEdit?.project.revision,
   };
   jobs.set(jobId, job);
 
   const historyRecorder = createBatchHistoryRecorder({
     jobId,
-    sourceVideo: video_path,
-    transcriptWords: transcript_words,
+    sourceVideo: renderVideoPath,
+    transcriptWords: historyTranscriptWords,
     label: "batch",
     clipSpecs: enrichedClips,
     logoPath: logo_path,
     outroPath: outro_path,
     introPath: intro_path,
     cleanFillers: clean_fillers,
+    renderTranscriptWords,
+    editProjectId: loadedEdit?.project.id,
+    editRevision: loadedEdit?.project.revision,
   });
 
   broadcastSSE("export-started", { jobId, clipCount: clips.length });
@@ -1376,28 +1538,29 @@ app.post("/api/batch-clips", async (req, res) => {
     .execute<BatchClipsResult>(
       "batch_clips",
       {
-        video_path,
+        video_path: renderVideoPath,
         clips: enrichedClips,
         format,
-        transcript_words,
+        transcript_words: renderTranscriptWords,
         output_dir: paths.output,
         logo_path,
         outro_path,
         intro_path,
         clean_fillers,
         keep_caption_overlay: keep_caption_overlay === true,
-        face_map: uiState.transcript?.face_map,
+        face_map: loadedEdit ? undefined : uiState.transcript?.face_map,
         caption_position,
         caption_font_scale: normalizedFontScale,
         logo_position,
       },
       (event) => {
+        if (job.status !== "running") return;
         const progress = advanceProgress(job, event.percent);
         job.message = event.message;
-        historyRecorder.recordProgress(event);
         const clipResult = event.clip_result
           ? tagSubmittedClip(event.clip_result, enrichedClips)
           : undefined;
+        historyRecorder.recordProgress(clipResult ? { ...event, clip_result: clipResult } : event);
         if (event.stage === "clip_complete" && clipResult) {
           (job.clip_results ??= []).push(clipResult);
         }
@@ -1411,6 +1574,10 @@ app.post("/api/batch-clips", async (req, res) => {
       },
     )
     .then(async (result) => {
+      if (job.status === "error" && loadedEdit) {
+        await Promise.all((result.data?.results ?? []).map((row) => row.output_path ? unlink(row.output_path).catch(() => {}) : Promise.resolve()));
+        return;
+      }
       const data = tagSubmittedClips(result.data, enrichedClips);
       job.status = "done";
       job.progress = 100;
@@ -1418,7 +1585,7 @@ app.post("/api/batch-clips", async (req, res) => {
       job.result = data;
       // Record successful clips to history
       try {
-        await historyRecorder.recordRemaining(result.data?.results);
+        await historyRecorder.recordRemaining(data?.results);
       } catch (err) {
         log.warn("Failed to record batch clips to history", {
           err: errMsg(err),
@@ -1428,6 +1595,7 @@ app.post("/api/batch-clips", async (req, res) => {
       broadcastSSE("job-complete", { jobId, result: data });
     })
     .catch((err) => {
+      if (job.status === "error" && loadedEdit) return;
       job.status = "error";
       job.error = err.message;
       job.message = `Error: ${err.message}`;
@@ -1452,6 +1620,353 @@ function reserveFullEpisodeOutput(videoPath: string): string {
   }
   return candidate;
 }
+
+function editApiError(res: Response, err: unknown): void {
+  if (err instanceof EditProjectConflictError) {
+    res.status(409).json({ error: err.message, current_revision: err.currentRevision });
+    return;
+  }
+  const message = errMsg(err);
+  const notFound = /not found/i.test(message);
+  res.status(notFound ? 404 : 400).json({ error: message });
+}
+
+function loadEditRevision(id: unknown, revision: unknown): ReturnType<EditProjectStore["get"]> {
+  const loaded = editProjects.get(String(id));
+  if (!Number.isInteger(revision) || loaded.project.revision !== revision) {
+    throw new EditProjectConflictError(loaded.project.revision);
+  }
+  if (!existsSync(loaded.project.source.path)) {
+    throw new Error("Edited episode source is missing; relink it in Editor");
+  }
+  return loaded;
+}
+
+function spawnTool(command: string, args: string[]): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
+    child.on("error", rejectPromise);
+    child.on("close", (code) => {
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(stderr.trim() || `${command} exited with code ${code}`));
+    });
+  });
+}
+
+/** Create a durable one-segment edit project over an untouched local source. */
+app.post("/api/edit-projects", (req, res) => {
+  try {
+    const requested = typeof req.body?.video_path === "string" ? req.body.video_path : "";
+    const resolved = requested ? realpathSync(path.resolve(requested)) : "";
+    if (!resolved || !allowedSourcePaths.has(resolved)) throw new Error("Select a local episode first");
+    const transcript = req.body?.transcript ?? sessionTranscripts.get(requested) ?? sessionTranscripts.get(resolved) ?? uiState.transcript;
+    if (!transcript || !Array.isArray(transcript.words)) throw new Error("Complete transcription before editing");
+    const project = editProjects.findBySourcePath(resolved) ?? editProjects.create(
+      resolved,
+      transcript,
+      req.body?.name,
+      typeof req.body?.source_filename === "string" ? req.body.source_filename : undefined,
+    );
+    registerSourcePath(project.source.path);
+    res.status(201).json({ project });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/duplicate", (req, res) => {
+  try {
+    if (typeof req.body?.source_fingerprint !== "string" || !Array.isArray(req.body?.timeline)) {
+      throw new Error("Current timeline and source fingerprint are required");
+    }
+    const project = editProjects.duplicate(
+      req.params.id,
+      String(req.body?.name || "Episode"),
+      req.body.source_fingerprint,
+      req.body.timeline,
+    );
+    res.status(201).json({ project });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.get("/api/edit-projects", (_req, res) => {
+  res.json(editProjects.list());
+});
+
+app.get("/api/edit-projects/:id", (req, res) => {
+  try {
+    const result = editProjects.get(req.params.id, req.query.trash === "1");
+    if (!result.project.trashed_at) registerSourcePath(result.project.source.path);
+    res.json({ ...result, source_missing: !existsSync(result.project.source.path) });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/operations", (req, res) => {
+  try {
+    if (!Number.isInteger(req.body?.expected_revision)) throw new Error("expected_revision is required");
+    const project = editProjects.applyOperation(
+      req.params.id,
+      req.body.expected_revision,
+      req.body.operation as EditOperation,
+    );
+    const transcript = editProjects.activate(project.id, project.revision).transcript;
+    invalidateActiveEdit(project.id, project.revision);
+    res.json({ project, transcript });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/relink", (req, res) => {
+  try {
+    if (typeof req.body?.path !== "string") throw new Error("Replacement path is required");
+    const project = editProjects.relink(req.params.id, req.body.path);
+    registerSourcePath(project.source.path);
+    invalidateActiveEdit(project.id, project.revision);
+    res.json({ project });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/activate", (req, res) => {
+  try {
+    if (!Number.isInteger(req.body?.expected_revision)) throw new Error("expected_revision is required");
+    const result = editProjects.activate(req.params.id, req.body.expected_revision);
+    if (!result.project.timeline.length) throw new Error("Restore some episode content before continuing");
+    uiState.videoPath = result.project.source.path;
+    uiState.filePath = result.project.source.path;
+    uiState.transcript = result.transcript as ServerTranscript;
+    uiState.activeEditProjectId = result.project.id;
+    uiState.activeEditRevision = result.project.revision;
+    uiState.suggestions = [];
+    uiState.deselectedIndices = [];
+    uiState.silencePlan = null;
+    uiState.results = [];
+    uiState.phase = "review";
+    uiState.lastUpdated = Date.now();
+    sessionTranscripts.set(result.project.source.path, result.transcript as ServerTranscript);
+    registerSourcePath(result.project.source.path);
+    persistState();
+    broadcastSSE("state", uiState);
+    res.json({ project: result.project, transcript: result.transcript });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/trash", (req, res) => {
+  try {
+    const loaded = editProjects.get(req.params.id);
+    const project = editProjects.trash(req.params.id);
+    invalidateProjectJobs(project.id);
+    deactivateActiveEdit(project.id, loaded);
+    res.json({ project });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+app.post("/api/edit-projects/:id/restore", (req, res) => {
+  try {
+    const project = editProjects.restore(req.params.id);
+    registerSourcePath(project.source.path);
+    res.json({ project });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
+
+/** Prepare disposable preview assets. A proxy is only accepted for a real playback fallback. */
+app.post("/api/edit-projects/:id/prepare-preview", (req, res) => {
+  let project;
+  try {
+    project = editProjects.get(req.params.id).project;
+  } catch (err) {
+    editApiError(res, err);
+    return;
+  }
+  const proxyReason = req.body?.proxy_reason;
+  if (proxyReason && !["playback_error", "seek_timeout"].includes(proxyReason)) {
+    res.status(400).json({ error: "Proxy generation requires a playback fallback reason" });
+    return;
+  }
+  const cacheDir = join(paths.editCache, project.id);
+  const waveform = join(cacheDir, "waveform.png");
+  const storyboard = join(cacheDir, "storyboard.jpg");
+  const proxy = join(cacheDir, "proxy.mp4");
+  const jobId = uuidv4();
+  const job: JobState = {
+    id: jobId,
+    type: "edit_preview",
+    status: "running",
+    progress: 2,
+    message: proxyReason ? "Optimizing preview..." : "Preparing waveform and storyboard...",
+    createdAt: Date.now(),
+    editProjectId: project.id,
+    editRevision: project.revision,
+  };
+  jobs.set(jobId, job);
+  res.json({ job_id: jobId, status: "running" });
+  void (async () => {
+    try {
+      await mkdir(cacheDir, { recursive: true });
+      if (!existsSync(waveform) && project.source.has_audio) {
+        await spawnTool(paths.ffmpegPath, ["-y", "-i", project.source.path, "-filter_complex", "showwavespic=s=1800x160:colors=0x788294", "-frames:v", "1", waveform]);
+      }
+      job.progress = 35;
+      job.message = "Preparing storyboard...";
+      if (!existsSync(storyboard)) {
+        const storyboardInterval = Math.max(0.25, project.source.duration / 20);
+        await spawnTool(paths.ffmpegPath, ["-y", "-i", project.source.path, "-vf", `fps=1/${storyboardInterval},scale=240:-2,tile=20x1`, "-frames:v", "1", storyboard]);
+      }
+      job.progress = proxyReason ? 55 : 100;
+      if (proxyReason && !existsSync(proxy)) {
+        job.message = "Optimizing preview...";
+        await spawnTool(paths.ffmpegPath, [
+          "-y", "-i", project.source.path,
+          "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+          "-map", "0:v:0", "-map", "0:a:0?",
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+          "-force_key_frames", "expr:gte(t,n_forced*1)",
+          ...(project.source.has_audio ? ["-c:a", "aac", "-b:a", "160k"] : ["-an"]),
+          "-movflags", "+faststart", proxy,
+        ]);
+      }
+      editProjects.get(project.id);
+      job.status = "done";
+      job.progress = 100;
+      job.message = "Preview ready";
+      job.result = {
+        waveform: existsSync(waveform) ? `/api/edit-projects/${project.id}/assets/waveform` : null,
+        storyboard: existsSync(storyboard) ? `/api/edit-projects/${project.id}/assets/storyboard` : null,
+        proxy: existsSync(proxy) ? `/api/edit-projects/${project.id}/assets/proxy` : null,
+      };
+    } catch (err) {
+      try {
+        editProjects.get(project.id);
+      } catch {
+        await rm(cacheDir, { recursive: true, force: true });
+      }
+      job.status = "error";
+      job.error = errMsg(err);
+      job.message = `Preview preparation failed: ${job.error}`;
+    }
+  })();
+});
+
+app.get("/api/edit-projects/:id/assets/:kind", (req, res) => {
+  const files: Record<string, { name: string; type: string }> = {
+    waveform: { name: "waveform.png", type: "image/png" },
+    storyboard: { name: "storyboard.jpg", type: "image/jpeg" },
+    proxy: { name: "proxy.mp4", type: "video/mp4" },
+  };
+  const asset = files[req.params.kind];
+  if (!asset) { res.status(404).end(); return; }
+  try { editProjects.get(req.params.id); } catch { res.status(404).end(); return; }
+  const file = join(paths.editCache, req.params.id, asset.name);
+  if (!existsSync(file)) { res.status(404).end(); return; }
+  if (req.params.kind === "proxy") streamVideo(req, res, file, asset.type);
+  else res.type(asset.type).sendFile(file);
+});
+
+app.post("/api/edit-projects/:id/analyze-silence", (req, res) => {
+  let loaded;
+  try {
+    loaded = editProjects.get(req.params.id);
+    if (!Number.isInteger(req.body?.expected_revision) || req.body.expected_revision !== loaded.project.revision) {
+      throw new EditProjectConflictError(loaded.project.revision);
+    }
+  } catch (err) {
+    editApiError(res, err);
+    return;
+  }
+  if (!loaded.project.source.has_audio) {
+    res.status(400).json({ error: "This episode has no audio track to analyze" });
+    return;
+  }
+  const threshold = Number(req.body?.threshold ?? 0.5);
+  const minSilence = Number(req.body?.min_silence_seconds ?? 0.65);
+  const padding = Number(req.body?.padding_seconds ?? 0.12);
+  if (
+    !Number.isFinite(threshold) || threshold < 0.25 || threshold > 0.8 ||
+    !Number.isFinite(minSilence) || minSilence < 0.3 || minSilence > 5 ||
+    !Number.isFinite(padding) || padding < 0.02 || padding > 0.5
+  ) {
+    res.status(400).json({ error: "Invalid silence-removal settings" });
+    return;
+  }
+  const jobId = uuidv4();
+  const job: JobState = {
+    id: jobId,
+    type: "silence_analysis",
+    status: "running",
+    progress: 0,
+    message: "Analyzing source speech...",
+    createdAt: Date.now(),
+    editProjectId: loaded.project.id,
+    editRevision: loaded.project.revision,
+  };
+  jobs.set(jobId, job);
+  res.json({ job_id: jobId, status: "running" });
+  executor.execute<SilencePlan>("analyze_silence", {
+    video_path: loaded.project.source.path,
+    transcript_words: loaded.transcript.words,
+    threshold,
+    min_silence_seconds: minSilence,
+    padding_seconds: padding,
+  }, (event) => {
+    if (job.status !== "running") return;
+    job.progress = event.percent;
+    job.message = event.message;
+  }).then((result) => {
+    if (job.status !== "running") return;
+    const proposalId = uuidv4();
+    const timeline = retainSourceRanges(loaded.project.timeline, result.data?.keep_segments ?? []);
+    const proposal: EditSilenceProposal = {
+      id: proposalId,
+      projectId: loaded.project.id,
+      revision: loaded.project.revision,
+      timeline,
+      analysis: result.data as SilencePlan,
+    };
+    editSilenceProposals.set(proposalId, proposal);
+    job.status = "done";
+    job.progress = 100;
+    job.message = "Silence review ready";
+    job.result = {
+      proposal_id: proposalId,
+      revision: proposal.revision,
+      removed_ranges: proposal.analysis.removed_ranges,
+      edited_duration: editedDuration(timeline),
+      cut_count: proposal.analysis.cut_count,
+    };
+  }).catch((err) => {
+    if (job.status !== "running") return;
+    job.status = "error";
+    job.error = errMsg(err);
+    job.message = `Error: ${job.error}`;
+  });
+});
+
+app.post("/api/edit-projects/:id/silence-proposals/:proposalId/apply", (req, res) => {
+  try {
+    const proposal = editSilenceProposals.get(req.params.proposalId);
+    if (!proposal || proposal.projectId !== req.params.id) throw new Error("Silence proposal not found; analyze again");
+    const project = editProjects.replaceTimeline(req.params.id, proposal.revision, proposal.timeline);
+    invalidateActiveEdit(project.id, project.revision);
+    editSilenceProposals.delete(proposal.id);
+    res.json({ project, transcript: editProjects.activate(project.id, project.revision).transcript });
+  } catch (err) {
+    editApiError(res, err);
+  }
+});
 
 /** Analyze spoken sections locally. The first run downloads a verified 1.3 MB VAD model. */
 app.post("/api/analyze-silence", async (req, res) => {
@@ -1596,13 +2111,15 @@ app.post("/api/export-full-episode", async (req, res) => {
     caption_position = "auto",
     caption_font_scale = 100,
     logo_position = "top-left",
+    edit_project_id,
+    edit_revision,
   } = req.body || {};
 
   if (!video_path || typeof video_path !== "string" || !existsSync(video_path)) {
     res.status(400).json({ error: "Video file not found" });
     return;
   }
-  if (!Array.isArray(transcript_words) || transcript_words.length === 0) {
+  if ((!Array.isArray(transcript_words) || transcript_words.length === 0) && !edit_project_id) {
     res.status(400).json({ error: "Transcribe the episode before exporting it with captions" });
     return;
   }
@@ -1616,6 +2133,26 @@ app.post("/api/export-full-episode", async (req, res) => {
     return;
   }
   const normalizedFontScale = Math.max(60, Math.min(160, Number(caption_font_scale) || 100));
+
+  let renderVideoPath = video_path as string;
+  let renderWords = transcript_words as WordTimestamp[];
+  let orderedSegments: Array<{ start: number; end: number }> | null = null;
+  let fullEditProjectId: string | undefined;
+  let fullEditRevision: number | undefined;
+  if (edit_project_id) {
+    try {
+      const loaded = loadEditRevision(edit_project_id, edit_revision);
+      if (!loaded.project.timeline.length) throw new Error("The edited episode is empty");
+      renderVideoPath = loaded.project.source.path;
+      renderWords = remapTranscript(loaded.transcript, loaded.project.timeline).words;
+      orderedSegments = loaded.project.timeline.map((segment) => ({ start: segment.source_start, end: segment.source_end }));
+      fullEditProjectId = loaded.project.id;
+      fullEditRevision = loaded.project.revision;
+    } catch (err) {
+      editApiError(res, err);
+      return;
+    }
+  }
 
   let logoPath: string | null = null;
   if (req.body.logo_path) {
@@ -1633,9 +2170,11 @@ app.post("/api/export-full-episode", async (req, res) => {
   }
 
   await fileManager.ensureDirectories();
-  const outputPath = reserveFullEpisodeOutput(video_path);
+  const outputPath = reserveFullEpisodeOutput(renderVideoPath);
   const wordsPath = join(paths.working, `full-episode-${uuidv4()}.words.json`);
-  writeFileSync(wordsPath, JSON.stringify({ words: transcript_words }), "utf-8");
+  const segmentsPath = orderedSegments ? join(paths.working, `full-episode-${uuidv4()}.segments.json`) : null;
+  writeFileSync(wordsPath, JSON.stringify({ words: renderWords }), "utf-8");
+  if (segmentsPath) writeFileSync(segmentsPath, JSON.stringify(orderedSegments), "utf-8");
 
   const jobId = uuidv4();
   const job: JobState = {
@@ -1645,13 +2184,15 @@ app.post("/api/export-full-episode", async (req, res) => {
     progress: 0,
     message: "Preparing full episode...",
     createdAt: Date.now(),
+    editProjectId: fullEditProjectId,
+    editRevision: fullEditRevision,
   };
   jobs.set(jobId, job);
   res.json({ job_id: jobId, status: "running" });
 
   const args = [
     renderer,
-    "--video", path.resolve(video_path),
+    "--video", path.resolve(renderVideoPath),
     "--words", wordsPath,
     "--style", caption_style,
     "--output", outputPath,
@@ -1661,6 +2202,7 @@ app.post("/api/export-full-episode", async (req, res) => {
     "--caption-font-scale", String(normalizedFontScale),
     "--logo-position", logo_position,
   ];
+  if (segmentsPath) args.push("--segments", segmentsPath);
   if (caption_style === "branded" && logoPath) args.push("--logo", logoPath);
 
   const child = spawn(process.execPath, args, {
@@ -1702,11 +2244,16 @@ app.post("/api/export-full-episode", async (req, res) => {
     job.error = err.message;
     job.message = `Error: ${err.message}`;
     try { await unlink(wordsPath); } catch { /* best effort */ }
+    if (segmentsPath) try { await unlink(segmentsPath); } catch { /* best effort */ }
   });
   child.on("close", async (code) => {
     consumeStdout("", true);
     try { await unlink(wordsPath); } catch { /* best effort */ }
-    if (job.status === "error") return;
+    if (segmentsPath) try { await unlink(segmentsPath); } catch { /* best effort */ }
+    if (job.status === "error") {
+      try { await unlink(outputPath); } catch { /* best effort */ }
+      return;
+    }
     if (code !== 0 || !existsSync(outputPath)) {
       const detail = stderrTail.trim().split(/\r?\n/).slice(-4).join("\n");
       job.status = "error";
@@ -1724,6 +2271,9 @@ app.post("/api/export-full-episode", async (req, res) => {
       filename: basename(outputPath),
       file_size_mb: Math.round((stat.size / (1024 * 1024)) * 100) / 100,
       caption_style,
+      edit_project_id: fullEditProjectId,
+      edit_revision: fullEditRevision,
+      ordered_segments: orderedSegments,
     };
   });
 });
@@ -2864,6 +3414,10 @@ app.post("/api/clips/:id/rerender", async (req, res) => {
     res.status(404).json({ error: "clip not found" });
     return;
   }
+  if (clip.edit_project_id || clip.ordered_segments?.length) {
+    res.status(409).json({ error: "Reframing an assembled edited clip is not supported. Choose framing in Episode Workspace and export the clip again." });
+    return;
+  }
   // Editor sends source-absolute keyframes + trim; derive the render's clip-relative
   // crop keyframes from it, and persist the editor state so reopening shows it.
   const reframe = req.body?.reframe as { keyframes?: { tAbs: number; x_pct: number }[]; inSec?: number; outSec?: number } | undefined;
@@ -3377,6 +3931,8 @@ app.post("/api/generate-prompt", (req, res) => {
 
 app.post("/api/claude-suggest", async (req, res) => {
   const { top_n = 5, min_duration, max_duration } = req.body;
+  const editProjectId = uiState.activeEditProjectId;
+  const editRevision = uiState.activeEditRevision;
 
   // Need transcript in state
   if (!uiState.transcript && !uiState.rawTranscriptText) {
@@ -3396,7 +3952,11 @@ app.post("/api/claude-suggest", async (req, res) => {
     // Feed already-known moments to the AI so it doesn't re-suggest the same
     // ranges: clips already rendered for this video plus current suggestions.
     const rendered = uiState.videoPath
-      ? await clipsHistory.getBySource(uiState.videoPath).catch(() => [])
+      ? (await clipsHistory.getBySource(uiState.videoPath).catch(() => [])).filter((clip) =>
+          editProjectId
+            ? clip.edit_project_id === editProjectId && clip.edit_revision === editRevision
+            : !clip.edit_project_id,
+        )
       : [];
     const existing_clips = [
       ...rendered.map((c) => ({ start_second: c.start_second, end_second: c.end_second, title: c.title })),
@@ -3407,7 +3967,7 @@ app.post("/api/claude-suggest", async (req, res) => {
     // the source video, not just the segments.
     const params: Record<string, unknown> = { segments: segs, top_n, existing_clips };
     const suggestVideo = uiState.filePath || uiState.videoPath;
-    if (suggestVideo) params.video_path = suggestVideo;
+    if (suggestVideo && !editProjectId) params.video_path = suggestVideo;
     if (min_duration) params.min_duration = min_duration;
     if (max_duration) params.max_duration = max_duration;
     const result = await executor.execute<{ clips?: SuggestedClip[] }>(
@@ -3421,6 +3981,10 @@ app.post("/api/claude-suggest", async (req, res) => {
     );
 
     const clips = result.data?.clips ?? [];
+    if (uiState.activeEditProjectId !== editProjectId || uiState.activeEditRevision !== editRevision) {
+      res.status(409).json({ error: "Edited episode changed while suggestions were being generated. Find clips again." });
+      return;
+    }
 
     // Auto-push to UI state as suggestions
     if (clips.length > 0) {
@@ -3435,6 +3999,8 @@ app.post("/api/claude-suggest", async (req, res) => {
         preview_text: c.preview_text ?? "",
         content_type: c.content_type,
         score: c.score,
+        edit_project_id: editProjectId,
+        edit_revision: editRevision,
         suggested_caption_style: c.suggested_caption_style || "hormozi",
       }));
       uiState.deselectedIndices = [];
@@ -3464,6 +4030,8 @@ app.post("/api/find-moment", async (req, res) => {
     res.status(400).json({ error: "Paste a moment or description to search for." });
     return;
   }
+  const editProjectId = uiState.activeEditProjectId;
+  const editRevision = uiState.activeEditRevision;
   const segs = uiState.transcript?.segments;
   if (!segs || !Array.isArray(segs) || segs.length === 0) {
     res
@@ -3486,6 +4054,10 @@ app.post("/api/find-moment", async (req, res) => {
     );
 
     const found = result.data?.clips ?? [];
+    if (uiState.activeEditProjectId !== editProjectId || uiState.activeEditRevision !== editRevision) {
+      res.status(409).json({ error: "Edited episode changed during the search. Search again." });
+      return;
+    }
     // Append to existing suggestions, skipping anything at a range we already have.
     const seen = new Set(
       uiState.suggestions.map(
@@ -3508,6 +4080,8 @@ app.post("/api/find-moment", async (req, res) => {
         preview_text: c.preview_text ?? "",
         content_type: c.content_type,
         score: c.score,
+        edit_project_id: editProjectId,
+        edit_revision: editRevision,
         suggested_caption_style: c.suggested_caption_style || "hormozi",
       });
     }
@@ -3745,6 +4319,8 @@ app.get("/api/ui-state", (_req, res) => {
       : 0,
     transcript: uiState.transcript,
     rawTranscriptText: uiState.rawTranscriptText,
+    activeEditProjectId: uiState.activeEditProjectId ?? null,
+    activeEditRevision: uiState.activeEditRevision ?? null,
     silenceOriginal: uiState.silenceOriginal,
     silencePlan: uiState.silencePlan,
     lastUpdated: uiState.lastUpdated,
@@ -3770,6 +4346,23 @@ app.post("/api/ui-state", (req, res) => {
   if (looksLikeMountDefaults) {
     res.json({ ok: true, ignored: "stale hydration defaults" });
     return;
+  }
+
+  if (body.activeEditProjectId !== undefined || body.activeEditRevision !== undefined) {
+    const requestedId = body.activeEditProjectId || undefined;
+    const requestedRevision = Number.isInteger(body.activeEditRevision) ? body.activeEditRevision : undefined;
+    const clearing = body._allowClear === true && !requestedId;
+    if (!clearing && (
+      requestedId !== uiState.activeEditProjectId ||
+      requestedRevision !== uiState.activeEditRevision
+    )) {
+      res.status(409).json({ error: "Episode edit state changed. Reload the saved workspace before continuing." });
+      return;
+    }
+    if (clearing) {
+      uiState.activeEditProjectId = undefined;
+      uiState.activeEditRevision = undefined;
+    }
   }
 
   if (body.videoPath !== undefined) uiState.videoPath = body.videoPath;
@@ -3816,6 +4409,13 @@ app.post("/api/ui-state", (req, res) => {
       });
     } else {
       uiState.suggestions = body.suggestions;
+    }
+    if (uiState.activeEditProjectId && Number.isInteger(uiState.activeEditRevision)) {
+      uiState.suggestions = uiState.suggestions.map((suggestion) => ({
+        ...suggestion,
+        edit_project_id: uiState.activeEditProjectId,
+        edit_revision: uiState.activeEditRevision,
+      }));
     }
   }
   if (body.deselectedIndices !== undefined)
@@ -4003,6 +4603,8 @@ app.post("/api/mcp/export", async (req, res) => {
       ? req.body.clean_fillers !== false
       : uiState.settings.cleanFillers !== false;
   const keepCaptionOverlay = req.body.keep_caption_overlay === true;
+  const editProjectId = req.body.edit_project_id || uiState.activeEditProjectId;
+  const editRevision = req.body.edit_revision ?? uiState.activeEditRevision;
 
   if (!videoPath || !existsSync(videoPath)) {
     res.status(400).json({ error: "Video file not found" });
@@ -4023,8 +4625,8 @@ app.post("/api/mcp/export", async (req, res) => {
 
   await fileManager.ensureDirectories();
 
-  // Apply style settings to clips that don't have their own
-  const styledClips = clips.map((c: any) =>
+  // Apply style settings to clips that don't have their own.
+  let styledClips = clips.map((c: any) =>
     enrichClipWithSegments({
       start_second: c.start_second,
       end_second: c.end_second,
@@ -4041,6 +4643,29 @@ app.post("/api/mcp/export", async (req, res) => {
     }),
   );
 
+  let renderVideoPath = videoPath as string;
+  let renderTranscriptWords = transcriptWords as WordTimestamp[];
+  let historyTranscriptWords = transcriptWords as WordTimestamp[];
+  let loadedEdit: ReturnType<EditProjectStore["get"]> | null = null;
+  if (editProjectId) {
+    try {
+      loadedEdit = loadEditRevision(editProjectId, editRevision);
+      renderVideoPath = loadedEdit.project.source.path;
+      renderTranscriptWords = loadedEdit.transcript.words;
+      historyTranscriptWords = remapTranscript(loadedEdit.transcript, loadedEdit.project.timeline).words;
+      const editTimeline = loadedEdit.project.timeline;
+      styledClips = styledClips.map((clip: any) => {
+        const ordered_segments = mapEditedClipToSource(editTimeline, clip);
+        if (!ordered_segments.length) throw new Error(`Clip “${clip.title || "Untitled"}” does not overlap the edited episode`);
+        const { keep_segments: _legacy, ...rest } = clip;
+        return { ...rest, ordered_segments };
+      });
+    } catch (err) {
+      editApiError(res, err);
+      return;
+    }
+  }
+
   const jobId = uuidv4();
   const job: JobState = {
     id: jobId,
@@ -4049,13 +4674,15 @@ app.post("/api/mcp/export", async (req, res) => {
     progress: 0,
     message: "Starting MCP export...",
     createdAt: Date.now(),
+    editProjectId: loadedEdit?.project.id,
+    editRevision: loadedEdit?.project.revision,
   };
   jobs.set(jobId, job);
 
   const historyRecorder = createBatchHistoryRecorder({
     jobId,
-    sourceVideo: videoPath,
-    transcriptWords,
+    sourceVideo: renderVideoPath,
+    transcriptWords: historyTranscriptWords,
     defaultCaptionStyle: captionStyle,
     defaultCropStrategy: cropStrategy,
     defaultFormat: format,
@@ -4065,6 +4692,9 @@ app.post("/api/mcp/export", async (req, res) => {
     outroPath,
     introPath,
     cleanFillers,
+    renderTranscriptWords,
+    editProjectId: loadedEdit?.project.id,
+    editRevision: loadedEdit?.project.revision,
   });
 
   // Broadcast to UI so it can track progress
@@ -4077,24 +4707,25 @@ app.post("/api/mcp/export", async (req, res) => {
     .execute<BatchClipsResult>(
       "batch_clips",
       {
-        video_path: videoPath,
+        video_path: renderVideoPath,
         clips: styledClips,
-        transcript_words: transcriptWords,
+        transcript_words: renderTranscriptWords,
         output_dir: paths.output,
         logo_path: logoPath,
         outro_path: outroPath,
         intro_path: introPath,
         clean_fillers: cleanFillers,
         keep_caption_overlay: keepCaptionOverlay,
-        face_map: uiState.transcript?.face_map,
+        face_map: loadedEdit ? undefined : uiState.transcript?.face_map,
       },
       (event) => {
+        if (job.status !== "running") return;
         const progress = advanceProgress(job, event.percent);
         job.message = event.message;
-        historyRecorder.recordProgress(event);
         const clipResult = event.clip_result
           ? tagSubmittedClip(event.clip_result, styledClips)
           : undefined;
+        historyRecorder.recordProgress(clipResult ? { ...event, clip_result: clipResult } : event);
         if (event.stage === "clip_complete" && clipResult) {
           (job.clip_results ??= []).push(clipResult);
         }
@@ -4108,6 +4739,10 @@ app.post("/api/mcp/export", async (req, res) => {
       },
     )
     .then(async (result) => {
+      if (job.status === "error" && loadedEdit) {
+        await Promise.all((result.data?.results ?? []).map((row) => row.output_path ? unlink(row.output_path).catch(() => {}) : Promise.resolve()));
+        return;
+      }
       const data = tagSubmittedClips(result.data, styledClips);
       job.status = "done";
       job.progress = 100;
@@ -4115,7 +4750,7 @@ app.post("/api/mcp/export", async (req, res) => {
       job.result = data;
       // Record clips to history
       try {
-        await historyRecorder.recordRemaining(result.data?.results);
+        await historyRecorder.recordRemaining(data?.results);
       } catch (err) {
         log.warn("Failed to record batch export clips to history", {
           err: errMsg(err),
@@ -4125,6 +4760,7 @@ app.post("/api/mcp/export", async (req, res) => {
       broadcastSSE("job-complete", { jobId, result: data });
     })
     .catch((err) => {
+      if (job.status === "error" && loadedEdit) return;
       job.status = "error";
       job.error = err.message;
       job.message = `Error: ${err.message}`;

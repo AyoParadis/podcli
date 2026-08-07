@@ -160,6 +160,36 @@ class ClipGeneratorTests(unittest.TestCase):
         self.assertEqual(detect_mock.call_count, 2)
         self.assertEqual(replace_mock.call_count, 2)
 
+    def test_ordered_clip_preserves_requested_edited_coordinates(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = os.path.join(td, "source.mp4")
+            with open(source, "wb") as output:
+                output.write(b"source")
+
+            def materialize(_input, output, *_args, **_kwargs):
+                with open(output, "wb") as target:
+                    target.write(b"video")
+                return output
+
+            ordered = [{"start": 20, "end": 25}, {"start": 0, "end": 3}]
+            with mock.patch.object(cg, "cut_multi_segment", side_effect=materialize) as cut, \
+                 mock.patch.object(cg, "fit_to_frame", side_effect=materialize), \
+                 mock.patch.object(cg, "normalize_audio", side_effect=materialize):
+                result = cg.generate_clip(
+                    video_path=source,
+                    start_second=3,
+                    end_second=8,
+                    format="horizontal",
+                    transcript_words=None,
+                    ordered_segments=ordered,
+                    clean_fillers=False,
+                    output_dir=td,
+                )
+
+        self.assertEqual((result["start_second"], result["end_second"]), (3, 8))
+        self.assertEqual(cut.call_args.args[2], ordered)
+        self.assertTrue(cut.call_args.kwargs["declick"])
+
 
 
 class TransitionAutofixGatingTests(unittest.TestCase):

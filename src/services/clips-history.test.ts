@@ -118,6 +118,69 @@ describe("ClipsHistory", () => {
     expect(recorded[0].transcript_slice).toBe("hello world");
   });
 
+  it("records edited coordinates and ordered source ranges for project clips", async () => {
+    const ok = makeFakeOutput("batch-edited.mp4");
+    const ordered = [{ start: 50, end: 53 }, { start: 0, end: 2 }];
+    const recorded = await history.recordBatchResults(
+      [{
+        status: "success", output_path: ok, start_second: 50, end_second: 2,
+        source_start_second: 0, source_end_second: 5, clip_index: 0, title: "edited",
+      }] as any,
+      {
+        sourceVideo: "/videos/show.mp4",
+        editProjectId: "project-id",
+        editRevision: 7,
+        orderedSegmentsFor: () => ordered,
+      },
+    );
+    expect(recorded[0]).toMatchObject({
+      start_second: 0,
+      end_second: 5,
+      edit_project_id: "project-id",
+      edit_revision: 7,
+      ordered_segments: ordered,
+    });
+  });
+
+  it("persists source words from every ordered source range for regeneration", async () => {
+    const rec = await history.record({
+      source_video: "/videos/show.mp4",
+      output_path: makeFakeOutput("ordered-recipe.mp4"),
+      start_second: 0,
+      end_second: 5,
+      caption_style: "karaoke",
+      crop_strategy: "speaker",
+      title: "ordered",
+      edit_project_id: "project-id",
+      edit_revision: 3,
+      ordered_segments: [{ start: 50, end: 53 }, { start: 0, end: 2 }],
+    } as any);
+    await history.persistClipRecipe(rec, {
+      transcriptWords: [
+        { word: "first", start: 0.5, end: 1 },
+        { word: "middle", start: 20, end: 21 },
+        { word: "last", start: 51, end: 52 },
+      ] as any,
+      orderedSegments: rec.ordered_segments,
+    });
+    expect((await history.loadRecipe(rec.id))?.transcript_words).toEqual([
+      { word: "first", start: 0.5, end: 1 },
+      { word: "last", start: 51, end: 52 },
+    ]);
+  });
+
+  it("does not treat clips from another project revision as duplicates", async () => {
+    const output = makeFakeOutput("edited-duplicate.mp4");
+    await history.record({
+      source_video: "/videos/show.mp4", output_path: output,
+      start_second: 0, end_second: 20, caption_style: "karaoke", crop_strategy: "speaker",
+      title: "revision 2", edit_project_id: "project-id", edit_revision: 2,
+    } as any);
+    expect(await history.findDuplicate("/videos/show.mp4", 0, 20, "karaoke", "speaker", "vertical", { projectId: "project-id", revision: 2 })).not.toBeNull();
+    expect(await history.findDuplicate("/videos/show.mp4", 0, 20, "karaoke", "speaker", "vertical", { projectId: "project-id", revision: 3 })).toBeNull();
+    expect(await history.findDuplicate("/videos/show.mp4", 0, 20, "karaoke", "speaker")).toBeNull();
+  });
+
   it("recordBatchResults tolerates undefined results", async () => {
     const recorded = await history.recordBatchResults(undefined, { sourceVideo: "/videos/show.mp4" });
     expect(recorded).toEqual([]);

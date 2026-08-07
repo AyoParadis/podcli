@@ -184,6 +184,7 @@ def handle_create_clip(task_id: str, params: dict):
         clean_fillers=params.get("clean_fillers", True),
         face_map=params.get("face_map"),
         keep_segments=params.get("keep_segments"),
+        ordered_segments=params.get("ordered_segments"),
         allow_ass_fallback=params.get("allow_ass_fallback", False),
         use_ass_captions=params.get("use_ass_captions", False),
         keep_caption_overlay=params.get("keep_caption_overlay", False),
@@ -240,6 +241,7 @@ def handle_batch_clips(task_id: str, params: dict):
             clean_fillers=params.get("clean_fillers", True),
             face_map=params.get("face_map"),
             keep_segments=clip.get("keep_segments"),
+            ordered_segments=clip.get("ordered_segments"),
             allow_ass_fallback=clip.get("allow_ass_fallback", params.get("allow_ass_fallback", False)),
             use_ass_captions=clip.get("use_ass_captions", params.get("use_ass_captions", False)),
             keep_caption_overlay=clip.get(

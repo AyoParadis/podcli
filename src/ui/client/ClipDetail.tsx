@@ -36,6 +36,8 @@ interface Clip {
   description?: string;
   tags?: string;
   hashtags?: string;
+  edit_project_id?: string;
+  edit_revision?: number;
 }
 
 const CAPTION_STYLES = ["branded", "hormozi", "karaoke", "subtle"];
@@ -234,7 +236,14 @@ export default function ClipDetail() {
       <div className="clip-detail">
         <div className="clip-detail-player">
           {clip.output_path ? <ClipPlayer key={previewUrl} src={previewUrl} poster={posterUrl} onTime={(t) => (playerTime.current = t)} /> : <div className="phone-empty">No rendered output</div>}
-          <button className="btn btn-ghost btn-sm" style={{ width: "100%", marginTop: 10 }} onClick={() => setReframing(true)}>Reframe (fix camera)</button>
+          <button
+            className="btn btn-ghost btn-sm"
+            style={{ width: "100%", marginTop: 10 }}
+            onClick={() => setReframing(true)}
+            disabled={Boolean(clip.edit_project_id)}
+            title={clip.edit_project_id ? "Edited clips already contain assembled cuts; choose framing in Episode Workspace before exporting." : undefined}
+          >Reframe (fix camera)</button>
+          {clip.edit_project_id && <div className="hint" style={{ marginTop: 6 }}>For edited episodes, choose framing before export.</div>}
           <div className="clip-meta">
             <span>{fmt(clip.start_second)}-{fmt(clip.end_second)} · {clip.duration}s</span>
             <span>{clip.crop_strategy}</span>

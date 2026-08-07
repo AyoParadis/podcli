@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import {
   Check,
@@ -21,6 +22,7 @@ import {
   Download as DownloadGlyph,
   Activity,
   ChevronRight,
+  ChevronLeft,
   ChevronDown,
   ArrowRight,
   Volume2,
@@ -366,7 +368,7 @@ const onKeyActivate = (fn) => (e) => {
       return <div style={{ whiteSpace: singleLine ? 'nowrap' : 'normal' }}>{inner}</div>;
     }
 
-    function useLiveCaptionPreview({ videoUrl, videoRef, captionStyle, activeClip, transcriptWords }) {
+    function useLiveCaptionPreview({ videoUrl, videoRef, captionStyle, activeClip, transcriptWords, clockOverrideRef }) {
       const cfg = STYLE_CONFIGS[captionStyle] || STYLE_CONFIGS.branded;
       const sourcePool = useMemo(() => {
         const words = selectPreviewWords(transcriptWords, activeClip);
@@ -397,7 +399,7 @@ const onKeyActivate = (fn) => (e) => {
           let raf;
           const step = () => {
             const v = videoRef?.current;
-            if (v) setClock(v.currentTime);
+            if (v) setClock(clockOverrideRef?.current ?? v.currentTime);
             raf = requestAnimationFrame(step);
           };
           raf = requestAnimationFrame(step);
@@ -510,16 +512,66 @@ const onKeyActivate = (fn) => (e) => {
       );
     }
 
-    function LiveYouTubePreview({ videoUrl, videoRef, captionStyle, captionPosition, captionFontScale, logoPosition, transcriptWords, logoPreviewUrl, rendered, title, showYouTubeFrame, onToggleFrame, onBack }) {
+    function LiveYouTubePreview({ videoUrl, videoRef, captionStyle, captionPosition, captionFontScale, logoPosition, transcriptWords, logoPreviewUrl, rendered, title, showYouTubeFrame, onToggleFrame, onBack, editTimeline }) {
+      const virtualSegments = useMemo(() => {
+        let cursor = 0;
+        return (editTimeline || []).map(segment => {
+          const item = { ...segment, timeline_start: cursor, timeline_end: cursor + segment.source_end - segment.source_start };
+          cursor = item.timeline_end;
+          return item;
+        });
+      }, [editTimeline]);
+      const virtualIndexRef = useRef(0);
+      const editedClockRef = useRef(0);
       const { cfg, usingSample, activeChunk, activeWordInChunk } = useLiveCaptionPreview({
-        videoUrl, videoRef, captionStyle, activeClip: null, transcriptWords,
+        videoUrl, videoRef, captionStyle, activeClip: null, transcriptWords, clockOverrideRef: editedClockRef,
       });
       const [logoBroken, setLogoBroken] = useState(false);
       const [playing, setPlaying] = useState(false);
       const [currentTime, setCurrentTime] = useState(0);
       const [duration, setDuration] = useState(0);
       useEffect(() => { setLogoBroken(false); }, [logoPreviewUrl]);
-      useEffect(() => { setPlaying(false); setCurrentTime(0); setDuration(0); }, [videoUrl]);
+      useEffect(() => {
+        setPlaying(false); setCurrentTime(0); editedClockRef.current = 0; virtualIndexRef.current = 0;
+        setDuration(virtualSegments.length ? virtualSegments[virtualSegments.length - 1].timeline_end : 0);
+      }, [videoUrl, virtualSegments]);
+
+      const seekVirtual = (editedTime) => {
+        const video = videoRef?.current;
+        if (!video || !virtualSegments.length) return;
+        const targetTime = Math.max(0, Math.min(duration, editedTime));
+        let index = virtualSegments.findIndex(segment => targetTime < segment.timeline_end - 0.001);
+        if (index < 0) index = virtualSegments.length - 1;
+        const segment = virtualSegments[index];
+        virtualIndexRef.current = index;
+        video.currentTime = segment.source_start + Math.max(0, targetTime - segment.timeline_start);
+        editedClockRef.current = targetTime;
+        setCurrentTime(targetTime);
+      };
+
+      const updateYouTubeClock = (video) => {
+        if (!virtualSegments.length) {
+          editedClockRef.current = video.currentTime || 0;
+          setCurrentTime(video.currentTime || 0);
+          return;
+        }
+        const segment = virtualSegments[virtualIndexRef.current] || virtualSegments[0];
+        const editedTime = segment.timeline_start + video.currentTime - segment.source_start;
+        editedClockRef.current = Math.max(segment.timeline_start, Math.min(segment.timeline_end, editedTime));
+        setCurrentTime(editedClockRef.current);
+        if (!video.paused && video.currentTime >= segment.source_end - 0.015) {
+          const next = virtualSegments[virtualIndexRef.current + 1];
+          if (next) {
+            virtualIndexRef.current += 1;
+            video.currentTime = next.source_start;
+            video.play().catch(() => {});
+          } else {
+            video.pause();
+            setCurrentTime(duration);
+            editedClockRef.current = duration;
+          }
+        }
+      };
 
       const togglePlay = () => {
         const video = videoRef?.current;
@@ -533,10 +585,15 @@ const onKeyActivate = (fn) => (e) => {
         <div className="youtube-preview fade-in">
           <div className="youtube-preview-canvas">
             {videoUrl ? (
-              <video key={videoUrl} ref={videoRef} src={videoUrl} controls={!showYouTubeFrame} playsInline preload="auto"
+              <video key={videoUrl} ref={videoRef} src={videoUrl} controls={!showYouTubeFrame && !virtualSegments.length} playsInline preload="auto"
                 onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-                onTimeUpdate={e => setCurrentTime(e.currentTarget.currentTime || 0)}
-                onLoadedMetadata={e => setDuration(e.currentTarget.duration || 0)} />
+                onTimeUpdate={e => updateYouTubeClock(e.currentTarget)}
+                onLoadedMetadata={e => {
+                  if (virtualSegments.length) {
+                    setDuration(virtualSegments[virtualSegments.length - 1].timeline_end);
+                    seekVirtual(0);
+                  } else setDuration(e.currentTarget.duration || 0);
+                }} />
             ) : (
               <div className="youtube-preview-empty"><Play size={24} />Select a video to preview</div>
             )}
@@ -589,6 +646,13 @@ const onKeyActivate = (fn) => (e) => {
             </div>
             <button className="preview-back" onClick={onBack}>Back to clip preview</button>
           </div>
+          {virtualSegments.length > 0 && (
+            <div className="youtube-edit-scrubber">
+              <span>Edited timeline</span>
+              <input aria-label="Seek edited episode" type="range" min="0" max={Math.max(.001, duration)} step=".01" value={currentTime} onChange={event => seekVirtual(Number(event.target.value))} />
+              <time>{fmt(currentTime)} / {fmt(duration)}</time>
+            </div>
+          )}
           <div className="preview-toggle-row youtube-toggle-row">
             <label>
               <input type="checkbox" checked={!!showYouTubeFrame} onChange={onToggleFrame} />
@@ -697,6 +761,7 @@ const onKeyActivate = (fn) => (e) => {
     }
 
     export default function App() {
+      const navigate = useNavigate();
       const { assets } = useAssets();
       const [videoPath, setVideoPath] = useState('');
       const [transcriptMode, setTranscriptMode] = useState('whisper');
@@ -728,6 +793,9 @@ const onKeyActivate = (fn) => (e) => {
       const [phase, setPhase] = useState('idle');
       const [file, setFile] = useState(null);
       const [transcript, setTranscript] = useState(null);
+      const [activeEditProjectId, setActiveEditProjectId] = useState(null);
+      const [activeEditRevision, setActiveEditRevision] = useState(null);
+      const [activeEditTimeline, setActiveEditTimeline] = useState(null);
       const [transcriptOpen, setTranscriptOpen] = useState(true);
       const [transcriptFormat, setTranscriptFormat] = useState('readable');
       const formattedTranscript = useMemo(
@@ -968,6 +1036,24 @@ const onKeyActivate = (fn) => (e) => {
       };
 
       // Auto-transcribe when video is set and in whisper mode with no transcript
+      const openingEditorRef = useRef(false);
+      const openEditorAfterTranscript = useCallback(async (vp, completedTranscript, originalFilename) => {
+        if (!vp || !completedTranscript || openingEditorRef.current) return;
+        openingEditorRef.current = true;
+        const sourceFilename = originalFilename || vp.split(/[\\/]/).pop() || 'Episode';
+        const projectName = sourceFilename.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Episode';
+        const created = await api('/edit-projects', {
+          method: 'POST',
+          body: JSON.stringify({ video_path: vp, transcript: completedTranscript, name: projectName, source_filename: sourceFilename }),
+        });
+        if (created.error || !created.project?.id) {
+          openingEditorRef.current = false;
+          setError(created.error || 'Could not create the edit project.');
+          return;
+        }
+        navigate(`/editor/${created.project.id}`);
+      }, [navigate]);
+
       const autoTranscribe = async (vp) => {
         if (!vp || transcribing || transcript) return;
         setTranscribing(true);
@@ -994,6 +1080,7 @@ const onKeyActivate = (fn) => (e) => {
             setTranscript(data.data);
             setCachedTranscript(true);
             setTranscribing(false);
+            await openEditorAfterTranscript(vp, data.data, fileData.filename);
           } else if (data.job_id) {
             setTranscribeJobId(data.job_id);
           } else {
@@ -1006,15 +1093,17 @@ const onKeyActivate = (fn) => (e) => {
       useEffect(() => {
         if (!transcribeStream) return;
         if (transcribeStream.status === 'done') {
-          setTranscript(transcribeStream.result);
+          const completedTranscript = transcribeStream.result;
+          setTranscript(completedTranscript);
           setTranscribing(false);
           setTranscribeJobId(null);
+          void openEditorAfterTranscript(videoPath.trim() || file?.file_path, completedTranscript, file?.filename);
         } else if (transcribeStream.status === 'error') {
           setError('Transcription failed: ' + (transcribeStream.error || 'Unknown error'));
           setTranscribing(false);
           setTranscribeJobId(null);
         }
-      }, [transcribeStream?.status]);
+      }, [transcribeStream?.status, videoPath, file?.file_path, openEditorAfterTranscript]);
 
       // Auto-trigger transcribe when video path is set and auto transcript mode is active
       const autoTranscribeRef = useRef('');
@@ -1030,6 +1119,12 @@ const onKeyActivate = (fn) => (e) => {
       const fetchHistory = () => { fetch('/api/history?limit=50').then(r => r.json()).then(d => { if (Array.isArray(d)) setClipHistory(d); }).catch(() => { }); };
       useEffect(fetchHistory, []);
       useEffect(() => { if (phase === 'done') fetchHistory(); }, [phase]);
+      useEffect(() => {
+        if (!activeEditProjectId) { setActiveEditTimeline(null); return; }
+        api(`/edit-projects/${activeEditProjectId}`).then(data => {
+          if (data.project?.timeline) setActiveEditTimeline(data.project.timeline);
+        }).catch(() => setActiveEditTimeline(null));
+      }, [activeEditProjectId, activeEditRevision]);
 
       // --- MCP ↔ UI Bridge: connect SSE + sync state ---
       const { lastEvent: sseEvent, connected: mcpConnected } = useSSE();
@@ -1041,6 +1136,8 @@ const onKeyActivate = (fn) => (e) => {
         if (!stateHydrated) return;
         const syncable = {
           videoPath,
+          activeEditProjectId,
+          activeEditRevision,
           silenceOriginal,
           silencePlan,
           suggestions,
@@ -1060,7 +1157,7 @@ const onKeyActivate = (fn) => (e) => {
         if (key === prevSyncRef.current) return;
         prevSyncRef.current = key;
         fetch('/api/ui-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: key }).catch(() => { });
-      }, [stateHydrated, videoPath, file, silenceOriginal, silencePlan, suggestions, deselected, captionStyle, captionPosition, captionFontScale, logoPosition, cropStrategy, format, logoPath, outroPath, introPath, cleanFillers, silenceThreshold, silenceMinPause, silencePadding, phase, results, energyData]);
+      }, [stateHydrated, videoPath, file, activeEditProjectId, activeEditRevision, silenceOriginal, silencePlan, suggestions, deselected, captionStyle, captionPosition, captionFontScale, logoPosition, cropStrategy, format, logoPath, outroPath, introPath, cleanFillers, silenceThreshold, silenceMinPause, silencePadding, phase, results, energyData]);
 
       // Sync transcript separately (large payload)
       const prevTranscriptRef = useRef(null);
@@ -1109,6 +1206,8 @@ const onKeyActivate = (fn) => (e) => {
           if (sseEvent.type === 'state') {
             hydrationTargetRef.current = JSON.stringify({
               videoPath: d.videoPath || '',
+              activeEditProjectId: d.activeEditProjectId || null,
+              activeEditRevision: d.activeEditRevision ?? null,
               silenceOriginal: d.silenceOriginal || null,
               silencePlan: d.silencePlan || null,
               suggestions: d.suggestions || [],
@@ -1141,6 +1240,8 @@ const onKeyActivate = (fn) => (e) => {
           if (sseEvent.type === 'state' && Array.isArray(d.results)) setResults(d.results);
           if (d.activeExportJobId !== undefined) setBatchJobId(d.activeExportJobId);
           if (d.videoPath !== undefined) setVideoPath(d.videoPath);
+          if (d.activeEditProjectId !== undefined) setActiveEditProjectId(d.activeEditProjectId || null);
+          if (d.activeEditRevision !== undefined) setActiveEditRevision(d.activeEditRevision ?? null);
           if (d.silenceOriginal !== undefined) setSilenceOriginal(d.silenceOriginal);
           if (d.silencePlan !== undefined) setSilencePlan(d.silencePlan);
           if (d.transcript !== undefined) {
@@ -1291,10 +1392,12 @@ const onKeyActivate = (fn) => (e) => {
             _source: 'ui', _allowClear: true, videoPath: '', filePath: '',
             transcript: null, rawTranscriptText: '', suggestions: [],
             silenceOriginal: null, silencePlan: null,
+            activeEditProjectId: null, activeEditRevision: null,
             deselectedIndices: [], phase: 'idle', results: [], energyData: {},
           }),
         }).catch(() => {});
         setVideoPath(''); setFile(null); setTranscript(null); setTranscriptText('');
+        setActiveEditProjectId(null); setActiveEditRevision(null); setActiveEditTimeline(null);
         setSuggestions([]); setDeselected(new Set()); setPhase('idle'); setResults([]);
         setSilenceOriginal(null); setSilencePlan(null);
         setEnergyData({}); setPreviewSrc(null); setPreviewMode('clips');
@@ -1309,7 +1412,7 @@ const onKeyActivate = (fn) => (e) => {
           if (d.error) setError(d.error);
           if (d.file_path) {
             setVideoPath(d.file_path);
-            setFile({ file_path: d.file_path });
+            setFile(d);
             setTranscript(null); setCachedTranscript(false); setTranscriptText('');
             setSilenceOriginal(null); setSilencePlan(null);
             resetClipWorkForSource();
@@ -1407,22 +1510,33 @@ const onKeyActivate = (fn) => (e) => {
         logo_position: logoPosition,
         crop_strategy: cropStrategy,
         format,
-        ...(Array.isArray(c.segments) && c.segments.length > 0 && { keep_segments: c.segments }),
+        ...(Array.isArray(c.segments) && c.segments.length > 0 && (activeEditProjectId
+          ? { segments: c.segments }
+          : { keep_segments: c.segments })),
       });
 
       const startExport = async () => {
-        setPhase('exporting'); setResults([]);
-        const sc = suggestions.filter((_, i) => !deselected.has(i));
-        const vp = videoPath.trim() || file?.file_path;
-        const data = await api('/batch-clips', {
-          method: 'POST', body: JSON.stringify({
-            video_path: vp,
-            clips: sc.map(clipExportPayload),
-            transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, intro_path: introPath || undefined, clean_fillers: cleanFillers || undefined,
-            caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition,
-          })
-        });
-        setBatchJobId(data.job_id);
+        setError(null); setPhase('exporting'); setResults([]);
+        try {
+          const sc = suggestions.filter((_, i) => !deselected.has(i));
+          const vp = videoPath.trim() || file?.file_path;
+          const data = await api('/batch-clips', {
+            method: 'POST', body: JSON.stringify({
+              video_path: vp,
+              clips: sc.map(clipExportPayload),
+              transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, intro_path: introPath || undefined, clean_fillers: cleanFillers || undefined,
+              caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition,
+              edit_project_id: activeEditProjectId || undefined,
+              edit_revision: activeEditRevision ?? undefined,
+            })
+          });
+          if (!data?.job_id) throw new Error('The export did not start.');
+          setBatchJobId(data.job_id);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Export could not start.');
+          setPhase('review');
+          setBatchJobId(null);
+        }
       };
 
       const startFullEpisodeExport = async () => {
@@ -1438,6 +1552,8 @@ const onKeyActivate = (fn) => (e) => {
             caption_font_scale: captionFontScale,
             logo_position: logoPosition,
             logo_path: captionStyle === 'branded' ? logoPath || undefined : undefined,
+            edit_project_id: activeEditProjectId || undefined,
+            edit_revision: activeEditRevision ?? undefined,
           })
         });
         if (data.error) {
@@ -1568,17 +1684,28 @@ const onKeyActivate = (fn) => (e) => {
       const retryClipRef = useRef(null);
       const retryClip = async (idx) => {
         const sc = suggestions.filter((_, i) => !deselected.has(i));
-        const c = sc[idx]; retryClipRef.current = c; setRetryIdx(idx); setRetryJobId(null);
-        const vp = file?.file_path || videoPath.trim();
-        const data = await api('/create-clip', {
-          method: 'POST', body: JSON.stringify({
-            video_path: vp, start_second: c.start_second, end_second: c.end_second,
-            title: c.title, caption_style: captionStyle, caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition, crop_strategy: cropStrategy, format,
-            transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, intro_path: introPath || undefined, clean_fillers: cleanFillers || undefined,
-            ...(Array.isArray(c.segments) && c.segments.length > 0 && { keep_segments: c.segments }),
-          })
-        });
-        setRetryJobId(data.job_id);
+        const c = sc[idx];
+        if (!c) return;
+        retryClipRef.current = c; setRetryIdx(idx); setRetryJobId(null); setError(null);
+        try {
+          const vp = file?.file_path || videoPath.trim();
+          const data = await api('/create-clip', {
+            method: 'POST', body: JSON.stringify({
+              video_path: vp, start_second: c.start_second, end_second: c.end_second,
+              title: c.title, caption_style: captionStyle, caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition, crop_strategy: cropStrategy, format,
+              transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, intro_path: introPath || undefined, clean_fillers: cleanFillers || undefined,
+              ...(Array.isArray(c.segments) && c.segments.length > 0 && { keep_segments: c.segments }),
+              edit_project_id: activeEditProjectId || undefined,
+              edit_revision: activeEditRevision ?? undefined,
+            })
+          });
+          if (!data?.job_id) throw new Error('The retry did not start.');
+          setRetryJobId(data.job_id);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Clip retry could not start.');
+          setRetryIdx(null);
+          retryClipRef.current = null;
+        }
       };
 
       useEffect(() => {
@@ -1598,6 +1725,14 @@ const onKeyActivate = (fn) => (e) => {
           return next;
         });
         setRetryIdx(null); setRetryJobId(null);
+      }, [retryStream?.status]);
+
+      useEffect(() => {
+        if (retryStream?.status !== 'error') return;
+        setError('Clip retry failed: ' + (retryStream.error || 'Unknown error'));
+        setRetryIdx(null);
+        setRetryJobId(null);
+        retryClipRef.current = null;
       }, [retryStream?.status]);
 
       const toggleClip = (i) => setDeselected(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n; });
@@ -1699,6 +1834,8 @@ const onKeyActivate = (fn) => (e) => {
             body: JSON.stringify({ _source: 'ui', transcript: t, videoPath: videoPath.trim(), filePath: fileData.file_path }),
           }).catch(() => { });
           setPhase('idle');
+          await openEditorAfterTranscript(fileData.file_path || videoPath.trim(), t, fileData.filename);
+          return;
         }
 
         // Ensure video path is synced even without transcript parsing
@@ -1809,6 +1946,12 @@ const onKeyActivate = (fn) => (e) => {
           <PageHeader
             title="Podcast content studio"
             actions={<>
+              {activeEditProjectId && (
+                <>
+                  <Link to={`/editor/${activeEditProjectId}`} className="btn btn-ghost btn-sm"><ChevronLeft size={13} /> Back to editor</Link>
+                  <span className="pill pill-blue">Edited episode · revision {activeEditRevision}</span>
+                </>
+              )}
               {mcpConnected && (
                 <span className="pill" style={{ fontSize: 10, letterSpacing: '0.5px', background: 'var(--green-subtle)', color: 'var(--green)', border: '1px solid var(--green-border)' }}>
                   MCP linked
@@ -2055,6 +2198,14 @@ const onKeyActivate = (fn) => (e) => {
               </div>
 
               {/* Silence removal */}
+              {activeEditProjectId ? (
+                <div className="section card silence-card">
+                  <div className="silence-head">
+                    <div className="silence-title-wrap"><span className="silence-icon"><Scissors size={15} /></span><div><div className="section-label" style={{ marginBottom: 2 }}>Silence is part of this edit</div><div className="silence-subtitle">Review or change non-destructive silence cuts in Episode Editor.</div></div></div>
+                    <Link className="btn btn-ghost btn-sm" to={`/editor/${activeEditProjectId}`}>Back to editor</Link>
+                  </div>
+                </div>
+              ) : (
               <div className="section card silence-card">
                 <div className="silence-head">
                   <div className="silence-title-wrap">
@@ -2175,6 +2326,7 @@ const onKeyActivate = (fn) => (e) => {
                   </>
                 )}
               </div>
+              )}
 
               {/* Settings */}
               <div className="section card">
@@ -2334,10 +2486,14 @@ const onKeyActivate = (fn) => (e) => {
                     <div>
                       <div className="section-label" style={{ marginBottom: 5 }}>Full episode</div>
                       <div className="hint" style={{ lineHeight: 1.45 }}>
-                        Export this entire imported video with {captionStyle} captions. Original framing and audio stay intact.
+                        {activeEditProjectId
+                          ? `Export edited revision ${activeEditRevision} with ${captionStyle} captions. Original framing and audio stay intact.`
+                          : `Export this entire imported video with ${captionStyle} captions. Original framing and audio stay intact.`}
                       </div>
                     </div>
-                    <span className="pill pill-blue" style={{ flexShrink: 0, fontSize: 10 }}>Original frame</span>
+                    <span className="pill pill-blue" style={{ flexShrink: 0, fontSize: 10 }}>
+                      {activeEditProjectId ? 'Edited timeline' : 'Original frame'}
+                    </span>
                   </div>
 
                   {fullEpisodeBusy && (
@@ -2753,6 +2909,7 @@ const onKeyActivate = (fn) => (e) => {
                     showYouTubeFrame={showYouTubeFrame}
                     onToggleFrame={() => setShowYouTubeFrame(v => !v)}
                     onBack={() => { setPreviewMode('clips'); setPreviewSrc(null); }}
+                    editTimeline={activeEditTimeline}
                   />
                 )}
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from services.media_probe import FFMPEG_TIMEOUT
+from services.media_probe import FFMPEG_TIMEOUT, has_audio_stream
 from utils.proc import run as proc_run
 
 
@@ -18,6 +18,8 @@ def cut_segment(
     output_path: str,
     start_second: float,
     end_second: float,
+    audio_fade_in: float = 0.0,
+    audio_fade_out: float = 0.0,
 ) -> str:
     """Extract a single time segment from a video file.
 
@@ -37,7 +39,17 @@ def cut_segment(
         "-ss", str(start_second),
         "-i", input_path,
         "-t", str(duration),
+        "-map", "0:v:0", "-map", "0:a:0?",
         "-c:v", "libx264", "-crf", "16", "-preset", "fast", "-profile:v", "high",
+    ]
+    if (audio_fade_in or audio_fade_out) and has_audio_stream(input_path):
+        filters = []
+        if audio_fade_in:
+            filters.append(f"afade=t=in:st=0:d={audio_fade_in}")
+        if audio_fade_out:
+            filters.append(f"afade=t=out:st={max(0, duration - audio_fade_out)}:d={audio_fade_out}")
+        cmd += ["-af", ",".join(filters)]
+    cmd += [
         "-c:a", "aac", "-b:a", "192k",
         "-avoid_negative_ts", "make_zero",
         output_path,
@@ -52,6 +64,7 @@ def cut_multi_segment(
     input_path: str,
     output_path: str,
     segments: list[dict],
+    declick: bool = False,
 ) -> str:
     """Cut multiple time ranges and concatenate them seamlessly.
 
@@ -73,7 +86,17 @@ def cut_multi_segment(
     try:
         for i, seg in enumerate(segments):
             part_path = os.path.join(work_dir, f"_part_{i}.mp4")
-            cut_segment(input_path, part_path, seg["start"], seg["end"])
+            if declick:
+                cut_segment(
+                    input_path,
+                    part_path,
+                    seg["start"],
+                    seg["end"],
+                    audio_fade_in=0.005 if i > 0 else 0.0,
+                    audio_fade_out=0.005 if i < len(segments) - 1 else 0.0,
+                )
+            else:
+                cut_segment(input_path, part_path, seg["start"], seg["end"])
             part_paths.append(part_path)
 
         with open(concat_file, "w", encoding="utf-8") as f:

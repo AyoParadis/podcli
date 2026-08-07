@@ -17,12 +17,16 @@ interface BatchRecordContext {
   defaultCropStrategy?: string;
   defaultFormat?: Format;
   contentTypeFor?: (start: number, end: number) => string | undefined;
+  editProjectId?: string;
+  editRevision?: number;
+  orderedSegmentsFor?: (row: BatchResultRow) => Array<{ start: number; end: number }> | undefined;
 }
 
 export interface BatchClipSpec {
   start_second: number;
   end_second: number;
   keep_segments?: Array<{ start: number; end: number }>;
+  ordered_segments?: Array<{ start: number; end: number }>;
 }
 
 export interface BatchRecipeContext {
@@ -100,8 +104,8 @@ export class ClipsHistory {
     const recorded: ClipHistoryEntry[] = [];
     for (const r of results) {
       if (r.status !== "success" || !r.output_path) continue;
-      const start = r.start_second || 0;
-      const end = r.end_second || 0;
+      const start = r.source_start_second ?? r.start_second ?? 0;
+      const end = r.source_end_second ?? r.end_second ?? 0;
       recorded.push(
         await this.record({
           source_video: ctx.sourceVideo,
@@ -116,6 +120,9 @@ export class ClipsHistory {
           duration: r.duration || 0,
           content_type: ctx.contentTypeFor?.(start, end),
           transcript_slice: sliceTranscript(ctx.transcriptWords, start, end),
+          edit_project_id: ctx.editProjectId,
+          edit_revision: ctx.editRevision,
+          ordered_segments: ctx.orderedSegmentsFor?.(r),
         }),
       );
     }
@@ -142,6 +149,7 @@ export class ClipsHistory {
         introPath: ctx.introPath,
         cleanFillers: ctx.cleanFillers,
         keepSegments: spec?.keep_segments,
+        orderedSegments: spec?.ordered_segments,
       });
     }
   }
@@ -155,9 +163,15 @@ export class ClipsHistory {
       introPath?: string | null;
       cleanFillers?: boolean;
       keepSegments?: Array<{ start: number; end: number }>;
+      orderedSegments?: Array<{ start: number; end: number }>;
     },
   ): Promise<void> {
-    const words = sliceWords(ctx.transcriptWords ?? [], rec.start_second, rec.end_second);
+    const sourceWords = ctx.transcriptWords ?? [];
+    const words = ctx.orderedSegments?.length
+      ? sourceWords.filter((word) => ctx.orderedSegments!.some((segment) =>
+          word.end > segment.start && word.start < segment.end,
+        ))
+      : sliceWords(sourceWords, rec.start_second, rec.end_second);
     await this.saveWords(rec.id, words);
     await this.saveRecipe(rec.id, {
       caption_style: rec.caption_style,
@@ -169,9 +183,13 @@ export class ClipsHistory {
       clean_fillers: ctx.cleanFillers ?? false,
       transcript_words: words,
       ...(ctx.keepSegments?.length && { keep_segments: ctx.keepSegments }),
+      ...(ctx.orderedSegments?.length && { ordered_segments: ctx.orderedSegments }),
     });
     if (ctx.keepSegments?.length) {
       await this.update(rec.id, { keep_segments: ctx.keepSegments });
+    }
+    if (ctx.orderedSegments?.length) {
+      await this.update(rec.id, { ordered_segments: ctx.orderedSegments });
     }
   }
 
@@ -185,7 +203,8 @@ export class ClipsHistory {
     endSecond: number,
     captionStyle: string,
     cropStrategy: string,
-    format: string = "vertical"
+    format: string = "vertical",
+    edit?: { projectId?: string; revision?: number },
   ): Promise<ClipHistoryEntry | null> {
     const entries = await this.load();
     const srcName = basename(sourceVideo);
@@ -196,6 +215,8 @@ export class ClipsHistory {
         if (e.caption_style !== captionStyle) return false;
         if (e.crop_strategy !== cropStrategy) return false;
         if ((e.format || "vertical") !== format) return false;
+        if ((e.edit_project_id || undefined) !== (edit?.projectId || undefined)) return false;
+        if ((e.edit_revision ?? undefined) !== (edit?.revision ?? undefined)) return false;
         if (Math.abs(e.start_second - startSecond) > 2) return false;
         if (Math.abs(e.end_second - endSecond) > 2) return false;
         // Check output still exists

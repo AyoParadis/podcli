@@ -79,6 +79,14 @@ export const suggestClipsToolDef = {
           required: ["title", "start_second", "end_second", "reasoning"],
         },
       },
+      edit_project_id: {
+        type: "string",
+        description: "Active edit project id from get_ui_state. Omit when editing is not active.",
+      },
+      edit_revision: {
+        type: "number",
+        description: "Exact active edit revision from get_ui_state.",
+      },
     },
     required: ["suggestions"],
   },
@@ -98,6 +106,8 @@ export interface RawSuggestion {
 
 export interface SuggestClipsInput {
   suggestions: RawSuggestion[];
+  edit_project_id?: string;
+  edit_revision?: number;
 }
 
 export async function handleSuggestClips(input: SuggestClipsInput): Promise<string> {
@@ -131,6 +141,8 @@ export async function handleSuggestClips(input: SuggestClipsInput): Promise<stri
       preview_text: s.preview_text || "",
       content_type: s.content_type || "unknown",
       score: s.score || 0,
+      edit_project_id: input.edit_project_id,
+      edit_revision: input.edit_revision,
       suggested_caption_style: s.suggested_caption_style || "hormozi",
       timestamp_display: `${formatTime(s.start_second)} → ${formatTime(s.end_second)}`,
     };

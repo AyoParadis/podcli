@@ -23,6 +23,7 @@ from typing import Callable, Iterable, Optional
 from config.paths import paths
 from services.audio_extract import extract_wav_16k_mono
 from services.media_probe import get_media_duration_seconds, has_audio_stream
+from services.transcript_packer import compute_cache_hash
 from utils.proc import run as proc_run
 
 try:
@@ -54,6 +55,10 @@ def _emit(callback: ProgressCallback, percent: int, message: str) -> None:
 
 def _model_path() -> Path:
     return Path(paths["cache"]) / "models" / SILERO_MODEL_FILENAME
+
+
+def _speech_cache_path(video_path: str) -> Path:
+    return Path(paths["cache"]) / "silence" / f"{compute_cache_hash(video_path)}.json"
 
 
 def _sha256(file_path: Path) -> str:
@@ -172,6 +177,21 @@ def detect_speech(
     if not _VAD_RUNTIME_AVAILABLE:
         raise RuntimeError("Local silence detection requires numpy and onnxruntime")
 
+    cache_path = _speech_cache_path(video_path)
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        probabilities = [float(value) for value in cached["probabilities"]]
+        total_samples = int(cached["audio_samples"])
+        if cached.get("schema_version") == 1 and probabilities and total_samples > 0:
+            _emit(progress_callback, 65, "Using cached source speech analysis")
+            return probabilities_to_speech_segments(
+                probabilities,
+                total_samples,
+                threshold=threshold,
+            )
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
     model_path = ensure_silero_model(progress_callback)
     _emit(progress_callback, 5, "Extracting episode audio")
     wav_path = extract_wav_16k_mono(video_path)
@@ -209,6 +229,17 @@ def detect_speech(
                     last_percent = percent
                     _emit(progress_callback, percent, "Finding spoken sections")
 
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+            temp_path.write_text(json.dumps({
+                "schema_version": 1,
+                "audio_samples": total_samples,
+                "probabilities": probabilities,
+            }), encoding="utf-8")
+            os.replace(temp_path, cache_path)
+        except (OSError, ValueError):
+            pass
         return probabilities_to_speech_segments(probabilities, total_samples, threshold=threshold)
     finally:
         try:

@@ -211,7 +211,7 @@ async function main() {
     execSync(
       `ffmpeg -y -hide_banner -loglevel warning -i "${path.resolve(opts.video)}" -i "${captionOverlay}" ` +
       `-filter_complex "[0:v][1:v]overlay=0:0:shortest=1" ` +
-      `-c:v libx264 -crf 18 -preset fast -map 0:a -c:a copy "${opts.output}"`,
+      `-c:v libx264 -crf 18 -preset fast -map 0:a? -c:a copy "${opts.output}"`,
       { stdio: ["pipe", "pipe", "pipe"], timeout: 300000 }
     );
 

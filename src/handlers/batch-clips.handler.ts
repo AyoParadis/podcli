@@ -6,6 +6,8 @@ import { paths } from "../config/paths.js";
 import { webServerUrl } from "../config/server.js";
 import { validateClipRange } from "../utils/clip-validation.js";
 import { childLogger } from "../utils/logger.js";
+import { mapEditedClipToSource, remapTranscript } from "../utils/edit-project.js";
+import { EditProjectStore } from "../services/edit-project-store.js";
 import type {
   BatchClipsInput,
   BatchClipSpec,
@@ -155,6 +157,8 @@ export async function handleBatchClips(input: BatchClipsInput): Promise<string> 
 
   const batchFormat = input.format || settings.format || "vertical";
   const cleanFillers = input.clean_fillers ?? settings.cleanFillers ?? true;
+  const editProjectId = input.edit_project_id || state?.activeEditProjectId;
+  const editRevision = input.edit_revision ?? state?.activeEditRevision;
 
   const buildClipFromSuggestion = (s: SuggestedClip, num: number): BatchClipSpec => ({
     start_second: s.start_second,
@@ -241,6 +245,8 @@ export async function handleBatchClips(input: BatchClipsInput): Promise<string> 
           outro_path: settings.outroPath || null,
           intro_path: settings.introPath || null,
           keep_caption_overlay: input.keep_caption_overlay === true,
+          edit_project_id: editProjectId,
+          edit_revision: editRevision,
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
@@ -262,11 +268,32 @@ export async function handleBatchClips(input: BatchClipsInput): Promise<string> 
     }
   }
 
+  let renderVideoPath = videoPath;
+  let renderWords = transcriptWords;
+  let historyWords = transcriptWords;
+  let editProject: ReturnType<EditProjectStore["get"]> | null = null;
+  if (editProjectId) {
+    const store = new EditProjectStore();
+    editProject = store.get(editProjectId);
+    if (!Number.isInteger(editRevision) || editProject.project.revision !== editRevision) {
+      return JSON.stringify({ error: `Edit project is now revision ${editProject.project.revision}; activate it again before rendering` });
+    }
+    renderVideoPath = editProject.project.source.path;
+    renderWords = editProject.transcript.words;
+    historyWords = remapTranscript(editProject.transcript, editProject.project.timeline).words;
+    const editTimeline = editProject.project.timeline;
+    clips = clips.map((clip) => {
+      const ordered = mapEditedClipToSource(editTimeline, clip);
+      const { keep_segments: _legacy, ...rest } = clip;
+      return { ...rest, ordered_segments: ordered };
+    });
+  }
+
   const result = await executor.execute<BatchClipsResult>("batch_clips", {
-    video_path: videoPath,
+    video_path: renderVideoPath,
     clips,
     format: batchFormat,
-    transcript_words: transcriptWords,
+    transcript_words: renderWords,
     clean_fillers: cleanFillers,
     allow_ass_fallback: input.allow_ass_fallback === true,
     keep_caption_overlay: input.keep_caption_overlay === true,
@@ -282,14 +309,17 @@ export async function handleBatchClips(input: BatchClipsInput): Promise<string> 
   const data = result.data;
 
   const recorded = await history.recordBatchResults(data.results, {
-    sourceVideo: videoPath,
-    transcriptWords: transcriptWords,
+    sourceVideo: renderVideoPath,
+    transcriptWords: historyWords,
     defaultCaptionStyle: settings.captionStyle || "hormozi",
     defaultCropStrategy: settings.cropStrategy || "speaker",
     defaultFormat: batchFormat,
+    editProjectId: editProject?.project.id,
+    editRevision: editProject?.project.revision,
+    orderedSegmentsFor: (row) => typeof row.clip_index === "number" ? clips[row.clip_index]?.ordered_segments : undefined,
   });
   await history.persistBatchRecipes(data.results, recorded, {
-    transcriptWords: transcriptWords,
+    transcriptWords: renderWords,
     clipSpecs: clips,
     logoPath: settings.logoPath || null,
     outroPath: settings.outroPath || null,

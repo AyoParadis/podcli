@@ -23,12 +23,10 @@ import {
   handleBatchClips,
 } from "./handlers/batch-clips.handler.js";
 import { registerIntegrationMcpTools } from "./handlers/integrations.handler.js";
-import { FileManager } from "./services/file-manager.js";
 import { KnowledgeBase } from "./services/knowledge-base.js";
 import { AssetManager, inferType } from "./services/asset-manager.js";
 import { ClipsHistory } from "./services/clips-history.js";
 import { TranscriptCache } from "./services/transcript-cache.js";
-import { paths } from "./config/paths.js";
 import { webServerUrl } from "./config/server.js";
 import { childLogger } from "./utils/logger.js";
 import { mcpError } from "./utils/errors.js";
@@ -413,10 +411,25 @@ export function createServer(): McpServer {
           }),
         )
         .describe("Array of suggested clip moments"),
+      edit_project_id: z.string().optional().describe("Active edit project id from get_ui_state"),
+      edit_revision: z.number().int().optional().describe("Exact active edit revision from get_ui_state"),
     },
-    async ({ suggestions }) => {
+    async ({ suggestions, edit_project_id, edit_revision }) => {
       try {
-        const result = await handleSuggestClips({ suggestions });
+        const current = await readUIState();
+        const currentProjectId = current?.activeEditProjectId;
+        const currentRevision = current?.activeEditRevision;
+        if (currentProjectId && (
+          (edit_project_id && edit_project_id !== currentProjectId) ||
+          (edit_revision !== undefined && edit_revision !== currentRevision)
+        )) {
+          throw new Error(`Edit project changed. Current revision: ${currentRevision}`);
+        }
+        const result = await handleSuggestClips({
+          suggestions,
+          edit_project_id: currentProjectId || edit_project_id,
+          edit_revision: currentRevision ?? edit_revision,
+        });
 
         // Push enriched suggestions (with clip_ids) to Web UI
         try {
@@ -557,13 +570,16 @@ export function createServer(): McpServer {
           if (resolved) params.logo_path = resolved;
         }
 
-        // Resolve clip_number from UI state BEFORE routing
+        // Resolve clip_number and active edit identity from UI state BEFORE routing.
+        const currentUiState = await readUIState();
+        const editProjectId = currentUiState?.activeEditProjectId;
+        const editRevision = currentUiState?.activeEditRevision;
         let keepSegments: Array<{ start: number; end: number }> | null = null;
         if (
           params.clip_number != null &&
           (params.start_second == null || params.end_second == null)
         ) {
-          const uiState = await readUIState();
+          const uiState = currentUiState;
           const suggestions = uiState?.suggestions ?? [];
           const settings = uiState?.settings ?? {};
           const idx = (params.clip_number as number) - 1;
@@ -615,6 +631,7 @@ export function createServer(): McpServer {
           (params.caption_style || "hormozi") as string,
           (params.crop_strategy || "speaker") as string,
           (params.format || "vertical") as string,
+          { projectId: editProjectId, revision: editRevision },
         );
         if (dup) {
           return {
@@ -656,6 +673,8 @@ export function createServer(): McpServer {
                 clean_fillers: params.clean_fillers,
               }),
               keep_caption_overlay: params.keep_caption_overlay === true,
+              edit_project_id: editProjectId,
+              edit_revision: editRevision,
             }),
           });
           if (webRes.ok) {
@@ -697,6 +716,9 @@ export function createServer(): McpServer {
         }
 
         if (!usedWebServer) {
+          if (editProjectId) {
+            throw new Error("The Studio must be running to render an edited episode safely. Launch podclip and try again.");
+          }
           // Notify UI that export is starting
           await uiPing({ phase: "exporting" });
 

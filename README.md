@@ -7,14 +7,20 @@
 
 ### What this fork adds
 
-- One-command local Studio launch with `podclip`
-- Local silence detection, review, and removal before editing
-- Full-episode YouTube workflow with a large 16:9 preview and export
-- Live caption and logo previews with placement and font-size controls
-- Format-aware captions, including single-line captions for YouTube
-- Readable full-episode and per-clip transcripts with one-click copying
+- **`podclip` launcher** — open the local Studio from any directory with one command
+- **Non-destructive episode editor** — split, trim, ripple-delete, reorder, and edit by transcript without modifying raw media
+- **Integrated silence removal** — detect, review, and remove silent sections before editing
+- **Full-episode YouTube export** — render and download the complete edited episode from Studio
+- **Large YouTube preview** — review the full episode in a responsive 16:9 frame before export
+- **Adjustable captions** — preview and change caption placement and font size for each format
+- **Adjustable logo overlay** — preview the logo and control its placement on the video
+- **YouTube-specific captions** — use a single caption line for horizontal videos
+- **Full-episode transcripts** — view a readable, formatted transcript and copy it in one click
+- **Per-clip transcripts** — open any rendered clip and copy its complete saved transcript
 
 Launch the Studio from any directory with `podclip`.
+
+Imported episodes now open in **Edit episode** after transcription. Every cut is stored as a small project instruction; previews, silence review, clip discovery, and the final YouTube render all use that saved revision directly. See the [episode editor guide](docs/episode-editor.md).
 
 <p align="center">
   <strong>Open-source AI podcast clipper.</strong><br/>

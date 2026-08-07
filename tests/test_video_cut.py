@@ -98,6 +98,34 @@ class CutMultiSegmentTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_declick_fades_only_internal_ordered_boundaries(self):
+        tmpdir = tempfile.mkdtemp(prefix="podcli-cut-test-")
+        out_path = os.path.join(tmpdir, "out.mp4")
+
+        def fake_cut(_input, part_path, _start, _end, **_kwargs):
+            with open(part_path, "w") as output:
+                output.write("stub")
+            return part_path
+
+        try:
+            with mock.patch.object(video_cut, "cut_segment", side_effect=fake_cut) as cut, \
+                 mock.patch.object(video_cut, "proc_run", return_value=_ok()):
+                video_cut.cut_multi_segment(
+                    "/in.mp4", out_path,
+                    [{"start": 0, "end": 5}, {"start": 10, "end": 15}],
+                    declick=True,
+                )
+            self.assertEqual(cut.call_args_list[0].kwargs, {
+                "audio_fade_in": 0.0,
+                "audio_fade_out": 0.005,
+            })
+            self.assertEqual(cut.call_args_list[1].kwargs, {
+                "audio_fade_in": 0.005,
+                "audio_fade_out": 0.0,
+            })
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_multi_segment_cleans_up_on_failure(self):
         tmpdir = tempfile.mkdtemp(prefix="podcli-cut-test-")
         out_path = os.path.join(tmpdir, "out.mp4")

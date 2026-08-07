@@ -285,6 +285,22 @@ export function dropEnergy(
 export const clampClipIndex = (idx: number | null, length: number): number | null =>
   idx === null || length === 0 ? null : Math.min(idx, length - 1);
 
+const UUID_STEM = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Hides upload-storage UUIDs from the CEO-facing project UI. */
+export function friendlyProjectName(name: string, sourceFilename?: string): string {
+  const trimmed = String(name || "").trim();
+  const sourceStem = String(sourceFilename || "").replace(/\.[^.]+$/, "");
+  if (!trimmed || (UUID_STEM.test(trimmed) && (!sourceStem || UUID_STEM.test(sourceStem)))) return "Untitled episode";
+  return trimmed;
+}
+
+export function friendlySourceFilename(filename: string): string {
+  const trimmed = String(filename || "").trim();
+  const stem = trimmed.replace(/\.[^.]+$/, "");
+  return !trimmed || UUID_STEM.test(stem) ? "Local video" : trimmed;
+}
+
 /**
  * The result for `clip`, or undefined if it has not been rendered. Rows written
  * before the server stamped bounds (a restored session) carry no key, so they

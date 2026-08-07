@@ -9,6 +9,8 @@ import {
   clampClipIndex,
   resolveAssetName,
   formatTranscriptText,
+  friendlyProjectName,
+  friendlySourceFilename,
 } from "./lib";
 
 describe("fmt", () => {
@@ -35,6 +37,16 @@ describe("fmtMs", () => {
   it("appends milliseconds", () => {
     expect(fmtMs(12.5)).toBe("0:12.500");
     expect(fmtMs(4711.25)).toBe("1:18:31.250");
+  });
+});
+
+describe("friendly project labels", () => {
+  it("hides internal upload UUIDs but preserves real filenames", () => {
+    const uuid = "41f3f9e0-5bc9-493b-8a2e-d82865d2a2bc";
+    expect(friendlyProjectName(uuid, `${uuid}.mov`)).toBe("Untitled episode");
+    expect(friendlySourceFilename(`${uuid}.mov`)).toBe("Local video");
+    expect(friendlyProjectName("CEO interview", "CEO interview.mov")).toBe("CEO interview");
+    expect(friendlySourceFilename("CEO interview.mov")).toBe("CEO interview.mov");
   });
 });
 
