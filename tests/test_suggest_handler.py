@@ -112,6 +112,10 @@ class SuggestReactionTimesTests(unittest.TestCase):
         captured, _ = self._run({"segments": SEGMENTS})
         self.assertIsNone(captured["reaction_times"])
 
+    def test_quality_only_is_forwarded_to_ai_selection(self):
+        captured, _ = self._run({"segments": SEGMENTS, "quality_only": True})
+        self.assertTrue(captured["quality_only"])
+
 
 if __name__ == "__main__":
     unittest.main()

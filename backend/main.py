@@ -692,6 +692,7 @@ def handle_suggest_clips(task_id: str, params: dict):
 
     segments = params.get("segments", [])
     top_n = params.get("top_n", 5)
+    quality_only = bool(params.get("quality_only", False))
     existing_clips = params.get("existing_clips", [])
 
     if not segments:
@@ -719,6 +720,7 @@ def handle_suggest_clips(task_id: str, params: dict):
         progress_callback=lambda pct, msg: emit_progress(task_id, "suggesting", pct, msg),
         error_sink=errors,
         reaction_times=reaction_times,
+        quality_only=quality_only,
     )
 
     if clips is None:

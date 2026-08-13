@@ -10,6 +10,7 @@
 - **`podclip` launcher** — open the local Studio from any directory with one command
 - **Non-destructive episode editor** — split, trim, ripple-delete, reorder, and edit by transcript without modifying raw media
 - **Integrated silence removal** — detect, review, and remove silent sections before editing
+- **Quality-gated clip discovery** — scan the full episode for every strong moment without filling a clip quota
 - **Full-episode YouTube export** — render and download the complete edited episode from Studio
 - **Large YouTube preview** — review the full episode in a responsive 16:9 frame before export
 - **Adjustable captions** — preview and change caption placement and font size for each format

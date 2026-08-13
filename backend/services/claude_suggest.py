@@ -500,6 +500,7 @@ def _build_prompt(
     top_n: int,
     exclude_clips: list[dict] | None = None,
     reaction_times: list[float] | None = None,
+    quality_only: bool = False,
 ) -> str:
     """Build the prompt for Claude to extract clips.
 
@@ -545,9 +546,26 @@ def _build_prompt(
                 + "\n".join(lines)
             )
 
-    return f"""You are a viral clip editor for TikTok and YouTube Shorts. Find the {top_n} most scroll-stopping moments in this podcast transcript.
+    selection_goal = (
+        "Find every genuinely scroll-stopping moment in this podcast transcript. "
+        "There is no clip quota: return all strong moments and skip every weak one."
+        if quality_only
+        else f"Find the {top_n} most scroll-stopping moments in this podcast transcript."
+    )
+    quality_gate = (
+        "\nQUALITY GATE (CRITICAL):\n"
+        "- Quality beats quantity. Never add a clip to fill a target count.\n"
+        "- Return only moments scoring at least 15/20 across the four dimensions below.\n"
+        "- Returning zero or only a few clips is correct when the episode has few strong moments.\n"
+        "- Search the full transcript before deciding no more qualifying moments exist.\n"
+        if quality_only
+        else ""
+    )
+
+    return f"""You are a viral clip editor for TikTok and YouTube Shorts. {selection_goal}
 
 IMPORTANT: Return ONLY valid JSON. No markdown, no explanation, no code fences.
+{quality_gate}
 
 TIMESTAMP FORMAT: All timestamps in the transcript are in SECONDS (e.g., [123.4s]).
 All timestamps you return MUST be in SECONDS as numbers (e.g., 123.4), NOT minutes:seconds.
@@ -912,6 +930,7 @@ def suggest_with_claude(
     timeout: int = 900,
     error_sink: Optional[list[str]] = None,
     reaction_times: list[float] | None = None,
+    quality_only: bool = False,
 ) -> Optional[list[dict]]:
     """
     Use an AI CLI (Claude Code or Codex) to extract the best clip moments.
@@ -941,6 +960,7 @@ def suggest_with_claude(
         top_n,
         exclude_clips=exclude_clips,
         reaction_times=reaction_times,
+        quality_only=quality_only,
     )
 
     # Write prompt to temp file to avoid shell escaping issues.
@@ -1107,6 +1127,7 @@ def suggest_initial_with_claude(
     progress_callback: Optional[Callable[[int, str], None]] = None,
     error_sink: Optional[list[str]] = None,
     reaction_times: list[float] | None = None,
+    quality_only: bool = False,
 ) -> Optional[list[dict]]:
     """
     Initial clip discovery entry point.
@@ -1116,6 +1137,7 @@ def suggest_initial_with_claude(
     prompt.
     """
     exclude_clips = exclude_clips or []
+    quality_kwargs = {"quality_only": True} if quality_only else {}
     if not _should_bucket_initial_selection(segments):
         return suggest_with_claude(
             segments=segments,
@@ -1125,6 +1147,7 @@ def suggest_initial_with_claude(
             error_sink=error_sink,
             timeout=180,
             reaction_times=reaction_times,
+            **quality_kwargs,
         )
 
     start_bound = float(segments[0].get("start", 0))
@@ -1157,6 +1180,7 @@ def suggest_initial_with_claude(
             error_sink=error_sink,
             timeout=180,
             reaction_times=reaction_times,
+            **quality_kwargs,
         )
 
     if progress_callback:
@@ -1190,6 +1214,7 @@ def suggest_initial_with_claude(
             reaction_times=[
                 t for t in (reaction_times or []) if bucket["start"] <= t <= bucket["end"]
             ] or None,
+            **quality_kwargs,
         )
         if not bucket_clips:
             continue
@@ -1214,6 +1239,7 @@ def suggest_initial_with_claude(
         error_sink=error_sink,
         timeout=120,
         reaction_times=reaction_times,
+        **quality_kwargs,
     )
     if fallback_clips:
         deduped = _dedupe_clips_by_range(deduped + fallback_clips)

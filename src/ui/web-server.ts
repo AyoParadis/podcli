@@ -40,7 +40,13 @@ import { EditProjectConflictError, EditProjectStore } from "../services/edit-pro
 import { paths, pythonEnv } from "../config/paths.js";
 import { webServerPort } from "../config/server.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
-import { maxClipSeconds, validateClipRange, validateSuggestionRange } from "../utils/clip-validation.js";
+import {
+  maxClipSeconds,
+  MIN_STRONG_SUGGESTION_SCORE,
+  suggestionCapacity,
+  validateClipRange,
+  validateSuggestionRange,
+} from "../utils/clip-validation.js";
 import { advanceProgress, tagSubmittedClip, tagSubmittedClips } from "../utils/clip-results.js";
 import { DEMO_ASSETS_DIR } from "./demo-fixtures.js";
 import { registerConfigIntegrationRoutes } from "../handlers/integrations.routes.js";
@@ -1749,7 +1755,9 @@ app.post("/api/edit-projects/:id/activate", (req, res) => {
     uiState.deselectedIndices = [];
     uiState.silencePlan = null;
     uiState.results = [];
-    uiState.phase = "review";
+    // Activation clears suggestions, so return to the generation step. `review`
+    // has no usable controls when there are no suggestions to review.
+    uiState.phase = "idle";
     uiState.lastUpdated = Date.now();
     sessionTranscripts.set(result.project.source.path, result.transcript as ServerTranscript);
     registerSourcePath(result.project.source.path);
@@ -3930,7 +3938,7 @@ app.post("/api/generate-prompt", (req, res) => {
 // --- AI-powered clip suggestion (delegates to Python backend) ---
 
 app.post("/api/claude-suggest", async (req, res) => {
-  const { top_n = 5, min_duration, max_duration } = req.body;
+  const { top_n = 5, min_duration, max_duration, find_all_quality = false } = req.body;
   const editProjectId = uiState.activeEditProjectId;
   const editRevision = uiState.activeEditRevision;
 
@@ -3965,7 +3973,16 @@ app.post("/api/claude-suggest", async (req, res) => {
 
     // The backend derives laughter/reaction anchors from the audio, so it needs
     // the source video, not just the segments.
-    const params: Record<string, unknown> = { segments: segs, top_n, existing_clips };
+    const requestedMinDuration = Number.isFinite(Number(min_duration)) ? Number(min_duration) : 20;
+    const requestedTopN = find_all_quality
+      ? suggestionCapacity(segs, requestedMinDuration)
+      : Math.max(1, Number(top_n) || 5);
+    const params: Record<string, unknown> = {
+      segments: segs,
+      top_n: requestedTopN,
+      existing_clips,
+      quality_only: Boolean(find_all_quality),
+    };
     const suggestVideo = uiState.filePath || uiState.videoPath;
     if (suggestVideo && !editProjectId) params.video_path = suggestVideo;
     if (min_duration) params.min_duration = min_duration;
@@ -3980,7 +3997,10 @@ app.post("/api/claude-suggest", async (req, res) => {
         }),
     );
 
-    const clips = result.data?.clips ?? [];
+    const returnedClips = result.data?.clips ?? [];
+    const clips = find_all_quality
+      ? returnedClips.filter((clip) => (clip.score ?? 0) >= MIN_STRONG_SUGGESTION_SCORE)
+      : returnedClips;
     if (uiState.activeEditProjectId !== editProjectId || uiState.activeEditRevision !== editRevision) {
       res.status(409).json({ error: "Edited episode changed while suggestions were being generated. Find clips again." });
       return;

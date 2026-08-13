@@ -1,5 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { validateClipRange, validateSuggestionRange, maxClipSeconds } from "./clip-validation.js";
+import {
+  validateClipRange,
+  validateSuggestionRange,
+  maxClipSeconds,
+  suggestionCapacity,
+} from "./clip-validation.js";
+
+describe("suggestionCapacity", () => {
+  it("uses episode length instead of an arbitrary clip ceiling", () => {
+    expect(suggestionCapacity([{ start: 0, end: 245 }], 20)).toBe(12);
+    expect(suggestionCapacity([{ start: 30, end: 50 }, { start: 50, end: 130 }], 20)).toBe(5);
+    expect(suggestionCapacity([], 20)).toBe(1);
+  });
+});
 
 describe("validateClipRange", () => {
   it("accepts a normal vertical clip", () => {

@@ -14,6 +14,9 @@ export const fmt = (s: number) => {
 export const fmtMs = (s: number) =>
   `${fmt(s)}.${String(Math.floor((s % 1) * 1000)).padStart(3, "0")}`;
 
+export const canGenerateClipSuggestions = (phase: string, suggestionCount: number) =>
+  phase === "idle" || (phase === "review" && suggestionCount === 0);
+
 // Kept in sync with the .section-label CSS class so section headers look
 // identical whether set via this object or the class.
 export const labelStyle: CSSProperties = {

@@ -42,7 +42,7 @@ import MomentTrim from './MomentTrim';
 import { useDialog } from './useDialog';
 import { PageHeader } from './Page';
 import { buildPreviewChunks, activePreviewChunk, selectPreviewWords } from './captionChunks';
-import { findClipResult, resultBoundsKey, clipKey, buildEnergyMap, dropEnergy, clampClipIndex, resolveAssetName, formatTranscriptText } from './lib';
+import { findClipResult, resultBoundsKey, clipKey, buildEnergyMap, dropEnergy, clampClipIndex, resolveAssetName, formatTranscriptText, canGenerateClipSuggestions } from './lib';
 
 const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const fmtSaved = (s) => s < 10 ? `${Number(s || 0).toFixed(1)}s` : fmt(s);
@@ -852,7 +852,6 @@ const onKeyActivate = (fn) => (e) => {
       const [advancedOpen, setAdvancedOpen] = useState(false);
       const [cleanFillers, setCleanFillers] = useState(true);
       const [quality, setQuality] = useState('max');
-      const [topClips, setTopClips] = useState(8);
       const [minDuration, setMinDuration] = useState(20);
       const [maxDuration, setMaxDuration] = useState(45);
       const [energyBoost, setEnergyBoost] = useState(true);
@@ -942,7 +941,6 @@ const onKeyActivate = (fn) => (e) => {
           }
           if (d.clean_fillers !== undefined) setCleanFillers(d.clean_fillers);
           if (d.quality) setQuality(d.quality);
-          if (d.top_clips) setTopClips(d.top_clips);
           if (d.min_clip_duration) setMinDuration(d.min_clip_duration);
           if (d.max_clip_duration) setMaxDuration(d.max_clip_duration);
           if (d.energy_boost !== undefined) setEnergyBoost(d.energy_boost);
@@ -959,7 +957,7 @@ const onKeyActivate = (fn) => (e) => {
         try {
           await api('/presets', { method: 'POST', body: JSON.stringify({
             action: 'save', name: presetName.trim(),
-            config: { caption_style: captionStyle, caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition, crop_strategy: cropStrategy, format, logo_path: logoPath, outro_path: outroPath, intro_path: introPath, video_path: videoPath.trim(), whisper_model: whisperModel, transcription_engine: transcriptionEngine, time_adjust: timeAdjust, clean_fillers: cleanFillers, quality, top_clips: topClips, min_clip_duration: minDuration, max_clip_duration: maxDuration, energy_boost: energyBoost }
+            config: { caption_style: captionStyle, caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition, crop_strategy: cropStrategy, format, logo_path: logoPath, outro_path: outroPath, intro_path: introPath, video_path: videoPath.trim(), whisper_model: whisperModel, transcription_engine: transcriptionEngine, time_adjust: timeAdjust, clean_fillers: cleanFillers, quality, min_clip_duration: minDuration, max_clip_duration: maxDuration, energy_boost: energyBoost }
           })});
           setActivePreset(presetName.trim());
           setPresetName(''); setShowPresetSave(false);
@@ -1859,7 +1857,7 @@ const onKeyActivate = (fn) => (e) => {
           const res = await fetch('/api/claude-suggest', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ top_n: topClips, min_duration: minDuration, max_duration: maxDuration }),
+            body: JSON.stringify({ find_all_quality: true, min_duration: minDuration, max_duration: maxDuration }),
           });
           const data = await res.json();
 
@@ -1916,6 +1914,9 @@ const onKeyActivate = (fn) => (e) => {
       const fullEpisodeBusy = fullEpisodeStream?.status === 'running' || !!fullEpisodeJobId;
       const silenceBusy = !!silenceAnalyzeJobId || !!silenceRenderJobId;
       const isProcessing = phase === 'parsing' || phase === 'suggesting' || phase === 'exporting' || transcribing || downloadingVideo || fullEpisodeBusy || silenceBusy;
+      // Recover persisted state produced by older builds that activated an edited
+      // project as `review` while simultaneously clearing all suggestions.
+      const canGenerateSuggestions = canGenerateClipSuggestions(phase, suggestions.length);
       const sourceIsUrl = isHttpUrl(videoPath);
       const exportStats = phase === 'done' ? {
         total: results.length || selectedClips.length,
@@ -2440,11 +2441,8 @@ const onKeyActivate = (fn) => (e) => {
                         </select>
                       </div>
                       <div className="field">
-                        <label className="field-label">Top clips</label>
-                        <div className="field-row">
-                          <input type="range" min="3" max="15" value={topClips} onChange={e => setTopClips(parseInt(e.target.value))} />
-                          <span className="range-value">{topClips}</span>
-                        </div>
+                        <label className="field-label">Moment search</label>
+                        <div className="hint">All strong moments · weak moments are skipped</div>
                       </div>
                       <div className="field">
                         <label className="field-label">Min duration</label>
@@ -2595,7 +2593,7 @@ const onKeyActivate = (fn) => (e) => {
               )}
 
               {/* Generate */}
-              {phase === 'idle' && (
+              {canGenerateSuggestions && (
                 <div>
                   {sourceIsUrl && (
                     <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 8 }}>

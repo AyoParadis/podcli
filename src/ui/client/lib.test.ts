@@ -11,6 +11,7 @@ import {
   formatTranscriptText,
   friendlyProjectName,
   friendlySourceFilename,
+  canGenerateClipSuggestions,
 } from "./lib";
 
 describe("fmt", () => {
@@ -37,6 +38,16 @@ describe("fmtMs", () => {
   it("appends milliseconds", () => {
     expect(fmtMs(12.5)).toBe("0:12.500");
     expect(fmtMs(4711.25)).toBe("1:18:31.250");
+  });
+});
+
+describe("canGenerateClipSuggestions", () => {
+  it("recovers an empty review state without interrupting active phases", () => {
+    expect(canGenerateClipSuggestions("idle", 0)).toBe(true);
+    expect(canGenerateClipSuggestions("review", 0)).toBe(true);
+    expect(canGenerateClipSuggestions("review", 1)).toBe(false);
+    expect(canGenerateClipSuggestions("suggesting", 0)).toBe(false);
+    expect(canGenerateClipSuggestions("exporting", 0)).toBe(false);
   });
 });
 

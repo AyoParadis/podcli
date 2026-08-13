@@ -35,6 +35,19 @@ class AIFallbackTests(unittest.TestCase):
         self.assertIn("Grid connection hot take", prompt)
         self.assertIn("search the ENTIRE timeline and diversify the picks", prompt)
 
+    def test_build_prompt_can_request_all_strong_moments_without_a_quota(self):
+        prompt = cs._build_prompt(
+            transcript_text="[0.0s] Test transcript",
+            segment_count=1,
+            duration_min=1,
+            top_n=3,
+            quality_only=True,
+        )
+
+        self.assertIn("There is no clip quota", prompt)
+        self.assertIn("scoring at least 15/20", prompt)
+        self.assertIn("Returning zero or only a few clips is correct", prompt)
+
     def test_suggest_with_claude_retries_with_codex_after_runtime_failure(self):
         segments = [
             {"start": 0.0, "end": 12.0, "speaker": "SPEAKER_00", "text": "Warmup context."},
