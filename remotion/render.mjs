@@ -44,6 +44,13 @@ function parseArgs() {
   return opts;
 }
 
+// Mirrors the 60-160 clamp in backend/services/caption_renderer.py so the ASS
+// and Remotion caption paths render the same size for a given request.
+function clampCaptionFontScale(raw) {
+  const value = Number(raw);
+  return Number.isFinite(value) ? Math.min(160, Math.max(60, value)) : 100;
+}
+
 
 async function main() {
   const opts = parseArgs();
@@ -152,7 +159,7 @@ async function main() {
     durationInFrames,
     fps,
     captionPosition: opts["caption-position"] || "auto",
-    captionFontScale: Number(opts["caption-font-scale"] || 100),
+    captionFontScale: clampCaptionFontScale(opts["caption-font-scale"]),
     logoPosition: opts["logo-position"] || "top-left",
   };
 

@@ -29,16 +29,28 @@ const parseArgs = () => {
   return out;
 };
 
+// spawnSync blocks signal handling while a child runs. Bound every external
+// step so a stalled ffmpeg cannot leave an export permanently running.
+const STEP_TIMEOUT_MS = 30 * 60 * 1000;
+
 const run = (command, args) => {
   const result = spawnSync(command, args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: STEP_TIMEOUT_MS,
   });
+  const name = path.basename(command);
+  if (result.error) {
+    const reason = result.error.code === "ETIMEDOUT"
+      ? `timed out after ${STEP_TIMEOUT_MS / 60000} minutes`
+      : result.error.message;
+    throw new Error(`${name} failed: ${reason}`);
+  }
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || "unknown error").trim().slice(-3000);
-    throw new Error(`${path.basename(command)} failed (${result.status}): ${detail}`);
+    throw new Error(`${name} failed (${result.status}): ${detail}`);
   }
-  return result.stdout.trim();
+  return (result.stdout || "").trim();
 };
 
 const progress = (percent, message) => {
@@ -62,7 +74,10 @@ const partialOutput = `${output}.partial.mp4`;
 const logo = args.logo ? path.resolve(args.logo) : null;
 const styleName = args.style || "branded";
 const captionPosition = args["caption-position"] || "auto";
-const captionFontScale = Number(args["caption-font-scale"] || 100);
+const rawFontScale = Number(args["caption-font-scale"]);
+const captionFontScale = Number.isFinite(rawFontScale)
+  ? Math.min(160, Math.max(60, rawFontScale))
+  : 100;
 const logoPosition = args["logo-position"] || "top-left";
 const segmentsPath = args.segments ? path.resolve(args.segments) : null;
 const fps = Number(args.fps || 30);

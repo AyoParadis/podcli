@@ -22,6 +22,11 @@ interface Props {
 
 const MAX_CHARS_PER_CHUNK = 18;
 
+// Shared with caption-margin guard below so logo placement cannot drift.
+const LOGO_INSET = 180;
+const LOGO_HEIGHT = 126;
+const LOGO_CAPTION_GAP = 24;
+
 /**
  * Active pill rendered as an absolutely positioned background behind the word.
  * The word itself is always rendered as plain inline text so layout doesn't shift.
@@ -145,6 +150,11 @@ export const BrandedCaptions: React.FC<Props> = ({
     // Face is high — can bring captions up a bit
     dynamicMargin = baseMargin + 60 * s;
   }
+  // A bottom-anchored logo spans 180-306 scaled units. Captions sitting inside
+  // that band (captionPosition "lower" starts at 220) would render over it.
+  if (logoSrc && logoPosition.startsWith("bottom-")) {
+    dynamicMargin = Math.max(dynamicMargin, (LOGO_INSET + LOGO_HEIGHT + LOGO_CAPTION_GAP) * s);
+  }
 
   return (
     <>
@@ -153,14 +163,14 @@ export const BrandedCaptions: React.FC<Props> = ({
           src={logoSrc.startsWith("http") ? logoSrc : staticFile(logoSrc)}
           style={{
             position: "absolute",
-            ...(logoPosition.startsWith("top-") ? { top: 180 * s } : { bottom: 180 * s }),
+            ...(logoPosition.startsWith("top-") ? { top: LOGO_INSET * s } : { bottom: LOGO_INSET * s }),
             ...(logoPosition.endsWith("-left")
               ? { left: 108 * s }
               : logoPosition.endsWith("-right")
                 ? { right: 108 * s }
                 : { left: "50%", transform: "translateX(-50%)" }),
             width: 255 * s,
-            height: 126 * s,
+            height: LOGO_HEIGHT * s,
             objectFit: "contain",
           }}
         />

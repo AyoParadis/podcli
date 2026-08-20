@@ -487,7 +487,9 @@ def render_silence_removed(
                 "-f", "concat", "-safe", "0", "-i", str(concat_path),
                 "-c", "copy", "-movflags", "+faststart", str(partial),
             ], timeout=1800, check=True)
-        os.replace(partial, output_path)
+        # Work and user-configured output directories can live on different
+        # volumes. shutil.move falls back to copy+delete when rename gets EXDEV.
+        shutil.move(str(partial), str(output_path))
         _emit(progress_callback, 96, "Remapping captions and clips")
         remapped = remap_transcript(transcript, normalized)
         manifest = output_path.with_suffix(".silence.json")

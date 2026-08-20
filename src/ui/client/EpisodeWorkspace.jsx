@@ -929,14 +929,8 @@ const onKeyActivate = (fn) => (e) => {
               setCachedTranscript(false);
               setTranscriptText('');
               setTranscriptFileName('');
-              setSuggestions([]);
-              setDeselected(new Set());
-              setResults([]);
-              setEnergyData({});
-              setPreviewSrc(null);
-              setActiveClipIdx(null);
+              resetClipWorkForSource();
               autoTranscribeRef.current = '';
-              setPhase('idle');
             }
           }
           if (d.clean_fillers !== undefined) setCleanFillers(d.clean_fillers);
@@ -1146,10 +1140,14 @@ const onKeyActivate = (fn) => (e) => {
           energyData,
         };
         const signature = JSON.stringify(syncable);
-        // React may expose the readiness flag before every restored field has
-        // committed. Never let that intermediate render erase server state.
-        if (hydrationTargetRef.current && signature !== hydrationTargetRef.current) return;
-        hydrationTargetRef.current = null;
+        // React may expose readiness before every restored field commits. Skip
+        // that intermediate render, but always release the guard so one stale
+        // signature cannot disable syncing for the entire session.
+        if (hydrationTargetRef.current) {
+          const target = hydrationTargetRef.current;
+          hydrationTargetRef.current = null;
+          if (signature !== target) return;
+        }
         const state = { _source: 'ui', filePath: file?.file_path || '', ...syncable };
         const key = JSON.stringify(state);
         if (key === prevSyncRef.current) return;
@@ -1403,6 +1401,7 @@ const onKeyActivate = (fn) => (e) => {
         setSuggestions([]); setDeselected(new Set()); setPhase('idle'); setResults([]);
         setSilenceOriginal(null); setSilencePlan(null);
         setEnergyData({}); setPreviewSrc(null); setPreviewMode('clips');
+        setFullEpisodeResult(null); setActiveClipIdx(null);
         autoTranscribeRef.current = '';
       };
 
@@ -1660,6 +1659,8 @@ const onKeyActivate = (fn) => (e) => {
             setSilencePlan(prev => ({ ...(prev || {}), applied: true, output_path: rendered.output_path }));
             resetClipWorkForSource();
             autoTranscribeRef.current = rendered.output_path;
+          } else {
+            setError('Silence removal finished but returned no usable episode. Try again.');
           }
           pendingSilenceOriginalRef.current = null;
           setSilenceRenderJobId(null);
@@ -2297,12 +2298,16 @@ const onKeyActivate = (fn) => (e) => {
                           <div className="silence-saved"><strong>{fmtSaved(silencePlan.removed_duration || 0)}</strong><span>Saved</span></div>
                         </div>
                         <div className="silence-timeline" aria-label={`${silencePlan.cut_count || 0} silent sections will be removed`}>
-                          {(silencePlan.removed_ranges || []).map((range, index) => (
-                            <span key={index} className="silence-cut" style={{
-                              left: `${(range.start / silencePlan.source_duration) * 100}%`,
-                              width: `${((range.end - range.start) / silencePlan.source_duration) * 100}%`,
-                            }} />
-                          ))}
+                          {(silencePlan.removed_ranges || []).map((range, index) => {
+                            const span = Number(silencePlan.source_duration) || 0;
+                            if (span <= 0) return null;
+                            return (
+                              <span key={index} className="silence-cut" style={{
+                                left: `${(range.start / span) * 100}%`,
+                                width: `${((range.end - range.start) / span) * 100}%`,
+                              }} />
+                            );
+                          })}
                         </div>
                         <div className="silence-plan-foot">
                           <span>{silencePlan.cut_count || 0} pauses · {silencePlan.removed_percent || 0}% shorter</span>
@@ -2805,7 +2810,8 @@ const onKeyActivate = (fn) => (e) => {
                   {(phase === 'done' || phase === 'review' || phase === 'exporting') && (
                     <div style={{ display: 'flex', gap: 10, justifyContent: 'center', marginTop: 24 }}>
                       <button className="btn btn-ghost" onClick={() => {
-                        setPhase('idle'); setResults([]); setSuggestions([]); setBatchJobId(null); setFile(null); setTranscript(null); setActiveClipIdx(null); setPreviewSrc(null); setPreviewMode('clips'); setEnergyData({}); setCachedTranscript(false); autoTranscribeRef.current = '';
+                        setBatchJobId(null); setFile(null); setTranscript(null); setPreviewMode('clips'); setCachedTranscript(false);
+                        resetClipWorkForSource(); autoTranscribeRef.current = '';
                         fetch('/api/ui-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ _source: 'ui', phase: 'idle', suggestions: [], deselectedIndices: [] }) }).catch(() => { });
                       }}>Start over</button>
                       {phase === 'done' && <button className="btn btn-ghost" onClick={() => { setPhase('review'); setResults([]); setBatchJobId(null); }}>Re-export</button>}

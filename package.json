@@ -1,6 +1,6 @@
 {
   "name": "podcli",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "private": true,
   "description": "AI-powered podcast clip generator for TikTok/YouTube Shorts. Transcribe, find viral moments, export vertical clips with burned captions.",
   "type": "module",
@@ -35,18 +35,18 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@fontsource/dm-sans": "^5.2.8",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@remotion/bundler": "^4.0.490",
-    "@remotion/cli": "^4.0.490",
+    "@fontsource/dm-sans": "^5.3.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@remotion/bundler": "^4.0.506",
+    "@remotion/cli": "^4.0.506",
     "@remotion/renderer": "^4.0.490",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "lucide-react": "^1.25.0",
+    "lucide-react": "^1.28.0",
     "multer": "^2.2.0",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "react-router-dom": "^6.30.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2",
     "remotion": "^4.0.490",
     "uuid": "^14.0.1",
     "winston": "^3.17.0",
@@ -56,13 +56,13 @@
     "@types/express": "^5.0.0",
     "@types/multer": "^2.2.0",
     "@types/node": "^22.12.0",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^4.7.0",
-    "tsx": "^4.23.1",
+    "tsx": "^4.23.7",
     "typescript": "^7.0.2",
     "vite": "^5.4.21",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.10"
   }
 }

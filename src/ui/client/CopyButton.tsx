@@ -45,6 +45,7 @@ type CopyButtonProps = {
   resetMs?: number;
   style?: React.CSSProperties;
   onCopied?: () => void;
+  failedLabel?: string;
 };
 
 export default function CopyButton({
@@ -52,6 +53,7 @@ export default function CopyButton({
   getText,
   label = "Copy",
   copiedLabel = "Copied",
+  failedLabel = "Copy failed",
   className = "copy-btn",
   title,
   disabled = false,
@@ -62,6 +64,7 @@ export default function CopyButton({
   onCopied,
 }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
   const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -75,32 +78,34 @@ export default function CopyButton({
     const value = getText ? getText() : text;
     if (!value) return;
 
+    if (timerRef.current) window.clearTimeout(timerRef.current);
     try {
       await copyText(value);
+      setFailed(false);
       setCopied(true);
       onCopied?.();
-
-      if (timerRef.current) window.clearTimeout(timerRef.current);
       timerRef.current = window.setTimeout(() => setCopied(false), resetMs);
     } catch {
       setCopied(false);
+      setFailed(true);
+      timerRef.current = window.setTimeout(() => setFailed(false), resetMs);
     }
   };
 
   return (
     <button
       type="button"
-      className={`${className} copy-button ${copied ? "is-copied" : ""} ${iconOnly ? "is-icon-only" : ""}`}
+      className={`${className} copy-button ${copied ? "is-copied" : ""} ${failed ? "is-copy-failed" : ""} ${iconOnly ? "is-icon-only" : ""}`}
       onClick={handleCopy}
       disabled={disabled}
-      title={title ?? label}
-      aria-label={copied ? copiedLabel : label}
+      title={failed ? failedLabel : title ?? label}
+      aria-label={copied ? copiedLabel : failed ? failedLabel : label}
       aria-live="polite"
       style={style}
     >
       <span className="copy-button-layer copy-button-idle">
         <Copy className="copy-button-icon" aria-hidden="true" />
-        {!iconOnly && <span>{label}</span>}
+        {!iconOnly && <span>{failed ? failedLabel : label}</span>}
       </span>
       <span className="copy-button-layer copy-button-success">
         <Check className="copy-button-icon" aria-hidden="true" />
