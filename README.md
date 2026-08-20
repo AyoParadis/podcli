@@ -45,7 +45,15 @@ My goal is a safe, working installation of this fork, including its fork-specifi
 - Confirm the fork-specific episode editor is present. Do not process or upload my real media during verification. If a media test is necessary, ask me for a disposable local sample first.
 - Stop background processes that were started only for testing unless I ask you to leave the Studio running.
 
-7. Finish with a plain-language report
+7. Create a safe weekly update automation
+- After installation passes, create a user-level scheduled task that checks for and installs updates from this fork once every seven days. Use the operating system's native scheduler (such as launchd on macOS, a systemd user timer on Linux, or Task Scheduler on Windows) without requiring administrator privileges. When supported, make a missed run execute after the computer next becomes available.
+- Store the updater script and logs in a user-owned location outside the Git checkout. Use only this fork's `origin/main`; never merge directly from upstream during an unattended run.
+- On each run, verify the checkout is on `main` and clean, fetch `origin`, and do nothing if no newer commit exists. Update only with a fast-forward. If local changes, divergence, conflicts, or an unsafe migration are detected, stop without resetting, stashing, deleting, or overwriting anything, then record the reason in the log.
+- Preserve `.env`, PODCLI_HOME, PODCLI_DATA, PODCLI_OUTPUT, knowledge, assets, history, transcripts, edits, and rendered media. Before an update that may migrate configuration or data, create a timestamped backup of the affected files. Never purge user data or redownload models unnecessarily.
+- After updating, rerun the documented source setup/build steps and a non-interactive smoke check. Do not open the Studio, process media, publish content, or change integrations during an unattended run. Log the previous commit, installed commit, time, checks, and exact outcome.
+- Report the automation name, weekly schedule, updater path, log path, next run, and commands to run it immediately or disable it safely.
+
+8. Finish with a plain-language report
 - Give me the checkout path, branch and commit installed, config/data/output paths, Studio URL, dependencies installed, model chosen or deferred, checks run, and their results.
 - List any optional setup still awaiting my approval. If something is blocked, give the exact error and the smallest next action instead of saying the installation succeeded.
 ```
