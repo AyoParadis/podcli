@@ -1,3 +1,57 @@
+## AI Installation
+
+No terminal experience is required. Copy the prompt below into Codex, Claude Code, Cursor, or another coding agent that can use a terminal. The agent will inspect your computer, install this fork safely, and verify that it works.
+
+<details open>
+<summary><strong>Copy this complete prompt into your coding agent</strong></summary>
+
+```text
+Install and verify PodCLI from https://github.com/AyoParadis/podcli on this computer.
+
+My goal is a safe, working installation of this fork, including its fork-specific Studio features. Work autonomously where it is safe, explain blockers in plain language, and do not claim success until the checks below pass.
+
+1. Inspect before changing anything
+- Detect the operating system, CPU architecture, available disk space, Git, package managers, FFmpeg/ffprobe, Python 3, Node.js, npm, and whether Node.js meets the repository's >=18 requirement.
+- Look for an existing PodCLI installation, checkout, running Studio, `.podcli-home` marker, `.env`, and the PODCLI_HOME, PODCLI_DATA, and PODCLI_OUTPUT locations.
+- If PodCLI is already installed, report its command path and version before proceeding. Do not overwrite a modified checkout.
+
+2. Protect my data and privacy
+- Preserve existing configuration, knowledge files, presets, assets, history, transcripts, source media, edits, and rendered clips. Back up any configuration file that must change and never use an uninstall purge.
+- Never print, commit, or upload API keys, tokens, `.env` contents, or private podcast media. Keep transcription and rendering local unless I explicitly approve a cloud integration or publishing action.
+- Ask before using administrator privileges, changing system security settings, installing a system-wide dependency, modifying another application's MCP configuration, or downloading a large speech model.
+
+3. Install this fork from source
+- Clone https://github.com/AyoParadis/podcli into a sensible user-owned development folder. If a clean checkout already exists, fetch and fast-forward it safely instead of cloning another copy.
+- Configure `origin` as https://github.com/AyoParadis/podcli and a fetch-only `upstream` remote as https://github.com/nmbrthirteen/podcli. Never push to upstream.
+- Do not use the podcli.com installer for this task: the checked-in installer currently downloads upstream release binaries and would omit this fork's changes.
+- Install only missing prerequisites using a trusted, platform-appropriate package manager after showing me what is needed.
+- Follow the repository's source setup: on macOS/Linux run `./setup.sh --install`; on Windows run `powershell -ExecutionPolicy Bypass -File setup.ps1 -Install`. Keep an existing `.env` and user-data paths intact.
+- If setup fails, diagnose the first real error, make the smallest safe correction, and retry. Do not disable checksum, TLS, antivirus, Gatekeeper, or execution-policy protections globally.
+
+4. Use Computer Use when helpful
+- If a Computer Use or computer-use tool is available, call it for GUI-only steps such as approving an operating-system dialog, confirming the Studio in a browser, or selecting a local test file. Keep terminal work in the terminal.
+- Tell me before taking over the screen, avoid unrelated apps and private files, and return control for passwords, tokens, account sign-ins, purchases, publishing, or irreversible choices.
+
+5. Configure conservatively
+- Keep optional Hugging Face, AssemblyAI, Claude, Codex, YouTube, and other integrations disabled unless I ask for one. Never invent credentials.
+- Recommend one suitable Whisper model based on this computer's memory, performance, and free space; state its approximate download cost and ask before downloading it. Do not download every model.
+- Preserve the default local Studio port unless it is occupied; if it is, choose a safe free port and report it.
+- Do not register the MCP server with another application unless I approve the exact config change. You may show me the generated configuration first.
+
+6. Verify the installation
+- Confirm Git, FFmpeg, ffprobe, Python, Node, npm, and the installed dependencies are callable from the paths PodCLI will use.
+- Run the repository build and its smallest relevant smoke checks. Report any failed check exactly; do not hide or skip it.
+- Launch the source-built Studio using the repository's documented command, wait for it to become ready, and verify that its local page loads (normally http://localhost:3847). Use Computer Use to inspect the page if available.
+- Confirm the fork-specific episode editor is present. Do not process or upload my real media during verification. If a media test is necessary, ask me for a disposable local sample first.
+- Stop background processes that were started only for testing unless I ask you to leave the Studio running.
+
+7. Finish with a plain-language report
+- Give me the checkout path, branch and commit installed, config/data/output paths, Studio URL, dependencies installed, model chosen or deferred, checks run, and their results.
+- List any optional setup still awaiting my approval. If something is blocked, give the exact error and the smallest next action instead of saying the installation succeeded.
+```
+
+</details>
+
 <p align="center">
   <img src="public/podcli-badge.png" height="72" alt="podcli" />
 </p>
