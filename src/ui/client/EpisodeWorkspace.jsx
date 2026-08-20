@@ -776,7 +776,7 @@ const onKeyActivate = (fn) => (e) => {
       const [logoPosition, setLogoPosition] = useState('top-left');
       const [cropStrategy, setCropStrategy] = useState('face');
       const [format, setFormat] = useState('vertical');
-      const [showTikTokFrame, setShowTikTokFrame] = useState(false);
+      const [showTikTokFrame, setShowTikTokFrame] = useState(true);
       const [logoPath, setLogoPath] = useState('');
       const [outroPath, setOutroPath] = useState('');
       const [introPath, setIntroPath] = useState('');
@@ -1379,7 +1379,11 @@ const onKeyActivate = (fn) => (e) => {
       const onPreviewFullEpisode = (filename = null) => {
         setPreviewMode('youtube');
         setPreviewSrc(filename);
-        setActiveClipIdx(null);
+      };
+
+      const setPreviewPlatform = (mode) => {
+        setPreviewMode(mode);
+        setPreviewSrc(null);
       };
 
       const clearEpisode = () => {
@@ -2199,14 +2203,7 @@ const onKeyActivate = (fn) => (e) => {
               </div>
 
               {/* Silence removal */}
-              {activeEditProjectId ? (
-                <div className="section card silence-card">
-                  <div className="silence-head">
-                    <div className="silence-title-wrap"><span className="silence-icon"><Scissors size={15} /></span><div><div className="section-label" style={{ marginBottom: 2 }}>Silence is part of this edit</div><div className="silence-subtitle">Review or change non-destructive silence cuts in Episode Editor.</div></div></div>
-                    <Link className="btn btn-ghost btn-sm" to={`/editor/${activeEditProjectId}`}>Back to editor</Link>
-                  </div>
-                </div>
-              ) : (
+              {!activeEditProjectId && (
               <div className="section card silence-card">
                 <div className="silence-head">
                   <div className="silence-title-wrap">
@@ -2478,7 +2475,7 @@ const onKeyActivate = (fn) => (e) => {
               </div>
 
               {/* Full episode export stays separate from short-clip selection. */}
-              {transcript && videoPath.trim() && (
+              {previewMode === 'youtube' && transcript && videoPath.trim() && (
                 <div className="section card">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
                     <div>
@@ -2513,9 +2510,6 @@ const onKeyActivate = (fn) => (e) => {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
                       <button className="btn btn-primary" onClick={startFullEpisodeExport} disabled={isProcessing}>
                         <Download size={14} /> {fullEpisodeResult ? 'Export another copy' : 'Export full episode'}
-                      </button>
-                      <button className="btn btn-ghost" onClick={() => onPreviewFullEpisode()}>
-                        <Play size={14} /> Preview for YouTube
                       </button>
                       {fullEpisodeResult?.filename && (
                         <>
@@ -2891,6 +2885,24 @@ const onKeyActivate = (fn) => (e) => {
             {/* ═══════════ RIGHT COLUMN — PREVIEW ═══════════ */}
             <div className="preview-col">
               <div className="preview-panel">
+                <div className="preview-mode-switch" role="group" aria-label="Preview platform">
+                  <button
+                    type="button"
+                    className={previewMode === 'clips' ? 'active' : ''}
+                    aria-pressed={previewMode === 'clips'}
+                    onClick={() => setPreviewPlatform('clips')}
+                  >
+                    TikTok clips
+                  </button>
+                  <button
+                    type="button"
+                    className={previewMode === 'youtube' ? 'active' : ''}
+                    aria-pressed={previewMode === 'youtube'}
+                    onClick={() => setPreviewPlatform('youtube')}
+                  >
+                    YouTube episode
+                  </button>
+                </div>
 
                 {previewMode === 'youtube' && (
                   <LiveYouTubePreview
@@ -2906,7 +2918,7 @@ const onKeyActivate = (fn) => (e) => {
                     title={youtubePreviewTitle}
                     showYouTubeFrame={showYouTubeFrame}
                     onToggleFrame={() => setShowYouTubeFrame(v => !v)}
-                    onBack={() => { setPreviewMode('clips'); setPreviewSrc(null); }}
+                    onBack={() => setPreviewPlatform('clips')}
                     editTimeline={activeEditTimeline}
                   />
                 )}

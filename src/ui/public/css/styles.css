@@ -123,6 +123,22 @@ h1 { font-size: 28px; font-weight: 700; letter-spacing: 0; line-height: 1.15; }
 
 /* ─── Preview Panel ─── */
 .preview-panel { position: sticky; top: 32px; }
+.preview-mode-switch {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 3px;
+  margin-bottom: 12px; padding: 3px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+}
+.preview-mode-switch button {
+  min-height: 32px; padding: 6px 10px; border: 0; border-radius: 7px;
+  background: transparent; color: var(--text3); font: inherit; font-size: 11px;
+  font-weight: 650; cursor: pointer; transition: background .15s, color .15s, box-shadow .15s;
+}
+.preview-mode-switch button:hover { color: var(--text); }
+.preview-mode-switch button.active {
+  background: var(--surface2); color: var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .2);
+}
+.preview-mode-switch button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .preview-player {
   background: #000; border: 1px solid var(--border);
   border-radius: var(--radius); overflow: hidden; position: relative;
