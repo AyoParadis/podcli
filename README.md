@@ -2,7 +2,7 @@
 
 No terminal experience is required. Copy the prompt below into Codex, Claude Code, Cursor, or another coding agent that can use a terminal. The agent will inspect your computer, install this fork safely, and verify that it works.
 
-<details open>
+<details>
 <summary><strong>Copy this complete prompt into your coding agent</strong></summary>
 
 ```text
