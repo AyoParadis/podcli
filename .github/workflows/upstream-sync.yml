@@ -1,0 +1,410 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/nmbrthirteen/podcli.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: automation/upstream-sync
+  FAILURE_ISSUE_TITLE: "Upstream sync needs attention"
+
+jobs:
+  prepare:
+    name: Prepare exact merge
+    runs-on: ubuntu-latest
+    outputs:
+      base_sha: ${{ steps.merge.outputs.base_sha }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+      merged_tree: ${{ steps.merge.outputs.merged_tree }}
+      status: ${{ steps.merge.outputs.status }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: merge
+        name: Simulate merge without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_sha="$(git rev-parse HEAD)"
+          git remote add upstream-sync "$UPSTREAM_URL"
+          git fetch --no-tags upstream-sync \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream-sync/${UPSTREAM_BRANCH}"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream-sync/${UPSTREAM_BRANCH}")"
+
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
+            echo "status=noop" >> "$GITHUB_OUTPUT"
+            echo "Upstream $upstream_sha is already contained in $base_sha." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! git merge-base "$base_sha" "$upstream_sha" >/dev/null; then
+            echo "Fork and upstream have no common history." >&2
+            exit 1
+          fi
+
+          git config user.name "podcrypt-upstream-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          set +e
+          git merge --no-commit --no-ff "$upstream_sha"
+          merge_status=$?
+          set -e
+
+          if [[ "$merge_status" -ne 0 ]]; then
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Upstream merge conflicts"
+              echo
+              echo '```text'
+              git diff --name-only --diff-filter=U
+              echo '```'
+              echo
+              echo "No branch or pull request was published. Resolve these overlaps manually."
+            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 0
+          fi
+
+          merged_tree="$(git write-tree)"
+          echo "merged_tree=$merged_tree" >> "$GITHUB_OUTPUT"
+          echo "status=ready" >> "$GITHUB_OUTPUT"
+          echo "Prepared upstream $upstream_sha on fork base $base_sha, tree $merged_tree." >> "$GITHUB_STEP_SUMMARY"
+          git merge --abort
+
+  go:
+    name: Go build + test
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate verified merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.23"
+          cache: false
+      - name: Sync embedded backend + PodStack commands
+        working-directory: cli
+        shell: bash
+        run: go generate ./...
+      - name: Build
+        working-directory: cli
+        run: go build ./...
+      - name: Vet
+        working-directory: cli
+        run: go vet ./...
+      - name: Test
+        working-directory: cli
+        run: go test ./...
+
+  typescript:
+    name: TypeScript build + test
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate verified merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+
+  remotion:
+    name: Remotion release bundle
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate verified merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: remotion/package-lock.json
+      - run: sh scripts/build-remotion.sh dist/remotion-bundle
+      - working-directory: dist/remotion-bundle
+        run: node --input-type=module --eval "await Promise.all(['@remotion/bundler', '@remotion/renderer', 'remotion', 'react', 'react-dom'].map((name) => import(name))); import.meta.resolve('@fontsource/dm-sans/400.css')"
+
+  python:
+    name: Python tests
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate verified merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy Pillow python-dotenv questionary opencv-python-headless
+      - run: pytest tests/ -v
+
+  docs:
+    name: Docs drift check
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recreate verified merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+      - run: node scripts/gen-docs-manifest.mjs
+      - run: node scripts/check-docs-drift.mjs
+
+  publish:
+    name: Publish guarded pull request
+    needs: [prepare, go, typescript, remotion, python, docs]
+    if: >-
+      always() &&
+      needs.prepare.outputs.status == 'ready' &&
+      needs.go.result == 'success' &&
+      needs.typescript.result == 'success' &&
+      needs.remotion.result == 'success' &&
+      needs.python.result == 'success' &&
+      needs.docs.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+      - name: Recreate tested merge tree
+        shell: bash
+        run: .github/scripts/merge-upstream.sh "$UPSTREAM_SHA" "$MERGED_TREE"
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGED_TREE: ${{ needs.prepare.outputs.merged_tree }}
+      - id: push
+        name: Push automation-owned branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git branch -f "$SYNC_BRANCH" HEAD
+          git switch "$SYNC_BRANCH"
+
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            remote_sha="$(git rev-parse "refs/remotes/origin/${SYNC_BRANCH}")"
+            git push --force-with-lease="refs/heads/${SYNC_BRANCH}:${remote_sha}" \
+              origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          else
+            git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          fi
+
+          echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Record full verification on merge commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.push.outputs.merge_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${MERGE_SHA}" \
+            -f state=success \
+            -f context="Upstream sync / full verification" \
+            -f description="Exact merged tree passed all fork CI gates" \
+            -f target_url="$RUN_URL"
+      - id: pr
+        name: Create or update pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          MERGE_SHA: ${{ steps.push.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          body_file="$(mktemp)"
+          trap 'rm -f "$body_file"' EXIT
+          cat > "$body_file" <<EOF
+          Automated merge of [nmbrthirteen/podcli@$UPSTREAM_SHA](https://github.com/nmbrthirteen/podcli/commit/$UPSTREAM_SHA) into fork base \`$BASE_SHA\`.
+
+          Safety gates completed before this branch was published:
+
+          - merge completed without unresolved conflicts
+          - exact merged tree reproduced independently in every test job
+          - Go build, vet, and tests passed on Linux, macOS, and Windows
+          - TypeScript typecheck, tests, and production build passed on Linux, macOS, and Windows
+          - Python tests passed on Linux, macOS, and Windows
+          - Remotion release bundle and docs drift checks passed
+
+          Fork-specific Studio, episode editor, strong-moment discovery, transcript copy, and non-destructive editing behavior still need owner review. This automation never merges into \`main\` or resolves semantic conflicts automatically.
+
+          Tested merge commit: \`$MERGE_SHA\`
+          EOF
+
+          pr_number="$(gh pr list --base main --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" \
+              --title "chore: sync Podcrypt with upstream" \
+              --body-file "$body_file"
+          else
+            pr_url="$(gh pr create \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync Podcrypt with upstream" \
+              --body-file "$body_file")"
+            pr_number="${pr_url##*/}"
+          fi
+
+          echo "Pull request #$pr_number contains tested tree $MERGED_TREE." >> "$GITHUB_STEP_SUMMARY"
+      - name: Close stale failure issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_number="$(gh issue list --state open --search "${FAILURE_ISSUE_TITLE} in:title" --json number,title --jq ".[] | select(.title == env.FAILURE_ISSUE_TITLE) | .number" | head -n 1)"
+          if [[ -n "$issue_number" ]]; then
+            gh issue close "$issue_number" --comment "A conflict-free, fully tested upstream sync pull request is now open."
+          fi
+
+  no-updates:
+    name: No updates
+    needs: prepare
+    if: needs.prepare.outputs.status == 'noop'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Close stale failure issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_number="$(gh issue list --state open --search "${FAILURE_ISSUE_TITLE} in:title" --json number,title --jq ".[] | select(.title == env.FAILURE_ISSUE_TITLE) | .number" | head -n 1)"
+          if [[ -n "$issue_number" ]]; then
+            gh issue close "$issue_number" --comment "Fork already contains current upstream main."
+          fi
+
+  report-failure:
+    name: Report blocked sync
+    needs: [prepare, go, typescript, remotion, python, docs, publish]
+    if: >-
+      always() &&
+      (needs.prepare.outputs.status == 'conflict' ||
+      needs.prepare.result == 'failure' ||
+      needs.go.result == 'failure' ||
+      needs.typescript.result == 'failure' ||
+      needs.remotion.result == 'failure' ||
+      needs.python.result == 'failure' ||
+      needs.docs.result == 'failure' ||
+      needs.publish.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Create or update one actionable issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          body="Automated upstream sync stopped before changing main. Inspect the failed run: ${RUN_URL}
+
+          Upstream commit: ${UPSTREAM_SHA:-unknown}
+
+          Resolve merge conflicts or failing checks on a human-reviewed branch, preserving Podcrypt-specific Studio and editing behavior. Re-run Upstream sync afterward."
+          issue_number="$(gh issue list --state open --search "${FAILURE_ISSUE_TITLE} in:title" --json number,title --jq ".[] | select(.title == env.FAILURE_ISSUE_TITLE) | .number" | head -n 1)"
+
+          if [[ -n "$issue_number" ]]; then
+            gh issue edit "$issue_number" --body "$body"
+            gh issue comment "$issue_number" --body "Latest blocked run: ${RUN_URL}"
+          else
+            gh issue create --title "$FAILURE_ISSUE_TITLE" --body "$body"
+          fi

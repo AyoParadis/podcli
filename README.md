@@ -67,6 +67,8 @@ My goal is a safe, working installation of this fork, including its fork-specifi
 > [!NOTE]
 > **This is a maintained product fork of [nmbrthirteen/podcli](https://github.com/nmbrthirteen/podcli).** It preserves Podcli's local-first engine and CLI while extending Studio for a simpler podcast-production workflow. Upstream changes are reviewed and merged regularly to limit drift.
 
+See the [guarded upstream-sync process](docs/upstream-sync.md) for its schedule, test gates, and conflict policy.
+
 ### What this fork adds
 
 - **`podclip` launcher** — open the local Studio from any directory with one command
