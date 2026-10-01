@@ -276,14 +276,27 @@ def plan_cuts(
     min_shot: float = 2.0,
     max_shot: float = 30.0,
     wide_insert: float = 4.0,
+    backchannel: float = 1.2,
+    guests: frozenset[str] = frozenset(),
+    hold_guest: bool = True,
+    host_solo: bool = True,
+    guest_min: float = 0.0,
+    guest_delay: float = 0.0,
 ) -> list[dict]:
     """Turn per-frame speaker labels into [{start, end, source_id}] on the timeline.
 
-    Silence holds the previous shot; crosstalk goes wide. Shots shorter than
-    min_shot fold into a neighbour whose camera also covers them, and a single
-    shot longer than max_shot gets a wide_insert-second wide shot in the middle
-    when a wide camera exists. Split camera files (part 1, part 2) are handled
-    because every decision checks which camera actually covers the moment.
+    Silence holds the previous shot; crosstalk goes wide. A backchannel (an
+    "mm-hm", a laugh, a one-word interjection under backchannel seconds) inside
+    someone else's turn never cuts away from them. Shots shorter than min_shot
+    fold into a neighbour whose camera also covers them. A single shot longer
+    than max_shot gets a wide_insert-second wide shot in the middle when a wide
+    camera exists, except on a guest when hold_guest is set: a guest's answer
+    stays on the guest from start to finish. With host_solo off a host speaks
+    on the wide shot. A guest turn shorter than guest_min stays wide, and a
+    longer one opens wide for guest_delay seconds before going to the guest,
+    as a call recording cuts between the split screen and the guest. Split
+    camera files (part 1, part 2) are handled because every decision checks
+    which camera actually covers the moment.
     """
     if not cameras or range_end <= range_start:
         return []
@@ -309,16 +322,22 @@ def plan_cuts(
     avail = labels[max(0, first):min(len(labels), last)]
     lead = max(0, -first)
     window[lead:lead + len(avail)] = avail
+    window = suppress_backchannels(window, backchannel)
 
     targets: list[str] = []
+    speech: list[str] = []
     previous = "wide" if wide else (people[0] if people else "wide")
     for value in window:
         if value == SILENT:
             targets.append(previous)
+            speech.append("")
             continue
         current = "wide" if value == BOTH else people[value]
         targets.append(current)
+        speech.append(current)
         previous = current
+    if wide and (not host_solo or guest_min > 0 or guest_delay > 0):
+        targets = _call_layout(targets, speech, guests, host_solo, guest_min, guest_delay)
     codes = {name: i for i, name in enumerate(dict.fromkeys(targets))}
     names = list(codes)
     shot_runs = _runs(np.array([codes[t] for t in targets], dtype=np.int32))
@@ -346,8 +365,9 @@ def plan_cuts(
         broken: list[dict] = []
         for shot in shots:
             length = shot["end"] - shot["start"]
-            is_wide = by_id[shot["source_id"]].person == "wide"
-            if is_wide or length <= max_shot:
+            person = by_id[shot["source_id"]].person
+            held = hold_guest and person in guests
+            if person == "wide" or held or length <= max_shot:
                 broken.append(shot)
                 continue
             # Spacing inserts at least a shortest shot apart keeps them from
@@ -374,6 +394,65 @@ def plan_cuts(
         for s in shots
         if s["end"] - s["start"] > 1e-3
     ]
+
+
+# A guest's full-frame shot runs this far past their last word, then the
+# split returns before the next speaker, as the measured remote edits do.
+SOLO_TAIL = 1.0
+
+
+def _call_layout(targets: list[str], speech: list[str], guests: frozenset[str], host_solo: bool,
+                 guest_min: float, guest_delay: float) -> list[str]:
+    """Send host turns and short guest turns to the wide shot; open long guest turns on it.
+
+    `targets` has pauses filled with the last speaker; `speech` keeps them
+    empty, so a guest turn is measured from their first word to their last,
+    and silence after an answer never counts toward it.
+    """
+    out = list(targets)
+    delay = int(guest_delay / FRAME_SECONDS)
+    tail = int(SOLO_TAIL / FRAME_SECONDS)
+    start = 0
+    for i in range(1, len(targets) + 1):
+        if i < len(targets) and targets[i] == targets[start]:
+            continue
+        who = targets[start]
+        if who in guests:
+            spoken = [k for k in range(start, i) if speech[k] == who]
+            first, last = (spoken[0], spoken[-1] + 1) if spoken else (start, start)
+            if (last - first) * FRAME_SECONDS < guest_min:
+                out[start:i] = ["wide"] * (i - start)
+            else:
+                solo_from, solo_to = min(i, first + delay), min(i, last + tail)
+                out[start:i] = ["wide"] * (i - start)
+                out[solo_from:solo_to] = [who] * max(0, solo_to - solo_from)
+        elif who != "wide" and not host_solo:
+            out[start:i] = ["wide"] * (i - start)
+        start = i
+    return out
+
+
+def suppress_backchannels(labels: np.ndarray, backchannel: float) -> np.ndarray:
+    """Relabel short interjections inside one person's turn as that person.
+
+    A run shorter than `backchannel` seconds that sits between two stretches of
+    the same speaker (silence in between doesn't count) belongs to that
+    speaker's turn: a listener's "yeah" or a shared laugh shouldn't pull the
+    camera off someone mid-answer. Both stretches must be at least that long
+    themselves, so a blip inside real crosstalk doesn't swallow it.
+    """
+    limit = int(backchannel / FRAME_SECONDS)
+    if limit <= 0 or len(labels) == 0:
+        return labels
+    out = labels.copy()
+    runs = [r for r in _runs(labels) if r[0] != SILENT]
+    for k in range(1, len(runs) - 1):
+        value, a, b = runs[k]
+        (before, a0, b0), (after, a1, b1) = runs[k - 1], runs[k + 1]
+        if (b - a < limit and before == after and before >= 0 and value != before
+                and b0 - a0 >= limit and b1 - a1 >= limit):
+            out[a:b] = before
+    return out
 
 
 def _merge_neighbours(shots: list[dict]) -> list[dict]:

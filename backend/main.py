@@ -963,14 +963,16 @@ def handle_render_silence_removed(task_id: str, params: dict):
         emit_result(task_id, "error", error=str(e))
 
 
-MULTICAM_MAP_KEYS = ("people", "sources", "range_start", "range_end", "cut_settings", "speaker_map", "look")
+MULTICAM_MAP_KEYS = ("people", "sources", "range_start", "range_end", "cut_settings", "speaker_map", "look", "removals")
 
 
 def handle_manage_multicam(task_id: str, params: dict):
     """Multicam podcast editing: map sources, sync, plan cuts, render, export.
 
     Actions: new (folder or files, people), list, show, map, sync, plan, cut
-    (swap one shot's camera), previews, render, export (premiere|fcpxml), delete.
+    (swap one shot's camera), set_cuts (replace the whole cut), activity (who
+    speaks when), previews (stills), preview (playback proxies), render,
+    export (premiere|fcpxml), delete.
     sync, plan and render apply any mapping fields sent with them first.
     """
     from services import multicam as mc
@@ -1004,6 +1006,9 @@ def handle_manage_multicam(task_id: str, params: dict):
             return
 
         session = mc.MulticamSession.load(session_id)
+        if action == "render" and any(k in params for k in MULTICAM_MAP_KEYS if k != "look"):
+            # A mapping change can drop the cut, and a render needs one: map, then plan, then render.
+            raise ValueError("render takes only look and stems. Change the mapping with 'map', then 'plan' again.")
         if action in ("map", "sync", "plan", "render") and any(k in params for k in MULTICAM_MAP_KEYS):
             session = mc.update_mapping(session, params)
         data: dict = {}
@@ -1013,6 +1018,12 @@ def handle_manage_multicam(task_id: str, params: dict):
             session = mc.sync_session(session, force=bool(params.get("force")), progress_callback=progress("syncing"))
         elif action == "plan":
             session = mc.plan_session(session, progress_callback=progress("planning"))
+        elif action == "preview":
+            session = mc.build_preview(session, progress_callback=progress("preview"))
+        elif action == "activity":
+            data["activity"] = mc.activity(session)
+        elif action == "set_cuts":
+            session = mc.set_cuts(session, params.get("cuts"))
         elif action == "cut":
             index, source_id = params.get("index"), params.get("source_id")
             if not isinstance(index, int) or not isinstance(source_id, str):
@@ -1021,14 +1032,21 @@ def handle_manage_multicam(task_id: str, params: dict):
         elif action == "previews":
             data["previews"] = mc.previews(session, looks=bool(params.get("looks")), at=params.get("at"))
         elif action == "render":
-            mc.render_session(session, stems=params.get("stems", True), progress_callback=progress("rendering"))
+            stems = params.get("stems", True)
+            if not isinstance(stems, bool):
+                raise ValueError("stems is true or false")
+            mc.render_session(session, stems=stems, progress_callback=progress("rendering"))
         elif action == "export":
             data["export_path"] = mc.export_xml(session, params.get("format", "premiere"))
         else:
             raise ValueError(f"Unknown multicam action {action!r}")
         emit_result(task_id, "success", data={**mc.payload(session), **data})
-    except (IndexError, ValueError, OSError, RuntimeError, ImportError, TypeError, AttributeError) as e:
-        emit_result(task_id, "error", error=str(e))
+    except KeyError as e:
+        emit_result(task_id, "error", error=f"Missing field {e.args[0]!r}")
+    except Exception as e:
+        # Callers get one sentence; the full trace goes to the log, never to a client.
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        emit_result(task_id, "error", error=str(e) or type(e).__name__)
 
 
 def handle_run_integration_tool(task_id: str, params: dict):

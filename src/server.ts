@@ -2230,20 +2230,23 @@ export function createServer(): McpServer {
       "Flow: 'new' (folder or files, people) → check the guessed mapping with 'show' and fix it with 'map' → 'sync' → 'plan' → 'render' or 'export'. " +
       "'new' returns the session with guessed roles; calling it again on the same files reopens that edit. " +
       "'sync', 'plan' and 'render' start a background job and return job_id: poll job_status, then call 'show'. " +
-      "Mapping fields (people, sources, range_start, range_end, cut_settings, speaker_map, look) apply on 'map', 'sync', 'plan' and 'render'. " +
+      "Mapping fields (people, sources, range_start, range_end, cut_settings, speaker_map, look, removals) apply on 'map', 'sync' and 'plan'; 'render' takes only look and stems. " +
       "Changing who is in a file or where it sits clears the cut, so run 'plan' again. 'render' skips work when nothing changed. " +
-      "Other actions: 'list', 'cut' (index, source_id: swap one shot's camera), 'previews' (still frames per camera, looks: true adds color-look stills), 'delete'.",
+      "Other actions: 'list', 'cut' (index, source_id: swap one shot's camera), 'set_cuts' (cuts: replace the whole cut with back-to-back shots), " +
+      "'activity' (who speaks when, as spans per person), 'previews' (still frames per camera, looks: true adds color-look stills), " +
+      "'preview' (background job: playback proxies, a mic mix and stills, for a browser editor such as podcli cloud), 'delete'. " +
+      "Call recordings work too: one file per person becomes a split screen, one gallery recording is split into a camera per tile; Premiere and FCPXML export refuse those layouts for now.",
     {
       action: z
-        .enum(["new", "list", "show", "map", "sync", "plan", "cut", "previews", "render", "export", "delete"])
+        .enum(["new", "list", "show", "map", "sync", "plan", "cut", "set_cuts", "activity", "previews", "preview", "render", "export", "delete"])
         .describe("What to do"),
       session_id: z.string().optional().describe("Session id returned by 'new' (every action except new/list)"),
       folder: z.string().optional().describe("For 'new': folder holding one episode's recordings, scanned recursively"),
       files: z.array(z.string()).optional().describe("For 'new': explicit media file paths, alone or with folder"),
       people: z
-        .array(z.union([z.string(), z.object({ id: z.string().optional(), name: z.string() })]))
+        .array(z.union([z.string(), z.object({ id: z.string().optional(), name: z.string(), role: z.enum(["host", "guest"]).optional() })]))
         .optional()
-        .describe("For 'new': speaker names (default Host, Guest). For 'map': the full people list, with ids to keep"),
+        .describe("For 'new': speaker names, or {name, role} (default Host, Guest; without roles the last one is the guest). For 'map': the full people list, with ids to keep and role host or guest; a guest's long answers are held on their camera"),
       name: z.string().optional().describe("For 'new': episode name"),
       sources: z
         .array(
@@ -2262,9 +2265,15 @@ export function createServer(): McpServer {
       range_end: z.number().nullable().optional().describe("For 'map'/'plan': episode end on the timeline, null for automatic"),
       cut_settings: z
         .object({
-          min_shot: z.number().optional().describe("Shortest shot in seconds (default 2)"),
-          max_shot: z.number().optional().describe("Break a longer single-speaker shot with a wide shot; 0 disables (default 30)"),
+          min_shot: z.number().optional().describe("Shortest shot in seconds (studio 2, remote 4)"),
+          max_shot: z.number().optional().describe("Break a longer single-host shot with a wide shot; 0 disables (studio 30, remote 0)"),
           wide_insert: z.number().optional().describe("Length of that wide shot in seconds (default 4)"),
+          backchannel: z.number().optional().describe("Interjections shorter than this many seconds inside someone's turn never cut away (default 1.2)"),
+          hold_guest: z.boolean().optional().describe("Never cut away from a guest mid-answer (default true)"),
+          style: z.enum(["auto", "studio", "remote"]).optional().describe("studio: everyone's camera. remote: split screen, guest full frame on long answers. auto picks remote for call recordings; a new style resets the other settings to its defaults"),
+          host_solo: z.boolean().optional().describe("Give hosts their own camera when they talk (studio true, remote false)"),
+          guest_min: z.number().optional().describe("Guest turns shorter than this stay on the wide shot (remote 8 s)"),
+          guest_delay: z.number().optional().describe("A long guest answer opens on the wide shot for this long first (remote 4 s)"),
         })
         .optional(),
       speaker_map: z.record(z.string(), z.string()).optional().describe("For shared-audio shows: diarization label → person id"),
@@ -2274,7 +2283,16 @@ export function createServer(): McpServer {
       format: z.enum(["premiere", "fcpxml"]).optional().describe("For 'export': premiere (FCP7 XML, also opens in Resolve) or fcpxml (Final Cut Pro, Resolve)"),
       index: z.number().int().min(0).optional().describe("For 'cut': 0-based shot index"),
       source_id: z.string().optional().describe("For 'cut': camera source id to use for that shot"),
+      removals: z
+        .array(z.object({ start: z.number(), end: z.number(), reason: z.string().optional() }))
+        .optional()
+        .describe("Stretches cut out of the episode on every camera and mic, in timeline seconds; [] restores everything"),
+      cuts: z
+        .array(z.object({ start: z.number(), end: z.number(), source_id: z.string() }))
+        .optional()
+        .describe("For 'set_cuts': the full cut, shots back to back on the timeline"),
       looks: z.boolean().optional().describe("For 'previews': include one still per color look"),
+      at: z.number().optional().describe("For 'previews': timeline second to take the stills at"),
     },
     async (params) => {
       try {
