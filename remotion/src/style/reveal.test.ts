@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { entranceFrames, settle } from "./reveal";
+import { countedTo, entranceFrames, settle } from "./reveal";
 import { MOTIONS } from "./theme";
 
 describe("settle", () => {
@@ -46,5 +46,38 @@ describe("entranceFrames", () => {
     const motion = MOTIONS.smooth;
     expect(entranceFrames(motion, "pop")).toBe(1);
     expect(entranceFrames(motion, "mask-circle")).toBe(motion.frames);
+  });
+});
+
+
+describe("counting a figure up", () => {
+  it("keeps the words around the number", () => {
+    expect(countedTo("−95%", 1)).toBe("−95%");
+    expect(countedTo("−95%", 0.5)).toBe("−48%");
+    expect(countedTo("$1.2 trillion", 0.5)).toBe("$0.6 trillion");
+  });
+
+  it("keeps thousands separators the speaker's figure had", () => {
+    expect(countedTo("10,000x", 0.25)).toBe("2,500x");
+    expect(countedTo("10000x", 0.25)).toBe("2500x");
+  });
+
+  it("leaves a figure with no number alone", () => {
+    expect(countedTo("half", 0.3)).toBe("half");
+  });
+
+  it("starts at zero and lands exactly on the figure", () => {
+    expect(countedTo("3 weeks", 0)).toBe("0 weeks");
+    expect(countedTo("3 weeks", 1)).toBe("3 weeks");
+  });
+});
+
+describe("counting a figure that is not one number", () => {
+  it("leaves a comma that is punctuation alone", () => {
+    expect(countedTo("3, 2, 1", 0.5)).toBe("2, 2, 1");
+  });
+
+  it("shows the exact figure once the count lands", () => {
+    expect(countedTo("9,007,199,254,740,993", 1)).toBe("9,007,199,254,740,993");
   });
 });
