@@ -1,6 +1,6 @@
 ---
 description: Full pipeline from transcript to publish-ready content package
-allowed-tools: Read, Write, Edit, Task
+allowed-tools: Read, Write, Edit, Task, mcp__podcli__knowledge_base, mcp__podcli__get_ui_state, mcp__podcli__record_decisions
 argument-hint: [transcript-file-or-episode-number]
 triggers:
   - process episode
@@ -29,6 +29,8 @@ Read the full knowledge base with the `knowledge_base` MCP tool:
 - `07-thumbnail-guide.md` — visual specs
 - `13-learnings.md` — past retro patterns (what worked, what didn't)
 
+If a video is already set (`get_ui_state`), check its `OPEN QUESTIONS` block for unanswered episode decisions (clip count, duration range, captions, language, thumbnails, delivery target). Ask whichever are relevant to this run, batched into one NEEDS_INPUT prompt rather than one per field, then call `record_decisions(video_path, ...)` so the next run against this video doesn't ask again.
+
 ---
 
 ## Inputs
@@ -51,6 +53,8 @@ Each phase calls the corresponding skill's logic. Each phase reports its own Com
 *Runs `/process-transcript` logic*
 
 Extract guest info, flag 15-20 moments, anchor each one (boundaries by meaning, question pulled in or carried as a setup line, payoff written before any title), score them, select top moments, classify by content type, check for duplicates.
+
+A moment may open with a `hook`: a 1-15 second line spoken inside the clip, played first. Quote it from the transcript. Never invent it.
 
 ### Phase 2: Title Development
 *Runs `/generate-titles` logic per moment*

@@ -135,6 +135,91 @@ class SpeakerTranscriptTests(unittest.TestCase):
         # First word start near 3600s
         self.assertGreaterEqual(result["words"][0]["start"], 3600.0 - 1.0)
 
+    def test_language_defaults_to_undetermined_not_english(self):
+        raw = "Alice (00:00)\nHello\n"
+        result = tp.parse_speaker_transcript(raw, total_duration=5.0)
+        self.assertEqual(result["language"], "und")
+
+    def test_language_passthrough(self):
+        raw = "Alice (00:00)\nHello\n"
+        result = tp.parse_speaker_transcript(raw, total_duration=5.0, language="ka")
+        self.assertEqual(result["language"], "ka")
+
+    def test_detect_and_parse_threads_language_to_each_format(self):
+        speaker_raw = "Alice (00:00)\nHello\n"
+        srt_raw = "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+        vtt_raw = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n"
+        for raw in (speaker_raw, srt_raw, vtt_raw):
+            with self.subTest(raw=raw):
+                result = tp.detect_and_parse(raw, total_duration=5.0, language="ka")
+                self.assertEqual(result["language"], "ka")
+
+    def test_speaker_segments_apply_time_adjust_like_words_and_segments(self):
+        # Regression: speaker_segments previously used the raw block
+        # start/end, ignoring time_adjust, while words and segments applied
+        # it, so the three arrays drifted out of sync for any non-zero adjust.
+        raw = "Alice (00:10)\nHello there\n"
+        result = tp.parse_speaker_transcript(raw, total_duration=30.0, time_adjust=-2.0)
+        seg = result["speaker_segments"][0]
+        self.assertAlmostEqual(seg["start"], result["segments"][0]["start"], places=3)
+        self.assertAlmostEqual(seg["end"], result["segments"][0]["end"], places=3)
+        self.assertAlmostEqual(seg["start"], 8.0, places=3)
+
+
+class CaptionMarkupStrippingTests(unittest.TestCase):
+    """SRT/VTT override tags like {\\an8} aren't spoken text and must not
+    end up imported as literal words in the transcript."""
+
+    def test_parse_srt_strips_ass_override_blocks(self):
+        raw = (
+            "1\n"
+            "00:00:01,000 --> 00:00:04,000\n"
+            "{\\an8}Hello this is text\n"
+        )
+        result = tp.parse_srt(raw)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["segments"][0]["text"], "Hello this is text")
+        self.assertNotIn("an8", result["transcript"])
+        self.assertNotIn("{", result["transcript"])
+
+    def test_parse_srt_strips_html_tags(self):
+        raw = (
+            "1\n"
+            "00:00:01,000 --> 00:00:04,000\n"
+            "<b>Hello</b> <i>world</i>\n"
+        )
+        result = tp.parse_srt(raw)
+        self.assertEqual(result["segments"][0]["text"], "Hello world")
+
+    def test_parse_srt_strips_override_block_in_trailing_block(self):
+        # No trailing blank line, so this exercises the "last block" path.
+        raw = (
+            "1\n"
+            "00:00:01,000 --> 00:00:04,000\n"
+            "{\\an8}No trailing blank line"
+        )
+        result = tp.parse_srt(raw)
+        self.assertEqual(result["segments"][0]["text"], "No trailing blank line")
+
+    def test_parse_vtt_strips_ass_override_blocks(self):
+        raw = (
+            "WEBVTT\n\n"
+            "00:00:01.000 --> 00:00:04.000\n"
+            "{\\an8}Hello this is text\n"
+        )
+        result = tp.parse_vtt(raw)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["segments"][0]["text"], "Hello this is text")
+
+    def test_parse_vtt_strips_override_block_in_trailing_block(self):
+        raw = (
+            "WEBVTT\n\n"
+            "00:00:01.000 --> 00:00:04.000\n"
+            "{\\an8}No trailing blank line"
+        )
+        result = tp.parse_vtt(raw)
+        self.assertEqual(result["segments"][0]["text"], "No trailing blank line")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -116,7 +116,7 @@ def test_sends_only_previews_and_renders_the_cloud_cut_here(episode, cloud, monk
     cloud["edit"] = {
         "state": {**sent["engine"], "people": [{"id": "nika", "name": "Nika"}, {"id": "ana", "name": "Ana Smith"}]},
         "cuts": [{"start": start, "end": end, "source_id": one}],
-        "removals": [{"start": 10, "end": 12}],
+        "removals": [{"start": 10, "end": 12, "reason": "retake"}],
         "look": "warm",
         "revision": 4,
     }
@@ -126,10 +126,73 @@ def test_sends_only_previews_and_renders_the_cloud_cut_here(episode, cloud, monk
     assert "Pulled the cloud edit: 1 shots" in out
     session = mc.MulticamSession.load(session.session_id)
     assert [p.name for p in session.people] == ["Nika", "Ana Smith"]
-    assert session.look == "warm" and session.removals == [{"start": 10.0, "end": 12.0}]
+    assert session.look == "warm"
+    assert session.removals == [{"start": 10.0, "end": 12.0, "reason": "retake"}]
     assert session.outputs["duration"] == pytest.approx(end - start - 2, abs=0.05)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_push_records_the_basis_of_what_was_actually_sent_not_whatever_lands_later(episode, cloud, monkeypatch, capsys):
+    """Edits keep landing on disk while proxies encode and upload.
+
+    push() used to recompute the basis from the session reloaded after the
+    uploads finished, so a nudge that landed mid-push got baked into the
+    recorded basis as if it had been there when the cuts were made. Pull
+    would then see pushed_basis == current_basis and apply a cut that was
+    actually made against the pre-nudge placement.
+    """
+    words = [{"start": 1.0, "end": 1.4, "text": "Hello", "person": "nika"}]
+    monkeypatch.setattr(mc, "transcript", lambda *a, **k: {"words": words})
+
+    real_put = multicam_cloud._put
+    nudged = []
+
+    def nudging_put(url, path):
+        # Simulate another edit landing on disk after push captured its
+        # basis but before the upload loop (which the basis must survive) finishes.
+        if not nudged:
+            nudged.append(True)
+            session = mc.MulticamSession.load(mc.list_sessions()[0]["session_id"])
+            one = next(s for s in session.sources if s.path.endswith("cam_one.mp4"))
+            mc.update_mapping(session, {"sources": [{"id": one.id, "nudge": 1.5}]})
+        return real_put(url, path)
+
+    monkeypatch.setattr(multicam_cloud, "_put", nudging_put)
+    code = run_cli(monkeypatch, str(episode), "--people", "Nika, Ana", "--set", "cam_one=camera:nika",
+                   "--set", "cam_two=camera:ana", "--cloud", "-y")
+    assert code == 0, capsys.readouterr().out
+
+    session = mc.MulticamSession.load(mc.list_sessions()[0]["session_id"])
+    pushed_basis = session.cloud["basis"]
+    sent_basis = mc.sync_basis_signature(session)  # recomputed from the session as it is now, nudge included
+    assert pushed_basis != sent_basis, "the nudge that landed mid-push must not be folded into the recorded basis"
+
+    cloud["edit"] = {"state": {}, "cuts": [], "removals": [], "revision": 1}
+    with pytest.raises(multicam_cloud.MulticamCloudError, match="moved on the timeline"):
+        multicam_cloud.pull(session)
 
 
 def test_pull_needs_an_edit_that_was_sent(sandbox):
     with pytest.raises(multicam_cloud.MulticamCloudError, match="No multicam edit on this computer"):
         multicam_cloud.resolve("11111111-2222-3333-4444-555555555555")
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_pull_refuses_when_sources_moved_since_the_edit_was_sent(episode, cloud, monkeypatch, capsys):
+    words = [{"start": 1.0, "end": 1.4, "text": "Hello", "person": "nika"}]
+    monkeypatch.setattr(mc, "transcript", lambda *a, **k: {"words": words})
+    code = run_cli(monkeypatch, str(episode), "--people", "Nika, Ana", "--set", "cam_one=camera:nika",
+                   "--set", "cam_two=camera:ana", "--cloud", "-y")
+    assert code == 0, capsys.readouterr().out
+
+    session = mc.MulticamSession.load(mc.list_sessions()[0]["session_id"])
+    one = next(s for s in session.sources if s.path.endswith("cam_one.mp4"))
+    cloud["edit"] = {"state": {}, "cuts": [], "removals": [], "revision": 1}
+
+    # Nudging a source after the push moves it on the timeline, so the cuts
+    # the cloud editor made against the old position would land on the wrong
+    # footage if pulled.
+    mc.update_mapping(session, {"sources": [{"id": one.id, "nudge": 1.5}]})
+    session = mc.MulticamSession.load(session.session_id)
+    with pytest.raises(multicam_cloud.MulticamCloudError, match="moved on the timeline"):
+        multicam_cloud.pull(session)

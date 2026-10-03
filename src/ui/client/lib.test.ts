@@ -9,6 +9,9 @@ import {
   clampClipIndex,
   resolveAssetName,
   formatTranscriptText,
+  safeUpper,
+  describePeople,
+  buildUiStateSyncPayload,
 } from "./lib";
 
 describe("fmt", () => {
@@ -210,5 +213,66 @@ describe("formatTranscriptText", () => {
     expect(formatTranscriptText({ transcript: "First sentence.   Second sentence." })).toBe(
       "First sentence. Second sentence.",
     );
+  });
+});
+
+describe("safeUpper", () => {
+  it("uppercases plain ASCII text", () => {
+    expect(safeUpper("hello world")).toBe("HELLO WORLD");
+  });
+
+  it("leaves Georgian Mkhedruli text unchanged instead of switching to Mtavruli", () => {
+    const georgian = "მიშა";
+    expect(safeUpper(georgian)).toBe(georgian);
+  });
+
+  it("uppercases the Latin parts of a mixed-script string and leaves Georgian alone", () => {
+    expect(safeUpper("hello მიშა")).toBe("HELLO მიშა");
+  });
+
+  it("passes through empty strings", () => {
+    expect(safeUpper("")).toBe("");
+  });
+});
+
+describe("describePeople", () => {
+  it("names each person and the second their face came from", () => {
+    expect(describePeople([
+      { side: "left", role: "guest", from: "seats", source_time: 72 },
+      { side: "right", role: "host", from: "seats", source_time: 9 },
+    ])).toBe("guest at 1:12, host at 0:09");
+  });
+
+  it("falls back to the side when the role is unknown and skips a missing time", () => {
+    expect(describePeople([
+      { side: "left", role: null, from: "image", source_time: null },
+      { side: "right", role: null, from: "seats", source_time: 3 },
+    ])).toBe("left person, right person at 0:03");
+  });
+});
+
+describe("buildUiStateSyncPayload", () => {
+  // The studio used to sync the transcript in a request of its own, separate
+  // from videoPath and the rest of the syncable state. After silence
+  // removal, videoPath and transcript update together in one render, but
+  // the two separate fetches could still arrive at the server in either
+  // order. A videoPath-only request landing after the transcript-only one
+  // looked exactly like a bare set_video (videoPath with no transcript in
+  // the request) and cleared the transcript that had just arrived.
+
+  it("omits transcript when it hasn't changed, matching the old split-request shape", () => {
+    const payload = buildUiStateSyncPayload({ videoPath: "a.mp4" }, "a.mp4", { words: [] }, false);
+    expect(payload).not.toHaveProperty("transcript");
+  });
+
+  it("carries videoPath and a just-changed transcript in one payload, not two", () => {
+    const transcript = { words: [{ word: "hi", start: 0, end: 1 }] };
+    const payload = buildUiStateSyncPayload({ videoPath: "b.mp4" }, "b.mp4", transcript, true);
+    expect(payload).toMatchObject({ _source: "ui", videoPath: "b.mp4", transcript });
+  });
+
+  it("sends an explicit transcript: null when it changed to null, not a silent omission", () => {
+    const payload = buildUiStateSyncPayload({ videoPath: "a.mp4" }, "a.mp4", null, true);
+    expect(payload).toHaveProperty("transcript", null);
   });
 });

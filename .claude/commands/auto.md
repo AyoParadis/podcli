@@ -1,6 +1,6 @@
 ---
 description: One-verb pipeline — drop a video, confirm strategy, render clips
-allowed-tools: Read, Bash, mcp__podcli__transcribe_podcast, mcp__podcli__transcribe_start, mcp__podcli__transcribe_status, mcp__podcli__get_ui_state, mcp__podcli__set_video, mcp__podcli__suggest_clips, mcp__podcli__batch_create_clips, mcp__podcli__knowledge_base, mcp__podcli__clip_history
+allowed-tools: Read, Bash, mcp__podcli__transcribe_podcast, mcp__podcli__transcribe_start, mcp__podcli__job_status, mcp__podcli__get_ui_state, mcp__podcli__set_video, mcp__podcli__suggest_clips, mcp__podcli__batch_create_clips, mcp__podcli__knowledge_base, mcp__podcli__clip_history, mcp__podcli__record_decisions
 argument-hint: [video-path-or-episode-slug] [optional: count e.g. "5 clips"]
 triggers:
   - auto
@@ -21,7 +21,7 @@ This command orchestrates the existing MCP tools on top of the compact packed tr
 
 1. **Read, don't watch.** Reason about clips from the packed markdown view — not raw segments, not frame dumps.
 2. **Strategy first, render after.** Propose the cut list and WAIT for user confirmation before calling `batch_create_clips`.
-3. **Knowledge base is context, not template.** If `` exists, read it for brand voice and format preferences. If not, infer from the content itself.
+3. **Knowledge base is context, not template.** If `.podcli/knowledge/` exists, read it for brand voice and format preferences. If not, infer from the content itself.
 4. **Never silently render.** Every clip that ships must appear in the proposal the user approved.
 5. **Every clip carries its own context.** A stranger who never heard the episode has to follow it from the first second. If the moment is an answer, the question comes with it.
 
@@ -46,14 +46,16 @@ This command orchestrates the existing MCP tools on top of the compact packed tr
    - Call `transcribe_start(file_path)` → returns `{job_id, cached, estimate}` immediately.
    - If `cached: true`, skip to step 3.
    - Otherwise emit a short status to the user: _"Transcription started — estimated {estimate}. I'll check progress every 30s."_
-   - Loop: call `transcribe_status(job_id, wait_seconds: 30)`. Between calls, emit ONE terse line to the user like `"Progress: 47% — pyannote diarization"`. Keep it to one line per poll — no repeat prose. Exit the loop when `done: true`.
+   - Loop: call `job_status(job_id, wait_seconds: 30)`. Between calls, emit ONE terse line to the user like `"Progress: 47%, pyannote diarization"`. Keep it to one line per poll, no repeat prose. Exit the loop when `done: true`.
    - If `status: "error"`, stop and report the error.
 3. Read the packed transcript: `get_ui_state(include_transcript: true)`. This returns a compact phrase-grouped view with speakers, silence gaps, and energy peaks.
    - **If the header says speakers: 0**, stop and tell the user before going further. Without speaker labels you cannot tell a question from an answer, so the whole question-with-the-answer rule below is inert and the picks will be worse. Offer to re-transcribe with `transcribe_start(file_path, enable_diarization: true)`. Only continue without it if the user says to.
-4. If `` exists, read `01-brand-identity.md`, `02-voice-and-tone.md`, and `04-shorts-creation-guide.md` for show context. Skip silently if missing — `/auto` works on any content.
+4. If `.podcli/knowledge/` exists, read `01-brand-identity.md`, `02-voice-and-tone.md`, and `04-shorts-creation-guide.md` for show context. Skip silently if missing: `/auto` works on any content.
 5. Call `clip_history` to see what's already been shipped for this episode. Avoid duplicates in the proposal.
 
-**Fallback**: if `transcribe_start` returns an error about the Web UI not running, tell the user and offer either (a) run `npm run ui` in another terminal then retry, or (b) fall back to the synchronous `transcribe_podcast` (no live progress, works silently).
+**Fallback**: if `transcribe_start` returns an error about the Web UI not running, tell the user and offer either (a) start the Web UI in another terminal then retry (`podcli studio` for a launcher install, `npm run ui` in a source checkout), or (b) fall back to the synchronous `transcribe_podcast` (no live progress, works silently).
+
+6. **Ask once, reuse the answer.** `get_ui_state` lists this episode's unanswered decisions under `OPEN QUESTIONS` (clip count, duration range, captions, language, thumbnails, delivery target). Ask whichever are relevant to this run, batched, not one dialog box per field, then call `record_decisions(video_path, ...)` with the answers. On every later run against this same video, those fields are already answered and won't appear in `OPEN QUESTIONS` again.
 
 ### Phase 2 — Topic Map (silent)
 
@@ -86,6 +88,7 @@ Work inside one topic at a time. Set boundaries by meaning, not by the clock.
 - The question has to be inside the clip. `context_line` is a note for the editor, not a fix: nothing burns it into the video yet, so a clip that relies on it still ships with no setup.
 - If the question rambles past roughly 8 seconds, use `segments` to keep the asked part and cut the rambling, or drop the moment.
 - Never open on a word pointing back before the cut: "that", "it", "they", "yeah", "so", "exactly", "right", "which is why". Widen the start until the reference is inside the clip.
+- If the sharpest line sits mid-clip, you may pass it as `hook` (`{start, end, mode}`, 1-15 seconds) so it plays first. It must be a line actually spoken inside the clip, never invented text. `repeat` replays it in place; `move` lifts it out.
 
 **end_second**
 

@@ -67,15 +67,29 @@ def handle_ping(task_id: str, params: dict):
     emit_result(task_id, "success", data={"message": "pong", "version": VERSION})
 
 
+def handle_resolve_transcribe_engine(task_id: str, params: dict):
+    """Predict transcribe_file's engine resolution without transcribing, so
+    callers can build the right cache key before deciding whether to run it."""
+    from services.transcription import resolve_engine_info
+
+    emit_result(
+        task_id,
+        "success",
+        data=resolve_engine_info(params.get("engine"), params.get("model_size", "base")),
+    )
+
+
 def handle_transcribe(task_id: str, params: dict):
     """Transcribe a podcast video/audio file with speaker detection."""
     from services.transcription import transcribe_file
     from services.corrections import apply_corrections
-    from services.transcript_packer import compute_cache_hash, engine_cache_suffix, write_packed
+    from services.transcript_packer import compute_cache_hash, cache_key_suffix, write_packed
 
     emit_progress(task_id, "transcribing", 0, "Starting transcription...")
     file_path = params["file_path"]
     engine = params.get("engine")
+    model_size = params.get("model_size", "base")
+    language = params.get("language")
     previous_engine = os.environ.get("PODCLI_ENGINE")
     previous_assemblyai_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if engine:
@@ -83,14 +97,26 @@ def handle_transcribe(task_id: str, params: dict):
     if params.get("assemblyai_api_key"):
         os.environ["ASSEMBLYAI_API_KEY"] = params["assemblyai_api_key"]
 
+    start_seconds = params.get("start_seconds")
+    duration_seconds = params.get("duration_seconds")
+    # Matches src/handlers/transcribe.handler.ts and web-server.ts exactly:
+    # a sample is a *positive* window, not merely a present key. A caller
+    # that explicitly passes null (dropped by JSON on the TS side, but
+    # still visible here as None) or duration_seconds: 0 must get the full
+    # transcription path, the same as not passing the field at all.
+    is_sample = (duration_seconds or 0) > 0 or (start_seconds or 0) > 0
+
     # One shared 16 kHz mono wav feeds transcription, energy and reactions
-    # instead of decoding the source three times.
+    # instead of decoding the source three times. Skipped for a sample run:
+    # transcribe_file extracts its own trimmed window, and decoding the full
+    # source here would undo the whole point of a quick sample.
     shared_wav = None
-    try:
-        from services.audio_extract import extract_wav_16k_mono
-        shared_wav = extract_wav_16k_mono(file_path)
-    except Exception:
-        shared_wav = None
+    if not is_sample:
+        try:
+            from services.audio_extract import extract_wav_16k_mono
+            shared_wav = extract_wav_16k_mono(file_path)
+        except Exception:
+            shared_wav = None
 
     try:
         result = transcribe_file(
@@ -100,46 +126,56 @@ def handle_transcribe(task_id: str, params: dict):
             language=params.get("language"),
             enable_diarization=params.get("enable_diarization", True),
             num_speakers=params.get("num_speakers"),
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
             progress_callback=lambda pct, msg: emit_progress(task_id, "transcribing", pct, msg),
             wav_path=shared_wav,
         )
         # Apply word corrections (Whisper misheard proper nouns)
         apply_corrections(result.get("words", []), result.get("segments", []))
 
-        energy_data = None
-        try:
-            from services.audio_analyzer import extract_audio_energy
-            energy_data = extract_audio_energy(file_path, wav_path=shared_wav)
-        except Exception:
-            pass  # energy is a nice-to-have
+        # A sample is a throwaway language/quality check on a slice of the
+        # source. Energy/event signals and the packed view are keyed by the
+        # full file and meant to describe the whole episode, so skip them
+        # rather than caching partial (or source-wide-but-wrongly-expensive)
+        # data under those keys.
+        if not is_sample:
+            energy_data = None
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # energy is a nice-to-have
 
-        events_data = None
-        try:
-            from services.audio_events import extract_audio_events
-            events_data = extract_audio_events(file_path, wav_path=shared_wav)
-        except Exception:
-            pass  # reactions are a nice-to-have
+            events_data = None
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # reactions are a nice-to-have
 
-        # Cached so clip suggestion reuses these instead of decoding the source again.
-        from services.signal_cache import save_signals
-        save_signals(file_path, energy_data=energy_data, events_data=events_data)
+            # Cached so clip suggestion reuses these instead of decoding the source again.
+            from services.signal_cache import save_signals
+            save_signals(file_path, energy_data=energy_data, events_data=events_data)
 
-        # Auto-pack: emit compact LLM-readable markdown alongside raw JSON.
-        # Pulls energy data so the packed view includes peak moments for clip reasoning.
-        try:
-            cache_hash = compute_cache_hash(file_path) + engine_cache_suffix(result.get("engine") or engine)
-            packed_path, packed_md = write_packed(
-                result,
-                cache_hash,
-                source_label=os.path.basename(file_path),
-                energy_data=energy_data,
-                events_data=events_data,
-            )
-            result["packed_path"] = packed_path
-            result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
-        except Exception as e:
-            # Non-fatal — transcription result is still useful without the packed view
-            emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
+            # Auto-pack: emit compact LLM-readable markdown alongside raw JSON.
+            # Pulls energy data so the packed view includes peak moments for clip reasoning.
+            try:
+                cache_hash = compute_cache_hash(file_path) + cache_key_suffix(
+                    engine=result.get("engine") or engine, model=model_size, language=language
+                )
+                packed_path, packed_md = write_packed(
+                    result,
+                    cache_hash,
+                    source_label=os.path.basename(file_path),
+                    energy_data=energy_data,
+                    events_data=events_data,
+                )
+                result["packed_path"] = packed_path
+                result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
+            except Exception as e:
+                # Non-fatal: transcription result is still useful without the packed view
+                emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
     finally:
         if previous_engine is None:
             os.environ.pop("PODCLI_ENGINE", None)
@@ -192,11 +228,13 @@ def handle_create_clip(task_id: str, params: dict):
         clean_fillers=params.get("clean_fillers", True),
         face_map=params.get("face_map"),
         keep_segments=params.get("keep_segments"),
+        hook=params.get("hook"),
         trim_opening=params.get("trim_opening"),
         preserve_timing=params.get("preserve_timing", False),
         allow_ass_fallback=params.get("allow_ass_fallback", False),
         use_ass_captions=params.get("use_ass_captions", False),
         keep_caption_overlay=params.get("keep_caption_overlay", False),
+        write_clean_variant=params.get("write_clean_variant", False),
         progress_callback=lambda pct, msg: emit_progress(task_id, "processing", pct, msg),
     )
     emit_result(task_id, "success", data=result)
@@ -258,10 +296,14 @@ def handle_batch_clips(task_id: str, params: dict):
             clean_fillers=params.get("clean_fillers", True),
             face_map=params.get("face_map"),
             keep_segments=clip.get("keep_segments"),
+            hook=clip.get("hook"),
             allow_ass_fallback=clip.get("allow_ass_fallback", params.get("allow_ass_fallback", False)),
             use_ass_captions=clip.get("use_ass_captions", params.get("use_ass_captions", False)),
             keep_caption_overlay=clip.get(
                 "keep_caption_overlay", params.get("keep_caption_overlay", False)
+            ),
+            write_clean_variant=clip.get(
+                "write_clean_variant", params.get("write_clean_variant", False)
             ),
             progress_callback=lambda pct, msg, _i=i: emit_progress(
                 task_id, "batch", int((_i / total) * 100 + pct / total), msg
@@ -331,13 +373,16 @@ def handle_parse_transcript(task_id: str, params: dict):
     raw_text = params.get("raw_text", "")
     total_duration = params.get("total_duration")
     time_adjust = params.get("time_adjust", 0.0)
+    language = params.get("language")
 
     if not raw_text:
         emit_result(task_id, "error", error="raw_text is required")
         return
 
     emit_progress(task_id, "parsing", 50, "Parsing transcript...")
-    result = detect_and_parse(raw_text, total_duration=total_duration, time_adjust=time_adjust)
+    result = detect_and_parse(
+        raw_text, total_duration=total_duration, time_adjust=time_adjust, language=language
+    )
 
     if "error" in result:
         emit_result(task_id, "error", error=result["error"])
@@ -943,6 +988,40 @@ def handle_analyze_silence(task_id: str, params: dict):
         emit_result(task_id, "error", error=str(e))
 
 
+def handle_compare_engines(task_id: str, params: dict):
+    """Transcribe the same sample window with two engines and report where
+    they disagree. See services/engine_comparison.py for the scoring."""
+    import time as _time
+    from config.paths import paths
+    from services.engine_comparison import compare_engines
+
+    file_path = params.get("file_path", "")
+    if not file_path or not os.path.exists(file_path):
+        emit_result(task_id, "error", error=f"File not found: {file_path}")
+        return
+
+    output_dir = params.get("output_dir") or os.path.join(
+        paths["output"], "engine-comparisons", f"{int(_time.time())}"
+    )
+    try:
+        emit_progress(task_id, "comparing", 10, f"Transcribing with {params.get('engine_a')}...")
+        report = compare_engines(
+            file_path,
+            params.get("engine_a", "whispercpp"),
+            params.get("engine_b", "whisper-py"),
+            start_seconds=params.get("start_seconds", 0.0) or 0.0,
+            duration_seconds=params.get("duration_seconds", 120.0) or 120.0,
+            window_seconds=params.get("window_seconds", 20.0) or 20.0,
+            model_size=params.get("model_size", "base"),
+            language=params.get("language"),
+            output_dir=output_dir,
+        )
+        emit_progress(task_id, "comparing", 100, "Comparison complete")
+        emit_result(task_id, "success", data=report)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
 def handle_render_silence_removed(task_id: str, params: dict):
     """Render the approved local cut plan and remap transcript timestamps."""
     from config.paths import paths
@@ -1006,7 +1085,7 @@ def handle_manage_multicam(task_id: str, params: dict):
             emit_result(task_id, "success", data={"deleted": True, "session_id": session_id})
             return
 
-        session = mc.MulticamSession.load(session_id)
+        session = mc.open_session(session_id)
         if action == "render" and any(k in params for k in MULTICAM_MAP_KEYS if k != "look"):
             # A mapping change can drop the cut, and a render needs one: map, then plan, then render.
             raise ValueError("render takes only look and stems. Change the mapping with 'map', then 'plan' again.")
@@ -1036,7 +1115,10 @@ def handle_manage_multicam(task_id: str, params: dict):
             stems = params.get("stems", True)
             if not isinstance(stems, bool):
                 raise ValueError("stems is true or false")
-            mc.render_session(session, stems=stems, progress_callback=progress("rendering"))
+            validate = params.get("validate", "sample")
+            if validate not in ("sample", "full"):
+                raise ValueError("validate must be 'sample' or 'full'")
+            mc.render_session(session, stems=stems, validate=validate, progress_callback=progress("rendering"))
         elif action == "export":
             data["export_path"] = mc.export_xml(session, params.get("format", "premiere"), review=bool(params.get("review")))
         elif action == "import_timeline":
@@ -1098,7 +1180,9 @@ def handle_run_integration_tool(task_id: str, params: dict):
 
 TASK_HANDLERS = {
     "ping": handle_ping,
+    "resolve_transcribe_engine": handle_resolve_transcribe_engine,
     "transcribe": handle_transcribe,
+    "compare_engines": handle_compare_engines,
     "parse_transcript": handle_parse_transcript,
     "create_clip": handle_create_clip,
     "batch_clips": handle_batch_clips,

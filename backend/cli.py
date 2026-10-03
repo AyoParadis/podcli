@@ -124,16 +124,20 @@ def _json_object_arg(raw: str | None, name: str):
     return parsed
 
 
-def _cached_face_map(video_path: str):
-    """Face maps are keyed by video content, not by transcript, so an imported
-    transcript can still borrow the map from an earlier run on the same file."""
+def _cached_transcript(video_path: str) -> dict:
+    """The cached transcript for this video, or {} when there is none."""
     try:
         from services.transcript_packer import load_cached_transcript_for_video
 
-        cached = load_cached_transcript_for_video(video_path)
+        return load_cached_transcript_for_video(video_path) or {}
     except Exception:
-        return None
-    return (cached or {}).get("face_map")
+        return {}
+
+
+def _cached_face_map(video_path: str):
+    """Face maps are keyed by video content, not by transcript, so an imported
+    transcript can still borrow the map from an earlier run on the same file."""
+    return _cached_transcript(video_path).get("face_map")
 
 
 def _suggestions_session_path(cache_hash: str) -> str:
@@ -557,6 +561,8 @@ def cmd_studio(args):
             cmd += ["--progress-color", args.progress_color]
     if getattr(args, "cards", None):
         cmd += ["--cards", args.cards]
+    if getattr(args, "hook", None):
+        cmd += ["--hook", args.hook]
     if getattr(args, "brand", None):
         cmd += ["--brand", args.brand]
     if getattr(args, "style", None):
@@ -798,7 +804,7 @@ def _open_multicam_session(target: str, people):
         session = mc.new_session(folder=target, people=people, progress_callback=report)
         done()
     else:
-        session = mc.MulticamSession.load(target)
+        session = mc.open_session(target)
     # Reopening keeps the saved names; --people on a re-run renames them.
     if people and people != [p.name for p in session.people]:
         session = mc.rename_people(session, people)
@@ -994,10 +1000,12 @@ def _run_multicam(args, mc, target: str):
 
 def _render_multicam(args, mc, session):
     report, done = _multicam_progress("Rendering")
-    outputs = mc.render_session(session, stems=not args.no_stems, progress_callback=report)
+    outputs = mc.render_session(session, stems=not args.no_stems, validate=args.validate, progress_callback=report)
     done()
     for path in [outputs["video"], *(outputs.get("stems") or [])]:
         print(f"  ✓ {path}")
+    for warning in (outputs.get("validation") or {}).get("warnings") or []:
+        print(f"  ! {warning}", file=sys.stderr)
 
 
 def _pull_multicam(args, mc, target: str):
@@ -1296,7 +1304,12 @@ def cmd_process(args):
     if skip_transcript:
         # Reuse an existing transcript so highlight boundaries snap to whole sentences;
         # only skip transcription outright when there is none (true no-dialogue footage).
-        cached = load_cached_transcript_for_video(video_path)
+        cached = load_cached_transcript_for_video(
+            video_path,
+            engine=os.environ.get("PODCLI_ENGINE"),
+            model=config.get("whisper_model", "base"),
+            language=config.get("language"),
+        )
         if cached and not config.get("no_cache", False):
             words = cached["words"]
             segments = cached["segments"]
@@ -1337,8 +1350,16 @@ def cmd_process(args):
             else:
                 print("         No cached face map, crop falls back to per-clip face tracking")
     elif not skip_transcript:
-        # Check cache first
-        cached = load_cached_transcript_for_video(video_path)
+        # Check cache first, with the same (engine, model, language) the
+        # transcribe call below would run with, so a hit here is guaranteed
+        # to be the combo this invocation actually asked for, not a
+        # different one that happens to share the file.
+        cached = load_cached_transcript_for_video(
+            video_path,
+            engine=os.environ.get("PODCLI_ENGINE"),
+            model=config.get("whisper_model", "base"),
+            language=config.get("language"),
+        )
         if cached and not config.get("no_cache", False):
             print("  [1/4] Loaded from cache (instant)")
             words = cached["words"]
@@ -1398,8 +1419,16 @@ def cmd_process(args):
             segments = result["segments"]
             print(f"         Done: {len(segments)} segments, {len(words)} words")
 
-            # Save to cache for next run
-            save_cached_transcript_for_video(video_path, result)
+            # Save to cache for next run, under the same key the read above
+            # checked. result["engine"] is what actually ran, which can
+            # differ from the env var on a fallback (see transcribe_file).
+            save_cached_transcript_for_video(
+                video_path,
+                result,
+                engine=result.get("engine") or os.environ.get("PODCLI_ENGINE"),
+                model=config.get("whisper_model", "base"),
+                language=config.get("language"),
+            )
 
     # Apply word corrections (Whisper misheard proper nouns, brand names)
     from services.corrections import apply_corrections
@@ -1668,7 +1697,7 @@ def cmd_process(args):
     _thumb_photo = None
     if _thumb_enabled:
         try:
-            from services.thumbnail_ai import generate_variations as _tv, thumbnail_to_video_frame as _ttv
+            from services.thumbnail_ai import render_variations as _tv, thumbnail_to_video_frame as _ttv
             _thumb_gen = _tv
             _thumb_to_video = _ttv
             _thumb_logo = config.get("logo_path") or None
@@ -1718,6 +1747,7 @@ def cmd_process(args):
                         motion=config.get("motion"),
                         bookend_fade=config.get("bookend_fade", 0.0),
                         keep_segments=clip.get("segments"),
+                        hook=_clip_hook(clip),
                         face_map=face_map,
                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                         use_ass_captions=config.get("use_ass_captions", False),
@@ -1741,7 +1771,7 @@ def cmd_process(args):
                         output_path=os.path.join(clip_thumb_dir, "_lead_frame.jpg"),
                         start_second=result.get("start_second", clip.get("start_second", 0)),
                     )
-                    thumb_paths = _thumb_gen(
+                    rendered_thumbs = _thumb_gen(
                         title=clip.get("title", f"Clip {i+1}"),
                         output_dir=clip_thumb_dir,
                         photo_path=lead_frame or _thumb_photo,
@@ -1750,7 +1780,14 @@ def cmd_process(args):
                         end_second=result.get("end_second", clip.get("end_second")),
                         logo_path=_thumb_logo,
                         config=_thumb_style,
+                        grounding=_clip_grounding(clip),
+                        face_map=face_map,
+                        segments=segments,
                     )
+                    thumb_paths = rendered_thumbs["paths"]
+                    _pair = rendered_thumbs["pair"]
+                    if _pair and _pair["layout"] != "pair":
+                        print(f"                 ℹ {_pair['reason']}")
                     if thumb_paths and _thumb_placement == "off":
                         print(f"                 + {len(thumb_paths)} thumbnail(s) in "
                               f"{os.path.basename(clip_thumb_dir)}/")
@@ -1945,6 +1982,7 @@ def cmd_process(args):
                                 outro_path=config.get("outro_path") or None,
                                 intro_path=config.get("intro_path") or None,
                                 keep_segments=clip.get("segments"),
+                                hook=_clip_hook(clip),
                                 face_map=face_map,
                                 allow_ass_fallback=config.get("allow_ass_fallback", False),
                                 use_ass_captions=config.get("use_ass_captions", False),
@@ -2196,6 +2234,24 @@ def _review_clips(clips: list, segments: list, energy_scores: list | None, confi
                 print(f"         No additional suggestions found.")
 
 
+def _clip_hook(clip: dict) -> dict | None:
+    """The clip's opening hook when it still fits the clip, else None.
+
+    Review can move a clip's edges after the hook was proposed. A hook left
+    outside the body would fail the whole render, so it is dropped with a note
+    and the clip renders without it.
+    """
+    from services.opening_hook import validate_hook
+
+    if not clip.get("hook"):
+        return None
+    try:
+        return validate_hook(clip["hook"], clip["start_second"], clip["end_second"], clip.get("segments"))
+    except ValueError as e:
+        print(f"         Opening hook dropped: {e}")
+        return None
+
+
 def _filter_duplicate_clip_suggestions(candidates: list, existing: list, overlap_threshold: float = 5.0) -> list:
     """Drop suggestions that significantly overlap already-selected clips."""
     filtered = []
@@ -2272,6 +2328,7 @@ def _post_render_loop(
                     outro_path=config.get("outro_path") or None,
                     intro_path=config.get("intro_path") or None,
                     keep_segments=clip.get("segments"),
+                    hook=_clip_hook(clip),
                     face_map=face_map,
                     allow_ass_fallback=config.get("allow_ass_fallback", False),
                     use_ass_captions=config.get("use_ass_captions", False),
@@ -2459,6 +2516,7 @@ def _post_render_loop(
                                         outro_path=config.get("outro_path") or None,
                                         intro_path=config.get("intro_path") or None,
                                         keep_segments=f_clip.get("segments"),
+                                        hook=_clip_hook(f_clip),
                                         face_map=face_map,
                                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                                         use_ass_captions=config.get("use_ass_captions", False),
@@ -2516,6 +2574,7 @@ def _post_render_loop(
                                         outro_path=config.get("outro_path") or None,
                                         intro_path=config.get("intro_path") or None,
                                         keep_segments=nc.get("segments"),
+                                        hook=_clip_hook(nc),
                                         face_map=face_map,
                                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                                         use_ass_captions=config.get("use_ass_captions", False),
@@ -3130,12 +3189,30 @@ def cmd_thumbnail_config(args):
     raise ValueError(f"unknown thumbnail-config action: {action}")
 
 
+def _clip_grounding(clip: dict) -> dict | None:
+    """A suggestion's payoff, question and opening line, for grounding thumbnail copy."""
+    grounding = {k: clip.get(k) for k in ("payoff", "context_line", "preview_text")}
+    return grounding if any(grounding.values()) else None
+
+
+def _grounding_from_args(args) -> dict | None:
+    """Collect the clip's payoff/question/opening-line CLI flags into the dict
+    thumbnail_ai expects, or None if the caller passed none of them (e.g. a
+    bare title with no clip behind it, as in the standalone thumbnail studio)."""
+    grounding = {
+        "payoff": getattr(args, "payoff", None),
+        "context_line": getattr(args, "context_line", None),
+        "preview_text": getattr(args, "preview_text", None),
+    }
+    return grounding if any(grounding.values()) else None
+
+
 def cmd_thumbnail_options(args):
     """Emit candidate headline text pairs and face frames for the thumbnail picker."""
     from services.thumbnail_ai import generate_headline_variations, extract_candidate_frames
 
     os.makedirs(args.output, exist_ok=True)
-    texts = generate_headline_variations(args.title, args.texts) or []
+    texts = generate_headline_variations(args.title, args.texts, grounding=_grounding_from_args(args)) or []
     frames = []
     if args.video:
         frames = extract_candidate_frames(
@@ -3180,34 +3257,80 @@ def _check_frame(path):
         sys.exit(1)
 
 
+def _pair_from_args(args, output_dir: str) -> dict | None:
+    """The two-person panels the thumbnail flags ask for, or None for one face.
+
+    The template's own layout applies when --layout is not given. Speaker
+    turns and the face map come from the cached transcript of --video.
+    """
+    from services.thumbnail_ai import _load_brand_config, resolve_pair
+
+    video = getattr(args, "video", None)
+    cached = _cached_transcript(video) if video else {}
+    try:
+        return resolve_pair(
+            _load_brand_config(), output_dir, video,
+            getattr(args, "start", None), getattr(args, "end", None),
+            layout=getattr(args, "layout", None),
+            left_image=getattr(args, "left_image", None),
+            right_image=getattr(args, "right_image", None),
+            swap=bool(getattr(args, "swap", False)),
+            face_map=cached.get("face_map"), segments=cached.get("segments"),
+        )
+    except ValueError as err:
+        print(f"thumbnail failed: {err}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _layout_report(pair: dict | None) -> dict:
+    """What a thumbnail result says about its layout: which people, from which source seconds."""
+    if not pair:
+        return {"layout": "single"}
+    if pair["layout"] != "pair":
+        return {"layout": "single", "note": pair["reason"]}
+    return {"layout": "pair", "roles": pair["roles"], "swapped": pair["swapped"], "people": pair["people"]}
+
+
 def cmd_thumbnail_render(args):
     """Render one final thumbnail from a chosen frame + headline.
 
     Empty line1/line2 let the AI write the text; a chosen frame is used as-is.
+    With the pair layout the two people come from --video between --start and
+    --end, or from --left-image and --right-image, and the frame is the
+    fallback when two people cannot be told apart.
     """
     from services.thumbnail_ai import generate_thumbnail_with_template
     from services.asset_store import resolve_logo
 
-    _check_frame(args.frame)
-    frame_info = json.loads(args.frame_info) if args.frame_info else None
+    pair = _pair_from_args(args, os.path.dirname(os.path.abspath(args.output)))
+    people = pair["people"] if pair and pair["layout"] == "pair" else None
+    if not people:
+        if not args.frame:
+            reason = f" {pair['reason']}" if pair else ""
+            print(f"thumbnail render failed: no frame to fall back on.{reason}", file=sys.stderr)
+            sys.exit(1)
+        _check_frame(args.frame)
+    frame_info = json.loads(args.frame_info) if args.frame_info and not people else None
     out = generate_thumbnail_with_template(
         title=args.title,
-        frame_path=args.frame,
+        frame_path=None if people else args.frame,
         output_path=args.output,
         logo_path=resolve_logo(args.logo) if args.logo else None,
         frame_info=frame_info,
         line1_override=args.line1 or None,
         line2_override=args.line2 or None,
+        grounding=_grounding_from_args(args),
+        people=people,
     )
     if not out:
         print("thumbnail render failed", file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"path": out}))
+    print(json.dumps({"path": out, **_layout_report(pair)}))
 
 
 def cmd_thumbnails(args):
     """Generate thumbnail variations for a title."""
-    from services.thumbnail_ai import generate_variations
+    from services.thumbnail_ai import render_variations
     from services.asset_store import resolve as resolve_asset, resolve_logo
 
     accent = "\033[38;2;212;135;74m"
@@ -3251,23 +3374,41 @@ def cmd_thumbnails(args):
         print(f"\n  {bold}Generating {args.variations} thumbnail variations...{reset}")
         print(f"  Title: {accent}{args.title}{reset}")
 
-    paths = generate_variations(
-        title=args.title,
-        output_dir=args.output,
-        photo_path=photo,
-        video_path=video,
-        start_second=getattr(args, "start", None),
-        end_second=getattr(args, "end", None),
-        logo_path=logo,
-        config={"variations": args.variations},
-        line1=getattr(args, "line1", None),
-        line2=getattr(args, "line2", None),
-    )
+    cached = _cached_transcript(video) if video else {}
+    try:
+        rendered = render_variations(
+            title=args.title,
+            output_dir=args.output,
+            photo_path=photo,
+            video_path=video,
+            start_second=getattr(args, "start", None),
+            end_second=getattr(args, "end", None),
+            logo_path=logo,
+            config={"variations": args.variations},
+            line1=getattr(args, "line1", None),
+            line2=getattr(args, "line2", None),
+            layout=getattr(args, "layout", None),
+            left_image=getattr(args, "left_image", None),
+            right_image=getattr(args, "right_image", None),
+            swap=bool(getattr(args, "swap", False)),
+            face_map=cached.get("face_map"),
+            segments=cached.get("segments"),
+        )
+    except ValueError as err:
+        print(f"  {red}✗{reset} {err}", file=sys.stderr)
+        sys.exit(1)
+    paths = rendered["paths"]
+    report = _layout_report(rendered["pair"])
 
     if as_json:
-        print(json.dumps({"paths": paths}))
+        print(json.dumps({"paths": paths, **report}))
         return
 
+    if report.get("note"):
+        print(f"  {gray}{report['note']}{reset}")
+    for person in report.get("people", []):
+        when = f" at {person['source_time']:.1f}s" if person.get("source_time") is not None else ""
+        print(f"  {gray}{person['side'].capitalize()}: {person.get('role') or 'person'}{when}{reset}")
     for p in paths:
         print(f"  {green}✓{reset} {p}")
     print(f"\n  {gray}Open the folder to preview and pick the best one.{reset}\n")
@@ -4088,6 +4229,40 @@ def cmd_cache(args):
     print(f"  {gray}Run {accent}podcli cache clear{reset} {gray}to delete all{reset}\n")
 
 
+def cmd_compare_engines(args):
+    """Transcribe the same sample window with two engines and report where they disagree."""
+    from services.engine_comparison import compare_engines
+
+    accent = "\033[38;2;212;135;74m"
+    gray = "\033[38;5;245m"
+    reset = "\033[0m"
+
+    if not os.path.exists(args.video):
+        print(f"podcli: file not found: {args.video}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Comparing {accent}{args.engine_a}{reset} vs {accent}{args.engine_b}{reset} "
+          f"on {args.duration:.0f}s starting at {args.start:.0f}s...")
+
+    report = compare_engines(
+        args.video,
+        args.engine_a,
+        args.engine_b,
+        start_seconds=args.start,
+        duration_seconds=args.duration,
+        window_seconds=args.window,
+        model_size=args.model_size,
+        language=args.language,
+        output_dir=args.output,
+    )
+
+    print(f"\nOverall disagreement: {accent}{report['overall_disagreement']:.2f}{reset} "
+          f"(0 = identical output, 1 = completely different; not accuracy against a transcript)")
+    if report["both_empty_window_count"]:
+        print(f"{gray}{report['both_empty_window_count']} window(s) had no words from either engine{reset}")
+    print(f"{gray}Wrote {report['json_path']} and {report['html_path']}{reset}")
+
+
 def cmd_info(args):
     """Show system info."""
     from services.encoder import get_encoder_info
@@ -4820,6 +4995,15 @@ def _first_run_setup() -> bool:
     return True
 
 
+def _add_pair_args(parser) -> None:
+    parser.add_argument("--layout", choices=["single", "pair"],
+                        help="single: one face. pair: the guest left and the host right, from the clip's "
+                             "footage. Defaults to the template's layout")
+    parser.add_argument("--left-image", dest="left_image", help="Image of the person on the left (pair layout)")
+    parser.add_argument("--right-image", dest="right_image", help="Image of the person on the right (pair layout)")
+    parser.add_argument("--swap", action="store_true", help="Swap the two people's sides (pair layout)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="podcli",
@@ -4856,7 +5040,7 @@ def main():
                       help="Render on podcli.com instead of this machine (needs `podcli login`)")
     proc.add_argument("--template-id",
                       help="Cut in a saved cloud template, by id (with --cloud)")
-    proc.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine (default: whisper-py; whispercpp is local; assemblyai uses ASSEMBLYAI_API_KEY)")
+    proc.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"], help="Transcription engine (default: whisper-py; whispercpp is local; assemblyai uses ASSEMBLYAI_API_KEY)")
     proc.add_argument("--language", help="Language of the recording (e.g. es, pt-BR, ka). Auto-detect if omitted.")
     proc.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
     proc.add_argument("--fast", action="store_true", help="Draft mode: tiny Whisper, heuristic selection, center crop, low quality")
@@ -4996,6 +5180,10 @@ def main():
                            "File > Export > Timeline > FCP 7 XML)")
     mc_p.add_argument("--no-render", action="store_true", dest="no_render", help="Skip the MP4 render (fast, export only)")
     mc_p.add_argument("--no-stems", action="store_true", dest="no_stems", help="Skip the per-person WAV files")
+    mc_p.add_argument("--validate", choices=["sample", "full"], default="sample",
+                      help="How hard to check the rendered episode decodes cleanly: 'sample' (default) checks the "
+                           "first and last 10s plus a few points in between; 'full' decodes the whole thing, which "
+                           "costs minutes per hour of 1080p")
     mc_p.add_argument("--resync", action="store_true",
                       help="Sync every file again, including offsets you set by hand")
     mc_p.add_argument("-y", "--yes", action="store_true", help="Don't stop to review guessed roles")
@@ -5011,7 +5199,7 @@ def main():
     mc_p.add_argument("--transcript", action="store_true",
                       help="Transcribe the episode with each word credited to whoever's mic was speaking")
     mc_p.add_argument("--model", default="base", help="Whisper model for --transcript (default base)")
-    mc_p.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"],
+    mc_p.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"],
                       help="Transcription engine for --transcript (default: the one podcli is set up with)")
     mc_p.add_argument("--activity", action="store_true", help="Report who speaks when (talk time, or spans with --json)")
     mc_p.add_argument("--cloud", action="store_true",
@@ -5028,7 +5216,7 @@ def main():
     studio.add_argument("--end", type=float, help="Fragment end (seconds)")
     studio.add_argument("--paragraph", help="Find the fragment by matching this text in the transcript")
     studio.add_argument("--language", help="Transcription language (e.g. es). Auto-detect if omitted.")
-    studio.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine")
+    studio.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"], help="Transcription engine")
     studio.add_argument("--transcript", help="Word timings JSON for this video ({words:[...]} or a list); skips transcription")
     studio.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
     studio.add_argument("--caption-style", choices=["hormozi", "karaoke", "subtle", "branded", "outline"], default="hormozi")
@@ -5056,6 +5244,10 @@ def main():
                         help="Draw how much of the clip is left along the bottom edge")
     studio.add_argument("--progress-color", dest="progress_color")
     studio.add_argument("--cards", help="On-screen cards as JSON, each with kind/start/end")
+    studio.add_argument("--hook", help='Opening hook as JSON, on the source clock: '
+                                       '{"start":41.2,"end":45.8,"mode":"repeat"}. '
+                                       "Plays a 1-15 s passage from inside the fragment first; "
+                                       '"move" lifts it out of the body')
     studio.add_argument("--brand", help="Show colours as JSON: "
                                         '{"accent":"#4C9DF5","ink":"#FFFFFF","surface":"#0A0D14"}')
     studio.add_argument("--style", help='Visual theme as JSON: '
@@ -5176,6 +5368,7 @@ def main():
     thumb.add_argument("--line1", help="Explicit first thumbnail line (skips AI rewrite)")
     thumb.add_argument("--line2", help="Explicit second thumbnail line")
     thumb.add_argument("--json", action="store_true", help="Emit JSON {paths:[...]} to stdout")
+    _add_pair_args(thumb)
 
     # ── thumbnail-config ──
     tcfg = sub.add_parser("thumbnail-config", help="Show, export, import, or reset the thumbnail template")
@@ -5196,16 +5389,27 @@ def main():
     topt.add_argument("--end", type=float, help="Frame window end (seconds)")
     topt.add_argument("--texts", type=int, default=6, help="Number of headline options")
     topt.add_argument("--frames", type=int, default=6, help="Number of frame options")
+    topt.add_argument("--payoff", help="Clip's payoff line, so headline copy is grounded in it rather than the title alone")
+    topt.add_argument("--context-line", dest="context_line", help="The question this clip answers, if any")
+    topt.add_argument("--preview-text", dest="preview_text", help="Clip's verbatim opening line")
 
     # ── thumbnail-render (one final thumbnail from a chosen frame + headline) ──
     trnd = sub.add_parser("thumbnail-render", help="Render one thumbnail PNG from a chosen frame + headline")
     trnd.add_argument("title", help="Clip/episode title")
-    trnd.add_argument("--frame", required=True, help="Background frame image path")
+    trnd.add_argument("--frame", help="Background frame image path. Optional with the pair layout, "
+                                      "where it is the fallback when two people cannot be told apart")
+    trnd.add_argument("--video", help="Source video the pair layout takes both people from")
+    trnd.add_argument("--start", type=float, help="Clip start in --video (seconds)")
+    trnd.add_argument("--end", type=float, help="Clip end in --video (seconds)")
+    _add_pair_args(trnd)
     trnd.add_argument("-o", "--output", required=True, help="Destination PNG path")
     trnd.add_argument("--line1", help="Headline line 1 (empty = AI writes it)")
     trnd.add_argument("--line2", help="Headline line 2 (empty = AI writes it)")
     trnd.add_argument("--frame-info", dest="frame_info", help="JSON face metadata for the frame")
     trnd.add_argument("--logo", help="Logo (asset name or path)")
+    trnd.add_argument("--payoff", help="Clip's payoff line, so headline copy is grounded in it rather than the title alone")
+    trnd.add_argument("--context-line", dest="context_line", help="The question this clip answers, if any")
+    trnd.add_argument("--preview-text", dest="preview_text", help="Clip's verbatim opening line")
 
     # ── swap-thumbnail ──
     st = sub.add_parser("swap-thumbnail", help="Regenerate thumbnail on an existing clip")
@@ -5324,6 +5528,21 @@ def main():
     # ── info ──
     sub.add_parser("info", help="Show system info (encoder, etc.)")
 
+    # ── compare-engines ──
+    cmp_p = sub.add_parser(
+        "compare-engines",
+        help="Transcribe the same sample window with two engines and report where they disagree",
+    )
+    cmp_p.add_argument("video", help="Path to podcast video/audio file")
+    cmp_p.add_argument("engine_a", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
+    cmp_p.add_argument("engine_b", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
+    cmp_p.add_argument("--start", type=float, default=0.0, help="Sample start, seconds into the source (default: 0)")
+    cmp_p.add_argument("--duration", type=float, default=120.0, help="Sample length in seconds (default: 120)")
+    cmp_p.add_argument("--window", type=float, default=20.0, help="Report window size in seconds (default: 20)")
+    cmp_p.add_argument("--model-size", default="base", help="Model size for engines that take one (default: base)")
+    cmp_p.add_argument("--language", help="ISO language code. Auto-detect if omitted.")
+    cmp_p.add_argument("-o", "--output", default="./engine-comparison", help="Output directory for comparison.json/.html")
+
     init_thumb = sub.add_parser(
         "init-thumbnail",
         help="Scaffold .podcli/thumbnail-config.json so podcli generates thumbnails for you",
@@ -5404,6 +5623,8 @@ def main():
         cmd_cache(args)
     elif args.command == "info":
         cmd_info(args)
+    elif args.command == "compare-engines":
+        cmd_compare_engines(args)
     elif args.command == "init-thumbnail":
         cmd_init_thumbnail(args)
     elif args.command in ("ui", "webui"):

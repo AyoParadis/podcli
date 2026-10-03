@@ -4,11 +4,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"podcli/internal/backend"
@@ -33,7 +35,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("podcli %s\n", Version)
 	case "doctor":
-		doctor()
+		os.Exit(doctor(args[1:]))
 	case "update":
 		os.Exit(update.Run(Version))
 	case "uninstall":
@@ -182,7 +184,8 @@ func runEngine(args []string) int {
 	if wantsStudio(args) {
 		refreshStudioBundles()
 	}
-	if transcribeEngine(args) == "whispercpp" {
+	switch transcribeEngine(args) {
+	case "whispercpp":
 		model, err := provision.EnsureModel(transcribeModel(args))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "podcli: provisioning model:", err)
@@ -190,6 +193,15 @@ func runEngine(args []string) int {
 		}
 		os.Setenv("PODCLI_ENGINE", "whispercpp")
 		os.Setenv("PODCLI_WHISPERCPP_MODEL", model)
+	case "omnilingual":
+		model, tokens, err := provision.EnsureOmnilingualModel()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "podcli: provisioning omnilingual model:", err)
+			return 1
+		}
+		os.Setenv("PODCLI_ENGINE", "omnilingual")
+		os.Setenv("PODCLI_OMNILINGUAL_MODEL", model)
+		os.Setenv("PODCLI_OMNILINGUAL_TOKENS", tokens)
 	}
 	code, err := engine.Run(args)
 	if err != nil {
@@ -200,12 +212,37 @@ func runEngine(args []string) int {
 }
 
 func transcribeModel(args []string) string {
+	fast := false
 	for _, arg := range args {
 		if arg == "--fast" {
-			return "tiny.en"
+			fast = true
+			break
 		}
 	}
-	return "base"
+	if !fast {
+		return "base"
+	}
+	// tiny.en is English-only; unset language runs auto-detection, which
+	// needs the multilingual tiny model same as any non-English request.
+	lang := strings.ToLower(transcribeLanguage(args))
+	if lang == "en" || lang == "english" {
+		return "tiny.en"
+	}
+	return "tiny"
+}
+
+// transcribeLanguage extracts --language/--language=<value> the same way
+// transcribeEngine extracts --engine.
+func transcribeLanguage(args []string) string {
+	lang := ""
+	for i, a := range args {
+		if a == "--language" && i+1 < len(args) {
+			lang = args[i+1]
+		} else if strings.HasPrefix(a, "--language=") {
+			lang = strings.TrimPrefix(a, "--language=")
+		}
+	}
+	return lang
 }
 
 func configCmd(args []string) int {
@@ -375,13 +412,23 @@ func setup(args []string) int {
 	}
 	if engine.MCPServer() != "" {
 		if mcpRegisteredToSelf() {
-			fmt.Printf("  mcp:     already registered\n")
+			fmt.Printf("  mcp:     already registered with Claude Code\n")
 		} else if _, err := exec.LookPath("claude"); err != nil {
 			// Claude MCP registration is optional; Codex users do not need this.
 		} else if err := registerMCPServer(); err != nil {
-			fmt.Fprintf(os.Stderr, "  mcp:     not registered (%v) - run `podcli mcp install`\n", err)
+			fmt.Fprintf(os.Stderr, "  mcp:     not registered with Claude Code (%v) - run `podcli mcp install`\n", err)
 		} else {
 			fmt.Printf("  mcp:     registered with Claude Code\n")
+		}
+
+		if codexMCPRegisteredToSelf() {
+			fmt.Printf("  mcp:     already registered with Codex\n")
+		} else if _, err := exec.LookPath("codex"); err != nil {
+			// Codex MCP registration is optional; Claude users do not need this.
+		} else if err := registerCodexMCPServer(); err != nil {
+			fmt.Fprintf(os.Stderr, "  mcp:     not registered with Codex (%v)\n", err)
+		} else {
+			fmt.Printf("  mcp:     registered with Codex\n")
 		}
 	}
 	fmt.Println("Done.")
@@ -419,14 +466,72 @@ func mcpRegisteredToSelf() bool {
 	return err == nil && strings.Contains(string(out), self)
 }
 
+// registerCodexMCPServer points Codex at this binary's `mcp` command. Unlike
+// Claude's `mcp add`, `codex mcp add` overwrites an existing entry by name,
+// so no remove-first step is needed to stay idempotent.
+func registerCodexMCPServer() error {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		return fmt.Errorf("Codex CLI not found on PATH")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if out, err := exec.Command(codex, "mcp", "add", "podcli", "--", self, "mcp").CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func codexMCPRegisteredToSelf() bool {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		return false
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	out, err := exec.Command(codex, "mcp", "get", "podcli").CombinedOutput()
+	return err == nil && strings.Contains(string(out), self)
+}
+
 func mcpInstall() int {
-	if err := registerMCPServer(); err != nil {
-		self, _ := os.Executable()
-		fmt.Fprintf(os.Stderr, "podcli: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Register manually:  claude mcp add podcli -- %s mcp\n", self)
+	self, _ := os.Executable()
+	_, claudeErr := exec.LookPath("claude")
+	_, codexErr := exec.LookPath("codex")
+	registeredAny := false
+	failedAny := false
+
+	if claudeErr == nil {
+		if err := registerMCPServer(); err != nil {
+			fmt.Fprintf(os.Stderr, "podcli: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Register manually:  claude mcp add podcli -- %s mcp\n", self)
+			failedAny = true
+		} else {
+			fmt.Println("Registered podcli MCP server with Claude Code.")
+			registeredAny = true
+		}
+	}
+	if codexErr == nil {
+		if err := registerCodexMCPServer(); err != nil {
+			fmt.Fprintf(os.Stderr, "podcli: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Register manually:  codex mcp add podcli -- %s mcp\n", self)
+			failedAny = true
+		} else {
+			fmt.Println("Registered podcli MCP server with Codex.")
+			registeredAny = true
+		}
+	}
+
+	if !registeredAny && !failedAny {
+		fmt.Fprintln(os.Stderr, "podcli: neither Claude Code nor Codex CLI found on PATH")
 		return 1
 	}
-	fmt.Println("Registered podcli MCP server with Claude Code.")
+	if failedAny {
+		return 1
+	}
 	return 0
 }
 
@@ -677,17 +782,252 @@ func backendStamp(root string) string {
 	}
 }
 
-func doctor() {
+// Check severity. "warn" surfaces a problem without counting toward
+// doctor's exit code. Used for MCP registration, which is a per-folder
+// (Claude) or optional (Codex-only users) setting, not evidence anything is
+// broken.
+const (
+	levelOK   = "ok"
+	levelWarn = "warn"
+	levelFail = "fail"
+)
+
+// doctorCheck is one pass/fail probe doctor actually runs, as opposed to the
+// path/engine-resolution report above it, which only states what was found.
+type doctorCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Level  string `json:"level"` // "ok", "warn", or "fail" - only "fail" counts toward doctor's exit code
+	Detail string `json:"detail"`
+}
+
+type doctorReport struct {
+	Version string            `json:"version"`
+	Paths   map[string]string `json:"paths"`
+	Checks  []doctorCheck     `json:"checks"`
+	OK      bool              `json:"ok"`
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i != -1 {
+		s = s[:i]
+	}
+	return s
+}
+
+// runCheck resolves a hermetic binary (falling back to PATH), then actually
+// runs it. A binary that resolves but fails to run (missing shared lib, bad
+// install) is exactly the failure mode `podcli doctor` otherwise can't see.
+func runCheck(name, hermetic, pathFallback string, args ...string) doctorCheck {
+	bin := hermetic
+	source := "hermetic"
+	if bin == "" {
+		if p, err := exec.LookPath(pathFallback); err == nil {
+			bin = p
+			source = "PATH"
+		}
+	}
+	if bin == "" {
+		return doctorCheck{Name: name, OK: false, Level: levelFail, Detail: "not found (hermetic or PATH)"}
+	}
+	out, err := exec.Command(bin, args...).CombinedOutput()
+	if err != nil {
+		return doctorCheck{Name: name, OK: false, Level: levelFail, Detail: fmt.Sprintf("%s (%s): %v: %s", bin, source, err, firstLine(string(out)))}
+	}
+	return doctorCheck{Name: name, OK: true, Level: levelOK, Detail: fmt.Sprintf("%s (%s): %s", bin, source, firstLine(string(out)))}
+}
+
+func pythonBackendCheck() doctorCheck {
+	root, ok := engine.BackendRoot()
+	if !ok {
+		return doctorCheck{Name: "python backend", OK: false, Level: levelFail, Detail: "backend not found (set PODCLI_BACKEND or run inside the repo)"}
+	}
+	// A representative sample, not every module: enough to catch "the
+	// interpreter can't even import the backend's own services" without
+	// reimplementing the whole import graph here.
+	modules := []string{"services.ai_cli", "services.multicam", "services.caption_renderer", "services.transcription"}
+	script := fmt.Sprintf("import sys; sys.path.insert(0, %q); import %s", root, strings.Join(modules, ", "))
+	out, err := exec.Command(engine.Python(), "-c", script).CombinedOutput()
+	if err != nil {
+		return doctorCheck{Name: "python backend", OK: false, Level: levelFail, Detail: fmt.Sprintf("%s: %v: %s", engine.Python(), err, firstLine(string(out)))}
+	}
+	return doctorCheck{Name: "python backend", OK: true, Level: levelOK, Detail: fmt.Sprintf("%s imports %s", engine.Python(), strings.Join(modules, ", "))}
+}
+
+// modelHashCheck reports ok=false when the file is absent: an unprovisioned
+// model is a valid state, not a failure.
+func modelHashCheck(name, p, want string) (doctorCheck, bool) {
+	if !fileExists(p) {
+		return doctorCheck{}, false
+	}
+	got, err := provision.Sha256File(p)
+	if err != nil {
+		return doctorCheck{Name: name, OK: false, Level: levelFail, Detail: fmt.Sprintf("could not hash %s: %v", p, err)}, true
+	}
+	if got != want {
+		return doctorCheck{Name: name, OK: false, Level: levelFail, Detail: fmt.Sprintf("%s hash mismatch: got %s, want %s", p, got, want)}, true
+	}
+	return doctorCheck{Name: name, OK: true, Level: levelOK, Detail: p}, true
+}
+
+func modelChecks() []doctorCheck {
+	var checks []doctorCheck
+	sizes := provision.KnownModelSizes()
+	sort.Strings(sizes)
+	for _, size := range sizes {
+		want, _ := provision.ModelSHA256(size)
+		if c, ok := modelHashCheck("model "+size, provision.ModelPath(size), want); ok {
+			checks = append(checks, c)
+		}
+	}
+	if c, ok := modelHashCheck("model vad", provision.VADModelPath(), provision.VADModelSHA256()); ok {
+		checks = append(checks, c)
+	}
+	files := provision.OmnilingualFileHashes()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := filepath.Join(provision.OmnilingualDir(), name)
+		if c, ok := modelHashCheck("model omnilingual "+name, p, files[name]); ok {
+			checks = append(checks, c)
+		}
+	}
+	return checks
+}
+
+// mcpRegistrationChecks reports registration status for whichever agent
+// CLIs are on PATH. Registration is per-folder for Claude and optional for
+// Codex-only users, so an unregistered folder is normal, not broken: these
+// checks are warnings and don't count toward doctor's exit code, unless
+// none of the detected agents are registered anywhere this can see, in
+// which case nothing would actually work and that's a real failure.
+func mcpRegistrationChecks() []doctorCheck {
+	var checks []doctorCheck
+	if _, err := exec.LookPath("claude"); err == nil {
+		ok := mcpRegisteredToSelf()
+		checks = append(checks, doctorCheck{
+			Name:   "mcp registration (Claude)",
+			OK:     ok,
+			Detail: pick(ok, "registered", "not registered for this folder - run `podcli mcp install` here"),
+		})
+	}
+	if _, err := exec.LookPath("codex"); err == nil {
+		ok := codexMCPRegisteredToSelf()
+		checks = append(checks, doctorCheck{
+			Name:   "mcp registration (Codex)",
+			OK:     ok,
+			Detail: pick(ok, "registered", "not registered - run `podcli mcp install`"),
+		})
+	}
+	return levelRegistrationChecks(checks)
+}
+
+func pick(cond bool, ifTrue, ifFalse string) string {
+	if cond {
+		return ifTrue
+	}
+	return ifFalse
+}
+
+// levelRegistrationChecks turns the OK/not-OK result of each detected
+// agent's registration check into a severity: registered is "ok"; an
+// unregistered agent is just "warn" as long as at least one detected agent
+// is registered somewhere, since the MCP tools work through that one. If
+// none of the detected agents are registered anywhere, nothing would
+// actually work, which escalates every one of them to "fail".
+func levelRegistrationChecks(checks []doctorCheck) []doctorCheck {
+	anyRegistered := false
+	for _, c := range checks {
+		if c.OK {
+			anyRegistered = true
+			break
+		}
+	}
+	for i := range checks {
+		switch {
+		case checks[i].OK:
+			checks[i].Level = levelOK
+		case anyRegistered:
+			checks[i].Level = levelWarn
+		default:
+			checks[i].Level = levelFail
+		}
+	}
+	return checks
+}
+
+func runDoctorChecks() []doctorCheck {
+	var checks []doctorCheck
+	checks = append(checks, runCheck("ffmpeg", engine.FFmpeg(), "ffmpeg", "-version"))
+	checks = append(checks, runCheck("ffprobe", engine.FFprobe(), "ffprobe", "-version"))
+	checks = append(checks, runCheck("whisper-cli", engine.WhisperCLI(), "whisper-cli", "--help"))
+	checks = append(checks, runCheck("node", engine.Node(), "node", "--version"))
+	checks = append(checks, pythonBackendCheck())
+	checks = append(checks, modelChecks()...)
+	checks = append(checks, mcpRegistrationChecks()...)
+	return checks
+}
+
+// checksAllOK is doctor's exit-code rule: only a "fail" level counts.
+// "warn" (currently just MCP registration) surfaces in the output without
+// turning an otherwise-healthy install into a reported failure.
+func checksAllOK(checks []doctorCheck) bool {
+	for _, c := range checks {
+		if c.Level == levelFail {
+			return false
+		}
+	}
+	return true
+}
+
+func doctor(args []string) int {
+	asJSON := false
+	for _, a := range args {
+		if a == "--json" {
+			asJSON = true
+		}
+	}
+
+	pathInfo := map[string]string{
+		"home":    paths.Home(),
+		"runtime": paths.RuntimeDir(),
+		"models":  paths.ModelsDir(),
+	}
+	if out := os.Getenv("PODCLI_OUTPUT"); out != "" {
+		pathInfo["clips"] = out
+	} else if cwd, err := os.Getwd(); err == nil {
+		pathInfo["clips"] = filepath.Join(cwd, "podcli-clips")
+	}
+
+	checks := runDoctorChecks()
+	allOK := checksAllOK(checks)
+
+	if asJSON {
+		report := doctorReport{Version: Version, Paths: pathInfo, Checks: checks, OK: allOK}
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "podcli: doctor:", err)
+			return 1
+		}
+		fmt.Println(string(data))
+		if !allOK {
+			return 1
+		}
+		return 0
+	}
+
 	fmt.Printf("podcli %s\n\n", Version)
 	fmt.Println("Paths")
-	fmt.Printf("  home:     %s\n", paths.Home())
-	fmt.Printf("  runtime:  %s\n", paths.RuntimeDir())
-	fmt.Printf("  models:   %s\n", paths.ModelsDir())
+	fmt.Printf("  home:     %s\n", pathInfo["home"])
+	fmt.Printf("  runtime:  %s\n", pathInfo["runtime"])
+	fmt.Printf("  models:   %s\n", pathInfo["models"])
 	fmt.Printf("  presets/knowledge/assets/history/cache: %s  (global - follow you everywhere)\n", paths.Home())
-	if out := os.Getenv("PODCLI_OUTPUT"); out != "" {
-		fmt.Printf("  clips:    %s  (PODCLI_OUTPUT)\n", out)
-	} else if cwd, err := os.Getwd(); err == nil {
-		fmt.Printf("  clips:    %s  (rendered into your working directory)\n", filepath.Join(cwd, "podcli-clips"))
+	if clips, ok := pathInfo["clips"]; ok {
+		fmt.Printf("  clips:    %s\n", clips)
 	}
 	fmt.Println("\nEngine resolution")
 	if root, ok := engine.BackendRoot(); ok {
@@ -703,24 +1043,6 @@ func doctor() {
 		fmt.Printf("  backend:  NOT FOUND (set PODCLI_BACKEND or run inside the repo)\n")
 	}
 	fmt.Printf("  python:   %s\n", engine.Python())
-	if ff := engine.FFmpeg(); ff != "" {
-		fmt.Printf("  ffmpeg:   %s (hermetic)\n", ff)
-	} else {
-		fmt.Printf("  ffmpeg:   PATH fallback (not yet hermetic)\n")
-	}
-	if fp := engine.FFprobe(); fp != "" {
-		fmt.Printf("  ffprobe:  %s (hermetic)\n", fp)
-	}
-	if wc := engine.WhisperCLI(); wc != "" {
-		fmt.Printf("  whisper:  %s (hermetic)\n", wc)
-	} else {
-		fmt.Printf("  whisper:  PATH fallback (install whisper-cli, or provisioned once hosted)\n")
-	}
-	if nd := engine.Node(); nd != "" {
-		fmt.Printf("  node:     %s (hermetic)\n", nd)
-	} else {
-		fmt.Printf("  node:     PATH fallback (Web UI uses system Node, or run `podcli setup`)\n")
-	}
 	if ss := engine.StudioServer(); ss != "" {
 		fmt.Printf("  studio:   %s\n", ss)
 	} else {
@@ -736,32 +1058,30 @@ func doctor() {
 	} else {
 		fmt.Printf("  remotion: not provisioned (captions/thumbnails need a published release)\n")
 	}
-	fmt.Println("\nModels")
-	fmt.Printf("  base:     %s\n", presence(provision.ModelPath("base")))
-	fmt.Printf("  vad:      %s\n", presence(provision.VADModelPath()))
-}
 
-func presence(p string) string {
-	if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-		return fmt.Sprintf("%s (%s)", p, humanBytes(fi.Size()))
+	fmt.Println("\nChecks")
+	for _, c := range checks {
+		mark := "OK  "
+		switch c.Level {
+		case levelWarn:
+			mark = "WARN"
+		case levelFail:
+			mark = "FAIL"
+		}
+		fmt.Printf("  [%s] %-28s %s\n", mark, c.Name, c.Detail)
 	}
-	return "not provisioned - run `podcli setup`"
+
+	if !allOK {
+		fmt.Println("\npodcli doctor found problems above.")
+		return 1
+	}
+	fmt.Println("\nAll checks passed.")
+	return 0
 }
 
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
-}
-
-func humanBytes(n int64) string {
-	switch {
-	case n >= 1<<20:
-		return fmt.Sprintf("%d MB", n>>20)
-	case n >= 1<<10:
-		return fmt.Sprintf("%d KB", n>>10)
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
 }
 
 func printHelp() {

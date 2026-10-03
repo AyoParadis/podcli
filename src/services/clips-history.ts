@@ -4,9 +4,9 @@ import { basename, join } from "path";
 import { v4 as uuidv4 } from "uuid";
 import { paths } from "../config/paths.js";
 import { writeFileAtomic } from "../utils/atomic-file.js";
-import { sliceTranscript, sliceWords } from "../utils/transcript.js";
+import { sliceTranscript, sliceWords, findGroundingText } from "../utils/transcript.js";
 import { isDemoMode, demoClips } from "../ui/demo-fixtures.js";
-import type { BatchClipsResult, ClipHistoryEntry, Format, WordTimestamp } from "../models/index.js";
+import type { BatchClipsResult, ClipHistoryEntry, ClipHook, Format, WordTimestamp } from "../models/index.js";
 
 type BatchResultRow = BatchClipsResult["results"][number];
 
@@ -17,12 +17,20 @@ interface BatchRecordContext {
   defaultCropStrategy?: string;
   defaultFormat?: Format;
   contentTypeFor?: (start: number, end: number) => string | undefined;
+  suggestions?: Array<{
+    start_second: number;
+    end_second: number;
+    payoff?: string;
+    context_line?: string;
+    preview_text?: string;
+  }> | null;
 }
 
 export interface BatchClipSpec {
   start_second: number;
   end_second: number;
   keep_segments?: Array<{ start: number; end: number }>;
+  hook?: ClipHook | null;
 }
 
 export interface BatchRecipeContext {
@@ -184,6 +192,7 @@ export class ClipsHistory {
           duration: r.duration || 0,
           content_type: ctx.contentTypeFor?.(start, end),
           transcript_slice: sliceTranscript(ctx.transcriptWords, start, end),
+          ...findGroundingText(ctx.suggestions, start, end),
         }),
       );
     }
@@ -210,6 +219,7 @@ export class ClipsHistory {
         introPath: ctx.introPath,
         cleanFillers: ctx.cleanFillers,
         keepSegments: spec?.keep_segments,
+        hook: spec?.hook,
       });
     }
   }
@@ -223,6 +233,7 @@ export class ClipsHistory {
       introPath?: string | null;
       cleanFillers?: boolean;
       keepSegments?: Array<{ start: number; end: number }>;
+      hook?: ClipHook | null;
     },
   ): Promise<void> {
     const words = sliceWords(ctx.transcriptWords ?? [], rec.start_second, rec.end_second);
@@ -237,6 +248,7 @@ export class ClipsHistory {
       clean_fillers: ctx.cleanFillers ?? false,
       transcript_words: words,
       ...(ctx.keepSegments?.length && { keep_segments: ctx.keepSegments }),
+      ...(ctx.hook && { hook: ctx.hook }),
     });
     if (ctx.keepSegments?.length) {
       await this.update(rec.id, { keep_segments: ctx.keepSegments });
@@ -270,6 +282,19 @@ export class ClipsHistory {
         return existsSync(e.output_path);
       }) || null
     );
+  }
+
+  // mine_channel's yt-dlp download writes "<title> [<video_id>].<ext>" (see
+  // ytdlp-args.ts's output template), so the id survives in source_video even
+  // though nothing else in the schema tracks where a video came from.
+  async minedYouTubeVideoIds(): Promise<Set<string>> {
+    const entries = await this.load();
+    const ids = new Set<string>();
+    for (const e of entries) {
+      const m = basename(e.source_video || "").match(/\[([A-Za-z0-9_-]{6,})\]\.[^.]+$/);
+      if (m) ids.add(m[1]);
+    }
+    return ids;
   }
 
   async list(limit = 50): Promise<ClipHistoryEntry[]> {
