@@ -1,0 +1,336 @@
+import { SAFE } from "./types";
+export type Tone = "ink" | "accent" | "muted" | "context";
+
+export type Size = "xs" | "sm" | "md" | "lg" | "xl" | "xxl";
+
+export type Align = "start" | "center" | "end";
+
+export type Layout = "stack" | "row" | "grid";
+
+export type Gap = "tight" | "group" | "section";
+
+export type BarRow = {
+  label: string;
+  value: number;
+  display?: string;
+  subject?: boolean;
+};
+
+export type StepPoint = { value: string; note?: string };
+
+type Common = {
+  tone?: Tone;
+  align?: Align;
+  /** Share of a row's width, when the row has more than one child. */
+  grow?: number;
+};
+
+export type Block =
+  | (Common & {
+      type: "text";
+      text: string;
+      /**
+       * The words set apart in the card's accent.
+       *
+       * A phrase found inside the text is coloured where it stands, so a
+       * sentence can land on two of them without being rewritten. One that is
+       * not in the text is appended instead, which is what this field used to
+       * mean and what an older plan still sends.
+       */
+      emphasis?: string | string[];
+      size?: Size;
+      caps?: boolean;
+    })
+  | (Common & { type: "quote"; text: string; attribution?: string; size?: Size })
+  | (Common & { type: "list"; items: string[]; numbered?: boolean; size?: Size })
+  | (Common & { type: "bars"; rows: BarRow[] })
+  | (Common & { type: "meter"; value: number; display?: string })
+  | (Common & { type: "steps"; points: StepPoint[] })
+  | (Common & { type: "chip"; name: string; note?: string; src?: string })
+  | (Common & {
+      type: "media";
+      media: "image" | "video";
+      src?: string;
+      fit?: "fit" | "fill";
+      startAt?: number;
+      caption?: string;
+      /** Reference-canvas height it asks for before the fit pass runs. */
+      height?: number;
+    })
+  | (Common & { type: "rule" })
+  | (Common & { type: "group"; layout?: Layout; gap?: Gap; blocks: Block[] });
+
+export type BlockType = Block["type"];
+
+export const BLOCK_TYPES: readonly BlockType[] = [
+  "text", "quote", "list", "bars", "meter", "steps", "chip", "media", "rule", "group",
+];
+
+/** Authored against the 1080x1920 canvas every other measurement here uses. */
+export const TYPE_SIZE: Record<Size, number> = {
+  xs: 34, sm: 46, md: 58, lg: 68, xl: 84, xxl: 168,
+};
+
+export const GAP_SIZE: Record<Gap, number> = { tight: 14, group: 36, section: 76 };
+
+export const MEDIA_HEIGHT = { min: 260, max: 540 };
+
+export const SCENE_WIDTH = 1080 - SAFE.left - SAFE.right;
+
+export const MAX_BLOCKS = 14;
+
+export const MAX_DEPTH = 3;
+
+const DEFAULT_SIZE: Partial<Record<BlockType, Size>> = {
+  text: "sm", quote: "lg", list: "md",
+};
+
+/** A stretch of a line, and whether it is the part being pointed at. */
+export type Run = { text: string; mark: boolean };
+
+/**
+ * A line split into what is set in ink and what is set in the accent.
+ *
+ * Written once because two things ask and they must not disagree: the
+ * renderer, to colour it, and the estimator, to say how tall it is. A phrase
+ * coloured in place costs no extra characters; one appended costs its own
+ * length, and a card measured under one rule and drawn under the other ends
+ * up behind the captions.
+ *
+ * Matching is case-insensitive and first-occurrence. Two phrases that overlap
+ * do not nest: the first one wins and the second is dropped rather than
+ * printed again at the end.
+ */
+export function emphasisRuns(text: string, emphasis?: string | string[]): Run[] {
+  const phrases = (Array.isArray(emphasis) ? emphasis : emphasis ? [emphasis] : [])
+    .map((phrase) => phrase.trim())
+    .filter(Boolean);
+  if (!phrases.length) return [{ text, mark: false }];
+
+  const runs: Run[] = [{ text, mark: false }];
+  const appended: string[] = [];
+
+  for (const phrase of phrases) {
+    let placed = false;
+    for (let i = 0; i < runs.length && !placed; i++) {
+      const run = runs[i]!;
+      if (run.mark) continue;
+      const at = run.text.toLowerCase().indexOf(phrase.toLowerCase());
+      if (at < 0) continue;
+      const before = run.text.slice(0, at);
+      const after = run.text.slice(at + phrase.length);
+      const parts: Run[] = [];
+      if (before) parts.push({ text: before, mark: false });
+      parts.push({ text: run.text.slice(at, at + phrase.length), mark: true });
+      if (after) parts.push({ text: after, mark: false });
+      runs.splice(i, 1, ...parts);
+      placed = true;
+    }
+    /*
+     * Appended only when the line does not contain it at all. A phrase that is
+     * in the line but already sits inside another mark has been said: adding
+     * it to the end as well would print it twice.
+     */
+    if (!placed && !text.toLowerCase().includes(phrase.toLowerCase())) {
+      appended.push(phrase);
+    }
+  }
+
+  for (const phrase of appended) {
+    runs.push({ text: " ", mark: false }, { text: phrase, mark: true });
+  }
+  return runs;
+}
+
+/** What the line comes to once emphasis has been placed or appended. */
+export const emphasised = (text: string, emphasis?: string | string[]): string =>
+  emphasisRuns(text, emphasis).map((run) => run.text).join("");
+
+export const sizeOf = (block: Block): Size =>
+  ("size" in block && block.size ? block.size : DEFAULT_SIZE[block.type] ?? "sm");
+
+/**
+ * Advance width of DM Sans at its heavier weights, as a fraction of the size.
+ * Wrapping is estimated rather than measured because the same number has to
+ * come out in the browser preview and in a headless render, and only one of
+ * those can measure text before it lays out.
+ */
+const ADVANCE = 0.55;
+
+const CAPS_ADVANCE = 0.68;
+
+const LINE = 1.25;
+
+const lines = (text: string, size: number, width: number, advance = ADVANCE) => {
+  const perLine = Math.max(1, Math.floor(width / (size * advance)));
+  return Math.max(1, Math.ceil(text.length / perLine));
+};
+
+const BAR_ROW = 26 + 8 + 34 * 1.3;
+
+const CHAR_WIDTH = 0.64;
+
+export const STEP_RISE = 44;
+
+export const stepsStacked = (points: StepPoint[]) => points.length <= 3;
+
+export const stepType = (points: StepPoint[], width = SCENE_WIDTH) => {
+  const stacked = stepsStacked(points);
+  const slot = stacked
+    ? width - 56
+    : (width - Math.max(0, points.length - 1) * 120) / Math.max(1, points.length);
+  const fits = (text: string | undefined, size: number) => !text || text.length * size * CHAR_WIDTH <= slot;
+  const value = [TYPE_SIZE.xl, TYPE_SIZE.lg, TYPE_SIZE.md, TYPE_SIZE.sm]
+    .find((size) => points.every((point) => fits(point.value, size))) ?? TYPE_SIZE.xs;
+  const note = (stacked ? [TYPE_SIZE.md, TYPE_SIZE.sm, TYPE_SIZE.xs] : [TYPE_SIZE.sm, TYPE_SIZE.xs])
+    .find((size) => points.every((point) => fits(point.note, size))) ?? TYPE_SIZE.xs;
+  return { value, note };
+};
+
+const stepRow = (points: StepPoint[], width: number) => {
+  const type = stepType(points, width);
+  if (!stepsStacked(points)) return 26 + type.value + type.note * 2.6 + 24;
+  const text = width - 56;
+  return points.reduce((sum, point, i) =>
+    sum + (i ? STEP_RISE : 0)
+      + lines(point.value, type.value, text, CHAR_WIDTH) * type.value * 1.05
+      + (point.note ? lines(point.note, type.note, text, CHAR_WIDTH) * type.note * 1.3 + 6 : 0), 0);
+};
+
+const CHIP_ROW = 132;
+
+const RULE_ROW = 5;
+
+const METER_ROW = 26;
+
+const listOf = (block: Block): Block[] =>
+  (block.type === "group" ? block.blocks : []);
+
+const gapOf = (block: Block): number =>
+  GAP_SIZE[(block.type === "group" && block.gap) || "tight"];
+
+/**
+ * How tall a block is at the reference canvas, before any fit shrink.
+ *
+ * Deliberately an over-estimate on text: a card drawn a little smaller than it
+ * had to be reads as a design choice, and one whose last line is behind the
+ * caption pill reads as a bug.
+ */
+export function blockHeight(block: Block, width: number): number {
+  switch (block.type) {
+    case "text": {
+      const size = TYPE_SIZE[sizeOf(block)];
+      const text = emphasised(block.text, block.emphasis);
+      return lines(text, size, width, block.caps ? CAPS_ADVANCE : ADVANCE) * size * LINE;
+    }
+    case "quote": {
+      const size = TYPE_SIZE[sizeOf(block)];
+      const body = lines(block.text, size, width) * size * LINE;
+      return body + (block.attribution ? GAP_SIZE.group + TYPE_SIZE.xs * LINE : 0);
+    }
+    case "list": {
+      const size = TYPE_SIZE[sizeOf(block)];
+      const marker = 46;
+      return block.items.reduce(
+        (total, item, i) =>
+          total + (i ? GAP_SIZE.tight : 0) + lines(item, size, width - marker) * size * LINE,
+        0,
+      );
+    }
+    case "bars":
+      return block.rows.length * BAR_ROW + Math.max(0, block.rows.length - 1) * 30;
+    case "meter":
+      return TYPE_SIZE.xxl * 0.72 + GAP_SIZE.tight + METER_ROW;
+    case "steps":
+      return stepRow(block.points, width);
+    case "chip":
+      return Math.max(
+        CHIP_ROW,
+        TYPE_SIZE.md * LINE + (block.note ? lines(block.note, TYPE_SIZE.sm, width) * TYPE_SIZE.sm * LINE : 0),
+      );
+    case "media":
+      return (block.height ?? MEDIA_HEIGHT.max)
+        + (block.caption ? TYPE_SIZE.xs * LINE + GAP_SIZE.tight : 0);
+    case "rule":
+      return RULE_ROW;
+    case "group":
+      return groupHeight(block, width);
+  }
+}
+
+function groupHeight(
+  block: Extract<Block, { type: "group" }>, width: number,
+): number {
+  const kids = listOf(block);
+  if (!kids.length) return 0;
+  const gap = gapOf(block);
+  const layout = block.layout ?? "stack";
+
+  if (layout === "stack") {
+    return kids.reduce(
+      (total, kid, i) => total + (i ? gap : 0) + blockHeight(kid, width),
+      0,
+    );
+  }
+
+  const columns = layout === "grid" ? 2 : kids.length;
+  const share = Math.max(1, (width - gap * (columns - 1)) / columns);
+  if (layout === "row") {
+    return Math.max(...kids.map((kid) => blockHeight(kid, share)));
+  }
+
+  let tallest = 0;
+  let total = 0;
+  kids.forEach((kid, i) => {
+    tallest = Math.max(tallest, blockHeight(kid, share));
+    if (i % columns === columns - 1 || i === kids.length - 1) {
+      total += (total ? gap : 0) + tallest;
+      tallest = 0;
+    }
+  });
+  return total;
+}
+
+export const sceneHeight = (
+  blocks: Block[], layout: Layout, gap: Gap, width = SCENE_WIDTH,
+) => groupHeight({ type: "group", layout, gap, blocks }, width);
+
+/** Never shrunk past this: below it the card is small rather than fitted. */
+export const MIN_FIT = 0.55;
+
+/**
+ * How much a scene has to be scaled down to sit in the room it was given.
+ *
+ * Media is excluded from the shrink because a picture answers a height rather
+ * than asking for one: the band it gets is what the fit pass leaves over.
+ */
+export function fitScale(
+  blocks: Block[],
+  { layout = "stack", gap = "group", room, width = SCENE_WIDTH }: {
+    layout?: Layout; gap?: Gap; room: number; width?: number;
+  },
+): number {
+  if (!(room > 0)) return 1;
+  const wanted = sceneHeight(blocks, layout, gap, width);
+  if (wanted <= room) return 1;
+  return Math.max(MIN_FIT, room / wanted);
+}
+
+export const hasMedia = (blocks: Block[]): boolean =>
+  blocks.some((block) =>
+    block.type === "media" || (block.type === "group" && hasMedia(block.blocks)));
+
+export function countBlocks(blocks: Block[]): number {
+  return blocks.reduce(
+    (total, block) => total + 1 + (block.type === "group" ? countBlocks(block.blocks) : 0),
+    0,
+  );
+}
+
+export function blockDepth(blocks: Block[]): number {
+  return blocks.reduce(
+    (deepest, block) =>
+      Math.max(deepest, block.type === "group" ? 1 + blockDepth(block.blocks) : 1),
+    0,
+  );
+}

@@ -67,15 +67,29 @@ def handle_ping(task_id: str, params: dict):
     emit_result(task_id, "success", data={"message": "pong", "version": VERSION})
 
 
+def handle_resolve_transcribe_engine(task_id: str, params: dict):
+    """Predict transcribe_file's engine resolution without transcribing, so
+    callers can build the right cache key before deciding whether to run it."""
+    from services.transcription import resolve_engine_info
+
+    emit_result(
+        task_id,
+        "success",
+        data=resolve_engine_info(params.get("engine"), params.get("model_size", "base")),
+    )
+
+
 def handle_transcribe(task_id: str, params: dict):
     """Transcribe a podcast video/audio file with speaker detection."""
     from services.transcription import transcribe_file
     from services.corrections import apply_corrections
-    from services.transcript_packer import compute_cache_hash, engine_cache_suffix, write_packed
+    from services.transcript_packer import compute_cache_hash, cache_key_suffix, write_packed
 
     emit_progress(task_id, "transcribing", 0, "Starting transcription...")
     file_path = params["file_path"]
     engine = params.get("engine")
+    model_size = params.get("model_size", "base")
+    language = params.get("language")
     previous_engine = os.environ.get("PODCLI_ENGINE")
     previous_assemblyai_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if engine:
@@ -83,14 +97,26 @@ def handle_transcribe(task_id: str, params: dict):
     if params.get("assemblyai_api_key"):
         os.environ["ASSEMBLYAI_API_KEY"] = params["assemblyai_api_key"]
 
+    start_seconds = params.get("start_seconds")
+    duration_seconds = params.get("duration_seconds")
+    # Matches src/handlers/transcribe.handler.ts and web-server.ts exactly:
+    # a sample is a *positive* window, not merely a present key. A caller
+    # that explicitly passes null (dropped by JSON on the TS side, but
+    # still visible here as None) or duration_seconds: 0 must get the full
+    # transcription path, the same as not passing the field at all.
+    is_sample = (duration_seconds or 0) > 0 or (start_seconds or 0) > 0
+
     # One shared 16 kHz mono wav feeds transcription, energy and reactions
-    # instead of decoding the source three times.
+    # instead of decoding the source three times. Skipped for a sample run:
+    # transcribe_file extracts its own trimmed window, and decoding the full
+    # source here would undo the whole point of a quick sample.
     shared_wav = None
-    try:
-        from services.audio_extract import extract_wav_16k_mono
-        shared_wav = extract_wav_16k_mono(file_path)
-    except Exception:
-        shared_wav = None
+    if not is_sample:
+        try:
+            from services.audio_extract import extract_wav_16k_mono
+            shared_wav = extract_wav_16k_mono(file_path)
+        except Exception:
+            shared_wav = None
 
     try:
         result = transcribe_file(
@@ -100,46 +126,56 @@ def handle_transcribe(task_id: str, params: dict):
             language=params.get("language"),
             enable_diarization=params.get("enable_diarization", True),
             num_speakers=params.get("num_speakers"),
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
             progress_callback=lambda pct, msg: emit_progress(task_id, "transcribing", pct, msg),
             wav_path=shared_wav,
         )
         # Apply word corrections (Whisper misheard proper nouns)
         apply_corrections(result.get("words", []), result.get("segments", []))
 
-        energy_data = None
-        try:
-            from services.audio_analyzer import extract_audio_energy
-            energy_data = extract_audio_energy(file_path, wav_path=shared_wav)
-        except Exception:
-            pass  # energy is a nice-to-have
+        # A sample is a throwaway language/quality check on a slice of the
+        # source. Energy/event signals and the packed view are keyed by the
+        # full file and meant to describe the whole episode, so skip them
+        # rather than caching partial (or source-wide-but-wrongly-expensive)
+        # data under those keys.
+        if not is_sample:
+            energy_data = None
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # energy is a nice-to-have
 
-        events_data = None
-        try:
-            from services.audio_events import extract_audio_events
-            events_data = extract_audio_events(file_path, wav_path=shared_wav)
-        except Exception:
-            pass  # reactions are a nice-to-have
+            events_data = None
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # reactions are a nice-to-have
 
-        # Cached so clip suggestion reuses these instead of decoding the source again.
-        from services.signal_cache import save_signals
-        save_signals(file_path, energy_data=energy_data, events_data=events_data)
+            # Cached so clip suggestion reuses these instead of decoding the source again.
+            from services.signal_cache import save_signals
+            save_signals(file_path, energy_data=energy_data, events_data=events_data)
 
-        # Auto-pack: emit compact LLM-readable markdown alongside raw JSON.
-        # Pulls energy data so the packed view includes peak moments for clip reasoning.
-        try:
-            cache_hash = compute_cache_hash(file_path) + engine_cache_suffix(result.get("engine") or engine)
-            packed_path, packed_md = write_packed(
-                result,
-                cache_hash,
-                source_label=os.path.basename(file_path),
-                energy_data=energy_data,
-                events_data=events_data,
-            )
-            result["packed_path"] = packed_path
-            result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
-        except Exception as e:
-            # Non-fatal — transcription result is still useful without the packed view
-            emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
+            # Auto-pack: emit compact LLM-readable markdown alongside raw JSON.
+            # Pulls energy data so the packed view includes peak moments for clip reasoning.
+            try:
+                cache_hash = compute_cache_hash(file_path) + cache_key_suffix(
+                    engine=result.get("engine") or engine, model=model_size, language=language
+                )
+                packed_path, packed_md = write_packed(
+                    result,
+                    cache_hash,
+                    source_label=os.path.basename(file_path),
+                    energy_data=energy_data,
+                    events_data=events_data,
+                )
+                result["packed_path"] = packed_path
+                result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
+            except Exception as e:
+                # Non-fatal: transcription result is still useful without the packed view
+                emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
     finally:
         if previous_engine is None:
             os.environ.pop("PODCLI_ENGINE", None)
@@ -172,6 +208,11 @@ def handle_create_clip(task_id: str, params: dict):
         caption_position=params.get("caption_position", "auto"),
         caption_font_scale=params.get("caption_font_scale", 100),
         logo_position=params.get("logo_position", "top-left"),
+        topic=params.get("topic"),
+        progress=params.get("progress"),
+        cards=params.get("cards"),
+        brand=params.get("brand"),
+        font_family=params.get("font_family"),
         crop_strategy=params.get("crop_strategy", "face"),
         format=params.get("format", "vertical"),
         crop_keyframes=params.get("crop_keyframes"),
@@ -181,13 +222,20 @@ def handle_create_clip(task_id: str, params: dict):
         logo_path=asset_store.resolve(params.get("logo_path")),
         outro_path=asset_store.resolve(params.get("outro_path")),
         intro_path=asset_store.resolve(params.get("intro_path")),
+        name_card=params.get("name_card"),
+        motion=params.get("motion"),
+        bookend_fade=params.get("bookend_fade", 0.0),
         clean_fillers=params.get("clean_fillers", True),
         face_map=params.get("face_map"),
         keep_segments=params.get("keep_segments"),
         ordered_segments=params.get("ordered_segments"),
+        hook=params.get("hook"),
+        trim_opening=params.get("trim_opening"),
+        preserve_timing=params.get("preserve_timing", False),
         allow_ass_fallback=params.get("allow_ass_fallback", False),
         use_ass_captions=params.get("use_ass_captions", False),
         keep_caption_overlay=params.get("keep_caption_overlay", False),
+        write_clean_variant=params.get("write_clean_variant", False),
         progress_callback=lambda pct, msg: emit_progress(task_id, "processing", pct, msg),
     )
     emit_result(task_id, "success", data=result)
@@ -230,6 +278,11 @@ def handle_batch_clips(task_id: str, params: dict):
             caption_position=clip.get("caption_position", params.get("caption_position", "auto")),
             caption_font_scale=clip.get("caption_font_scale", params.get("caption_font_scale", 100)),
             logo_position=clip.get("logo_position", params.get("logo_position", "top-left")),
+            topic=clip.get("topic", params.get("topic")),
+            progress=clip.get("progress", params.get("progress")),
+            cards=clip.get("cards", params.get("cards")),
+            brand=clip.get("brand", params.get("brand")),
+            font_family=clip.get("font_family", params.get("font_family")),
             crop_strategy=clip.get("crop_strategy", "face"),
             format=clip.get("format", params.get("format", "vertical")),
             transcript_words=params.get("transcript_words", []),
@@ -238,14 +291,21 @@ def handle_batch_clips(task_id: str, params: dict):
             logo_path=asset_store.resolve(clip.get("logo_path") or params.get("logo_path")),
             outro_path=asset_store.resolve(params.get("outro_path")),
             intro_path=asset_store.resolve(clip.get("intro_path") or params.get("intro_path")),
+            name_card=clip.get("name_card") or params.get("name_card"),
+            motion=clip.get("motion") or params.get("motion"),
+            bookend_fade=params.get("bookend_fade", 0.0),
             clean_fillers=params.get("clean_fillers", True),
             face_map=params.get("face_map"),
             keep_segments=clip.get("keep_segments"),
             ordered_segments=clip.get("ordered_segments"),
+            hook=clip.get("hook"),
             allow_ass_fallback=clip.get("allow_ass_fallback", params.get("allow_ass_fallback", False)),
             use_ass_captions=clip.get("use_ass_captions", params.get("use_ass_captions", False)),
             keep_caption_overlay=clip.get(
                 "keep_caption_overlay", params.get("keep_caption_overlay", False)
+            ),
+            write_clean_variant=clip.get(
+                "write_clean_variant", params.get("write_clean_variant", False)
             ),
             progress_callback=lambda pct, msg, _i=i: emit_progress(
                 task_id, "batch", int((_i / total) * 100 + pct / total), msg
@@ -315,13 +375,16 @@ def handle_parse_transcript(task_id: str, params: dict):
     raw_text = params.get("raw_text", "")
     total_duration = params.get("total_duration")
     time_adjust = params.get("time_adjust", 0.0)
+    language = params.get("language")
 
     if not raw_text:
         emit_result(task_id, "error", error="raw_text is required")
         return
 
     emit_progress(task_id, "parsing", 50, "Parsing transcript...")
-    result = detect_and_parse(raw_text, total_duration=total_duration, time_adjust=time_adjust)
+    result = detect_and_parse(
+        raw_text, total_duration=total_duration, time_adjust=time_adjust, language=language
+    )
 
     if "error" in result:
         emit_result(task_id, "error", error=result["error"])
@@ -686,6 +749,7 @@ def handle_suggest_clips(task_id: str, params: dict):
     """AI-powered clip suggestion using Claude/Codex and PodStack knowledge base."""
     from services import ai_provider
     from services.claude_suggest import (
+        ClipBounds,
         select_clips_with_signal_scores,
         suggest_initial_with_claude,
     )
@@ -694,6 +758,11 @@ def handle_suggest_clips(task_id: str, params: dict):
     top_n = params.get("top_n", 5)
     quality_only = bool(params.get("quality_only", False))
     existing_clips = params.get("existing_clips", [])
+    bounds = ClipBounds.of(
+        params.get("format"),
+        params.get("min_duration"),
+        params.get("max_duration"),
+    )
 
     if not segments:
         emit_result(task_id, "error", error="segments is required")
@@ -714,7 +783,7 @@ def handle_suggest_clips(task_id: str, params: dict):
 
     errors: list[str] = []
     energy_data, events_data, reaction_times = _signal_profiles_for_suggest(task_id, params)
-    candidate_top_n = top_n * 2 if energy_data or events_data else top_n
+    candidate_top_n = top_n * 2
     clips = suggest_initial_with_claude(
         segments=segments,
         top_n=candidate_top_n,
@@ -723,6 +792,7 @@ def handle_suggest_clips(task_id: str, params: dict):
         error_sink=errors,
         reaction_times=reaction_times,
         quality_only=quality_only,
+        bounds=bounds,
     )
 
     if clips is None:
@@ -735,6 +805,7 @@ def handle_suggest_clips(task_id: str, params: dict):
         top_n=top_n,
         energy_data=energy_data,
         events_data=events_data,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "suggesting", pct, msg),
     )
     emit_result(task_id, "success", data={"clips": clips})
 
@@ -921,6 +992,40 @@ def handle_analyze_silence(task_id: str, params: dict):
         emit_result(task_id, "error", error=str(e))
 
 
+def handle_compare_engines(task_id: str, params: dict):
+    """Transcribe the same sample window with two engines and report where
+    they disagree. See services/engine_comparison.py for the scoring."""
+    import time as _time
+    from config.paths import paths
+    from services.engine_comparison import compare_engines
+
+    file_path = params.get("file_path", "")
+    if not file_path or not os.path.exists(file_path):
+        emit_result(task_id, "error", error=f"File not found: {file_path}")
+        return
+
+    output_dir = params.get("output_dir") or os.path.join(
+        paths["output"], "engine-comparisons", f"{int(_time.time())}"
+    )
+    try:
+        emit_progress(task_id, "comparing", 10, f"Transcribing with {params.get('engine_a')}...")
+        report = compare_engines(
+            file_path,
+            params.get("engine_a", "whispercpp"),
+            params.get("engine_b", "whisper-py"),
+            start_seconds=params.get("start_seconds", 0.0) or 0.0,
+            duration_seconds=params.get("duration_seconds", 120.0) or 120.0,
+            window_seconds=params.get("window_seconds", 20.0) or 20.0,
+            model_size=params.get("model_size", "base"),
+            language=params.get("language"),
+            output_dir=output_dir,
+        )
+        emit_progress(task_id, "comparing", 100, "Comparison complete")
+        emit_result(task_id, "success", data=report)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
 def handle_render_silence_removed(task_id: str, params: dict):
     """Render the approved local cut plan and remap transcript timestamps."""
     from config.paths import paths
@@ -939,6 +1044,108 @@ def handle_render_silence_removed(task_id: str, params: dict):
         emit_result(task_id, "success", data=result)
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         emit_result(task_id, "error", error=str(e))
+
+
+MULTICAM_MAP_KEYS = ("people", "sources", "range_start", "range_end", "cut_settings", "speaker_map", "look", "removals")
+
+
+def handle_manage_multicam(task_id: str, params: dict):
+    """Multicam podcast editing: map sources, sync, plan cuts, render, export.
+
+    Actions: new (folder or files, people), list, show, map, sync, plan, cut
+    (swap one shot's camera), set_cuts (replace the whole cut), activity (who
+    speaks when), previews (stills), preview (playback proxies), render,
+    export (premiere|fcpxml, review keeps removals in place for an editor to judge),
+    import_timeline (path: an edited FCP 7 XML timeline becomes the cut and removals), delete.
+    sync, plan and render apply any mapping fields sent with them first.
+    """
+    from services import multicam as mc
+
+    action = params.get("action", "show")
+
+    def progress(stage):
+        return lambda p, m: emit_progress(task_id, stage, p, m)
+
+    try:
+        if action == "list":
+            emit_result(task_id, "success", data={"sessions": mc.list_sessions()})
+            return
+        if action == "new":
+            session = mc.new_session(
+                folder=str(params.get("folder") or ""),
+                files=params.get("files"),
+                people=params.get("people"),
+                name=str(params.get("name") or ""),
+                progress_callback=progress("scanning"),
+            )
+            emit_result(task_id, "success", data=mc.payload(session))
+            return
+
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is required. Get one from action 'new' or 'list'.")
+        if action == "delete":
+            mc.delete_session(session_id)
+            emit_result(task_id, "success", data={"deleted": True, "session_id": session_id})
+            return
+
+        session = mc.open_session(session_id)
+        if action == "render" and any(k in params for k in MULTICAM_MAP_KEYS if k != "look"):
+            # A mapping change can drop the cut, and a render needs one: map, then plan, then render.
+            raise ValueError("render takes only look and stems. Change the mapping with 'map', then 'plan' again.")
+        if action in ("map", "sync", "plan", "render") and any(k in params for k in MULTICAM_MAP_KEYS):
+            session = mc.update_mapping(session, params)
+        data: dict = {}
+        if action in ("show", "map"):
+            pass
+        elif action == "sync":
+            session = mc.sync_session(session, force=bool(params.get("force")), progress_callback=progress("syncing"))
+        elif action == "plan":
+            session = mc.plan_session(session, progress_callback=progress("planning"))
+        elif action == "preview":
+            session = mc.build_preview(session, progress_callback=progress("preview"))
+        elif action == "activity":
+            data["activity"] = mc.activity(session)
+        elif action == "set_cuts":
+            session = mc.set_cuts(session, params.get("cuts"))
+        elif action == "cut":
+            index, source_id = params.get("index"), params.get("source_id")
+            if not isinstance(index, int) or not isinstance(source_id, str):
+                raise ValueError("cut needs index (0-based shot number) and source_id (a camera's id)")
+            session = mc.set_cut(session, index, source_id)
+        elif action == "previews":
+            data["previews"] = mc.previews(session, looks=bool(params.get("looks")), at=params.get("at"))
+        elif action == "render":
+            stems = params.get("stems", True)
+            if not isinstance(stems, bool):
+                raise ValueError("stems is true or false")
+            validate = params.get("validate", "sample")
+            if validate not in ("sample", "full"):
+                raise ValueError("validate must be 'sample' or 'full'")
+            mc.render_session(session, stems=stems, validate=validate, progress_callback=progress("rendering"))
+        elif action == "export":
+            data["export_path"] = mc.export_xml(session, params.get("format", "premiere"), review=bool(params.get("review")))
+        elif action == "import_timeline":
+            if not isinstance(params.get("path"), str):
+                raise ValueError("import_timeline needs path: an FCP 7 XML timeline exported from Premiere or Resolve")
+            data["imported"] = mc.import_timeline(session, params["path"])
+            session = mc.MulticamSession.load(session.session_id)
+        elif action == "cloud":
+            from services import multicam_cloud
+            session = multicam_cloud.push(session, progress_callback=progress("sending"))
+        elif action == "pull":
+            from services import multicam_cloud
+            session = multicam_cloud.pull(session)
+            mc.render_session(session, stems=True, progress_callback=progress("rendering"))
+        else:
+            raise ValueError(f"Unknown multicam action {action!r}")
+        emit_result(task_id, "success", data={**mc.payload(session), **data})
+    except KeyError as e:
+        emit_result(task_id, "error", error=f"Missing field {e.args[0]!r}")
+    except Exception as e:
+        # Callers get one sentence; the full trace goes to the log, never to a client.
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        emit_result(task_id, "error", error=str(e) or type(e).__name__)
 
 
 def handle_run_integration_tool(task_id: str, params: dict):
@@ -977,7 +1184,9 @@ def handle_run_integration_tool(task_id: str, params: dict):
 
 TASK_HANDLERS = {
     "ping": handle_ping,
+    "resolve_transcribe_engine": handle_resolve_transcribe_engine,
     "transcribe": handle_transcribe,
+    "compare_engines": handle_compare_engines,
     "parse_transcript": handle_parse_transcript,
     "create_clip": handle_create_clip,
     "batch_clips": handle_batch_clips,
@@ -1000,6 +1209,7 @@ TASK_HANDLERS = {
     "manage_config": handle_manage_config,
     "analyze_silence": handle_analyze_silence,
     "render_silence_removed": handle_render_silence_removed,
+    "manage_multicam": handle_manage_multicam,
 }
 
 

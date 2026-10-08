@@ -31,7 +31,7 @@ Both share the same knowledge base at `.podcli/knowledge/`.
 
 ## MCP tools (podcli engine)
 
-All 26 tools registered by the MCP server.
+All 30 tools registered by the MCP server.
 
 **Transcription and input**
 
@@ -43,6 +43,8 @@ All 26 tools registered by the MCP server.
 | `set_video` | Set the working video without transcribing |
 | `import_transcript` | Import an external transcript with word-level timestamps, skips Whisper |
 | `parse_transcript` | Parse a speaker-labeled plain text transcript into word-level timestamps |
+| `compare_transcription_engines` | Transcribe one sample with two engines and write a side-by-side disagreement report |
+| `mine_channel` | List a YouTube channel's uploads or mine one video's existing captions, without downloading the video |
 
 **Clip workflow**
 
@@ -56,6 +58,13 @@ All 26 tools registered by the MCP server.
 | `batch_create_clips` | Render multiple clips in one batch |
 | `manage_reel` | Build a highlights reel: detect once, edit moments, rebuild without re-detecting |
 | `analyze_energy` | Analyze audio energy levels to find high-energy moments |
+| `record_decisions` | Record per-episode decisions (clip count, duration range, captions, language, thumbnails, delivery target) so later runs never re-ask |
+
+**Full-episode editing**
+
+| Tool | What it does |
+|------|-------------|
+| `manage_multicam` | Map camera, mic and call-recording files to people, sync them by audio, auto-cut to the speaker, render, export a studio shoot to Premiere / FCPXML, or hand the edit to the podcli cloud editor |
 
 **Content and configuration**
 

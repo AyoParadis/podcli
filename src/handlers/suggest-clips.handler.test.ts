@@ -1,23 +1,67 @@
-import { describe, expect, it } from "vitest";
-import { handleSuggestClips } from "./suggest-clips.handler.js";
+import { describe, it, expect } from "vitest";
+import { z } from "zod";
+import { handleSuggestClips, hookSchema, suggestClipsInputShape } from "./suggest-clips.handler.js";
 
-describe("handleSuggestClips", () => {
+const base = {
+  title: "Why the seed round cost them pricing",
+  start_second: 100,
+  end_second: 130,
+  payoff: "You learn why raising early cost the founders control of pricing.",
+  standalone: "nothing",
+  reasoning: "Concrete stakes and a clear turn.",
+  preview_text: "We raised a seed round before we had a single paying customer.",
+};
+
+describe("suggest_clips hook", () => {
+  it("accepts a hook in the tool schema and rejects an unknown mode", () => {
+    const schema = z.object(suggestClipsInputShape);
+    expect(
+      schema.safeParse({ suggestions: [{ ...base, hook: { start: 110, end: 113, mode: "move" } }] }).success,
+    ).toBe(true);
+    expect(hookSchema.safeParse({ start: 110, end: 113, mode: "loop" }).success).toBe(false);
+    expect(hookSchema.nullable().safeParse(null).success).toBe(true);
+  });
+
+  it("stores a valid hook and counts it in the duration", async () => {
+    const out = JSON.parse(
+      await handleSuggestClips({
+        suggestions: [{ ...base, hook: { start: 110, end: 113, mode: "repeat" } }],
+      }),
+    );
+    expect(out.clips[0].hook).toEqual({ start: 110, end: 113, mode: "repeat" });
+    expect(out.clips[0].duration).toBe(33);
+  });
+
+  it("rejects a hook outside the clip", async () => {
+    await expect(
+      handleSuggestClips({
+        suggestions: [{ ...base, hook: { start: 90, end: 95, mode: "repeat" } }],
+      }),
+    ).rejects.toThrow(/not inside the clip body/);
+  });
+
+  it("rejects a hook longer than 15 seconds", async () => {
+    await expect(
+      handleSuggestClips({
+        suggestions: [{ ...base, hook: { start: 105, end: 125, mode: "move" } }],
+      }),
+    ).rejects.toThrow(/between 1 and 15/);
+  });
+});
+
+
+describe("handleSuggestClips edit revision", () => {
   it("binds suggestions to an exact edit revision", async () => {
     const result = JSON.parse(await handleSuggestClips({
       edit_project_id: "project-1",
       edit_revision: 9,
-      suggestions: [{
-        title: "Moment",
-        start_second: 2,
-        end_second: 12,
-        reasoning: "Strong opening",
-      }],
+      suggestions: [base],
     }));
     expect(result.clips[0]).toMatchObject({
       edit_project_id: "project-1",
       edit_revision: 9,
-      start_second: 2,
-      end_second: 12,
+      start_second: 100,
+      end_second: 130,
     });
   });
 });

@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 
 import {
   transcribeToolDef,
@@ -11,8 +11,14 @@ import {
   handleJobStatus,
 } from "./handlers/transcribe.handler.js";
 import {
+  compareEnginesToolDef,
+  handleCompareEngines,
+} from "./handlers/compare-engines.handler.js";
+import {
   suggestClipsToolDef,
+  suggestClipsInputShape,
   handleSuggestClips,
+  hookSchema,
 } from "./handlers/suggest-clips.handler.js";
 import {
   createClipToolDef,
@@ -23,15 +29,21 @@ import {
   handleBatchClips,
 } from "./handlers/batch-clips.handler.js";
 import { registerIntegrationMcpTools } from "./handlers/integrations.handler.js";
+import { mineChannelToolDef, handleMineChannel } from "./handlers/mine-channel.handler.js";
+import { isHttpUrl } from "./utils/ytdlp-args.js";
+import { FileManager } from "./services/file-manager.js";
 import { KnowledgeBase } from "./services/knowledge-base.js";
 import { AssetManager, inferType } from "./services/asset-manager.js";
 import { ClipsHistory } from "./services/clips-history.js";
 import { TranscriptCache } from "./services/transcript-cache.js";
+import { EpisodeState } from "./services/episode-state.js";
+import { paths } from "./config/paths.js";
 import { webServerUrl } from "./config/server.js";
 import { childLogger } from "./utils/logger.js";
 import { mcpError } from "./utils/errors.js";
-import { podcliVersion } from "./version.js";
-import type { Format, SuggestedClip, UIState, WordTimestamp } from "./models/index.js";
+import { transcriptVideoMismatch } from "./utils/video-identity.js";
+import { podcliVersion, studioStartCommand } from "./version.js";
+import type { ClipHook, Format, SuggestedClip, UIState, WordTimestamp } from "./models/index.js";
 
 const log = childLogger("server");
 
@@ -72,6 +84,7 @@ async function uiPing(body: Record<string, unknown>): Promise<void> {
 const kb = new KnowledgeBase();
 const assets = new AssetManager();
 const history = new ClipsHistory();
+const episodeState = new EpisodeState();
 
 /** Prepend knowledge base file listing to a tool result. */
 async function withKnowledge(result: string): Promise<string> {
@@ -93,6 +106,33 @@ function withNextStep(result: string, nextStep: string): string {
 // Fallback transcript views (no packed markdown available) can be 500KB+ for a
 // long episode; cap what goes into a tool response.
 const TRANSCRIPT_FALLBACK_CAP = 50_000;
+
+// Every other tool's schema uses z.object's default behavior, which strips
+// an unknown key silently, so a caller passing captions: true instead of
+// captions_enabled gets no error and nothing recorded. record_decisions is
+// strict on purpose: it's meant to be the durable record of a decision, so a
+// typo'd key should fail loudly rather than quietly not stick.
+const recordDecisionsInputShape = {
+  video_path: z.string().describe("The episode's source video path (same path used with set_video/transcribe_podcast)"),
+  clip_count: z.number().optional().describe("How many clips to produce"),
+  clip_duration_min: z.number().optional().describe("Minimum target clip duration in seconds"),
+  clip_duration_max: z.number().optional().describe("Maximum target clip duration in seconds"),
+  caption_style: z.enum(["hormozi", "karaoke", "subtle", "branded"]).optional(),
+  captions_enabled: z.boolean().optional().describe("Whether clips should have captions burned in at all"),
+  language: z.string().optional().describe("The episode's spoken language"),
+  thumbnails_wanted: z.boolean().optional(),
+  delivery_target: z.string().optional().describe("Where clips are headed, e.g. youtube_shorts, tiktok, instagram, export_only"),
+  notes: z.string().optional().describe("Free-form notes that don't fit another field"),
+};
+
+export const recordDecisionsInputSchema = z.strictObject(recordDecisionsInputShape, {
+  // Returning undefined keeps zod's own message for every other issue.
+  error: (issue) =>
+    issue.code === "unrecognized_keys"
+      ? `Unknown field(s): ${issue.keys.join(", ")}. Valid fields: ` +
+        Object.keys(recordDecisionsInputShape).join(", ")
+      : undefined,
+});
 
 function capTranscriptText(text: string): string {
   if (text.length <= TRANSCRIPT_FALLBACK_CAP) return text;
@@ -162,17 +202,56 @@ interface ImportTranscriptResult extends ApiError {
   };
 }
 
-async function readUIState(): Promise<ServerUIState | null> {
+/**
+ * Read session state straight off disk (paths.uiState) instead of the Web
+ * UI's HTTP API. Used when the Web UI isn't running. The state file is the
+ * same JSON the UI persists on every change, so the agent isn't blind just
+ * because nothing is listening on webServerUrl.
+ */
+function readUIStateFromDisk(): ServerUIState | null {
   try {
-    const res = await fetch(`${webServerUrl}/api/ui-state`);
-    if (!res.ok) return null;
-    return (await res.json()) as ServerUIState;
+    if (!existsSync(paths.uiState)) return null;
+    const raw = JSON.parse(readFileSync(paths.uiState, "utf-8")) as UIState;
+    const words = raw.transcript?.words;
+    return {
+      ...raw,
+      transcriptWordCount: Array.isArray(words) ? words.length : 0,
+    };
   } catch (err) {
-    log.debug("readUIState failed (UI likely not running)", {
+    log.debug("readUIStateFromDisk failed", {
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
   }
+}
+
+async function readUIState(): Promise<ServerUIState | null> {
+  try {
+    const res = await fetch(`${webServerUrl}/api/ui-state`);
+    if (!res.ok) return readUIStateFromDisk();
+    return (await res.json()) as ServerUIState;
+  } catch (err) {
+    log.debug("readUIState via Web UI failed, falling back to disk", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return readUIStateFromDisk();
+  }
+}
+
+/**
+ * Resolve the path episode decisions should be keyed on. A silence-removal
+ * pass rewrites the working video to a new path with a different size, which
+ * would otherwise orphan decisions already recorded against the original.
+ * When videoPath is the UI's current (derivative) video and a silenceOriginal
+ * is on record, key on the original instead so decisions carry over.
+ */
+async function resolveEpisodeKeyPath(videoPath: string): Promise<string> {
+  const state = await readUIState();
+  const original = state?.silenceOriginal?.videoPath;
+  if (original && (state?.videoPath === videoPath || state?.filePath === videoPath)) {
+    return original;
+  }
+  return videoPath;
 }
 
 /** Generate workflow guidance based on current state. */
@@ -184,9 +263,10 @@ async function getWorkflowGuidance(): Promise<string> {
       "1. Set the video: use set_video or transcribe_podcast with a file path\n" +
       "2. Get a transcript: use transcribe_podcast (auto) or import_transcript / parse_transcript\n" +
       "3. Read the transcript: use get_ui_state(include_transcript: true)\n" +
-      "4. Suggest clips: analyze the transcript yourself, then call suggest_clips with your picks\n" +
+      "4. Suggest clips: analyze the transcript yourself, then call suggest_clips with your picks.\n" +
+      "   Each pick needs a payoff and a standalone check, and an answer needs its question.\n" +
       "5. Export: use batch_create_clips(export_selected: true) or create_clip(clip_number: N)\n\n" +
-      "Note: The Web UI is not running. Start it with: npm run ui"
+      `Note: The Web UI is not running. Start it with: ${studioStartCommand()}`
     );
   }
 
@@ -226,7 +306,8 @@ async function getWorkflowGuidance(): Promise<string> {
       `NEXT: Transcript is ready (${wordCount} words). Time to find viral moments!\n` +
         "  → Use get_ui_state(include_transcript: true) to read the full transcript\n" +
         "  → Analyze it for the most engaging, viral-worthy moments\n" +
-        "  → Then call suggest_clips with your suggestions (title, start_second, end_second, reasoning)",
+        "  → For each one: pull the question in if it is an answer, then state the payoff before the title\n" +
+        "  → Then call suggest_clips with your suggestions (title, start_second, end_second, payoff, standalone, reasoning)",
     );
   } else if (phase === "review" && selectedCount > 0) {
     lines.push(
@@ -243,6 +324,21 @@ async function getWorkflowGuidance(): Promise<string> {
         "  → Use get_ui_state(include_transcript: true) to find more moments\n" +
         "  → Try different caption styles (hormozi, karaoke, subtle, branded) for variety",
     );
+  }
+
+  const videoPath = state.videoPath || state.filePath;
+  if (videoPath) {
+    // A silence-removal pass rewrites the video to a new path with a different
+    // size, which would otherwise orphan decisions already recorded against the
+    // original. Key on the original so they carry over to its derivative.
+    const episodeKeyPath = state.silenceOriginal?.videoPath ?? videoPath;
+    const openQuestions = await episodeState.openQuestions(episodeKeyPath).catch(() => []);
+    if (openQuestions.length > 0) {
+      lines.push(
+        "\nOPEN QUESTIONS for this episode. Ask once, then call record_decisions so these never come up again:\n" +
+          openQuestions.map((q) => `  → ${q.question}`).join("\n"),
+      );
+    }
   }
 
   return lines.join("\n");
@@ -268,16 +364,18 @@ export function createServer(): McpServer {
         .default("base")
         .describe("Whisper model size"),
       engine: z
-        .enum(["whisper-py", "whispercpp", "assemblyai"])
+        .enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
         .optional()
         .describe("Transcription engine"),
       language: z.string().optional().describe("ISO language code"),
       enable_diarization: z
         .boolean()
         .optional()
-        .default(false)
+        .default(true)
         .describe(
-          "Set true for speaker labels (who is speaking). Works where torch is available (whisper-py engine); slower. Default: false",
+          "Speaker labels (who is speaking). On by default: without them a clip cannot tell a question " +
+            "from an answer. Set false only for a single-speaker recording. Falls back to no labels with " +
+            "a warning where torch is unavailable.",
         ),
       num_speakers: z
         .number()
@@ -285,6 +383,18 @@ export function createServer(): McpServer {
         .describe(
           "Exact number of speakers if known (e.g. 2). Auto-detects if omitted.",
         ),
+      start_seconds: z
+        .number()
+        .optional()
+        .describe(
+          "Sample mode: only transcribe a window starting here (seconds into the source), " +
+            "instead of the whole file, e.g. to test a language on 40s before committing to " +
+            "a full run. Pair with duration_seconds. Not written to the main transcript cache.",
+        ),
+      duration_seconds: z
+        .number()
+        .optional()
+        .describe("Sample mode window length in seconds. Defaults start_seconds to 0 if omitted."),
     },
     async ({
       file_path,
@@ -293,6 +403,8 @@ export function createServer(): McpServer {
       language,
       enable_diarization,
       num_speakers,
+      start_seconds,
+      duration_seconds,
     }) => {
       try {
         const result = await handleTranscribe({
@@ -302,13 +414,29 @@ export function createServer(): McpServer {
           language,
           enable_diarization,
           num_speakers,
+          start_seconds,
+          duration_seconds,
         });
 
         // Push FULL transcript (words[] + segments[]) to Web UI state from the
         // on-disk cache — NOT the trimmed MCP response. Without words in UI
         // state, downstream batch_create_clips can't burn captions.
+        // Skipped for a sample: it's never written to this cache, and it's a
+        // slice of the file, not something that belongs in the UI session.
+        const isSample = start_seconds !== undefined || duration_seconds !== undefined;
         try {
-          const cached = await transcriptCache.get(file_path, engine);
+          // handleTranscribe's result carries the engine it actually resolved
+          // to and cached under; the request-time `engine` can be unset while
+          // the write landed under "whispercpp", so reading with it misses.
+          const resolvedEngine =
+            (JSON.parse(result) as { engine?: string }).engine ?? engine;
+          const cached = isSample
+            ? null
+            : await transcriptCache.get(file_path, {
+                engine: resolvedEngine,
+                model: model_size,
+                language,
+              });
           if (cached) {
             await uiPing({
               videoPath: file_path,
@@ -348,8 +476,8 @@ export function createServer(): McpServer {
         .optional()
         .default("base"),
       language: z.string().optional(),
-      engine: z.enum(["whisper-py", "whispercpp", "assemblyai"]).optional(),
-      enable_diarization: z.boolean().optional().default(false),
+      engine: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).optional(),
+      enable_diarization: z.boolean().optional().default(true),
       num_speakers: z.number().optional(),
     },
     async (input) => {
@@ -388,32 +516,7 @@ export function createServer(): McpServer {
   server.tool(
     suggestClipsToolDef.name,
     suggestClipsToolDef.description,
-    {
-      suggestions: z
-        .array(
-          z.object({
-            title: z.string(),
-            start_second: z.number(),
-            end_second: z.number(),
-            segments: z
-              .array(z.object({ start: z.number(), end: z.number() }))
-              .optional()
-              .describe(
-                "Multi-cut keep-ranges. Omit for a single continuous clip.",
-              ),
-            reasoning: z.string(),
-            preview_text: z.string().optional(),
-            content_type: z.string().optional(),
-            score: z.number().optional(),
-            suggested_caption_style: z
-              .enum(["hormozi", "karaoke", "subtle", "branded"])
-              .optional(),
-          }),
-        )
-        .describe("Array of suggested clip moments"),
-      edit_project_id: z.string().optional().describe("Active edit project id from get_ui_state"),
-      edit_revision: z.number().int().optional().describe("Exact active edit revision from get_ui_state"),
-    },
+    suggestClipsInputShape,
     async ({ suggestions, edit_project_id, edit_revision }) => {
       try {
         const current = await readUIState();
@@ -561,6 +664,19 @@ export function createServer(): McpServer {
         .describe(
           "Keep ProRes 4444 alpha caption overlay beside the render (for DaVinci Resolve export). Returns caption_overlay_path and cropped_source_path.",
         ),
+      write_clean_variant: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Also render a second file with the same audio, loudness, and intro/outro but no burned captions. Returns clean_output_path.",
+        ),
+      hook: hookSchema
+        .nullable()
+        .optional()
+        .describe(
+          "Opening hook for this render. Auto-loaded from clip_number if omitted; null renders without one.",
+        ),
     },
     async (params) => {
       try {
@@ -575,6 +691,7 @@ export function createServer(): McpServer {
         const editProjectId = currentUiState?.activeEditProjectId;
         const editRevision = currentUiState?.activeEditRevision;
         let keepSegments: Array<{ start: number; end: number }> | null = null;
+        let hook: ClipHook | null = params.hook ?? null;
         if (
           params.clip_number != null &&
           (params.start_second == null || params.end_second == null)
@@ -612,7 +729,20 @@ export function createServer(): McpServer {
           }
           if (!params.transcript_words) {
             const transcript = uiState?.transcript;
-            if (transcript?.words) params.transcript_words = transcript.words;
+            if (transcript?.words) {
+              // handleCreateClip only runs this guard when transcript_words
+              // arrives null, so filling it from state here has to run the
+              // check itself or an offline render against a swapped video
+              // would silently skip it.
+              const mismatch = transcriptVideoMismatch(
+                uiState?.transcriptVideoIdentity,
+                params.video_path as string,
+              );
+              if (mismatch) {
+                return { content: [{ type: "text" as const, text: mismatch }], isError: true };
+              }
+              params.transcript_words = transcript.words;
+            }
           }
           // Pull multi-cut segments from suggestion
           const segs = suggestion.segments as
@@ -621,6 +751,7 @@ export function createServer(): McpServer {
           if (segs && segs.length > 0) {
             keepSegments = segs;
           }
+          if (params.hook === undefined && suggestion.hook) hook = suggestion.hook;
         }
 
         // Check for duplicates
@@ -663,7 +794,9 @@ export function createServer(): McpServer {
                   format: params.format || "vertical",
                   allow_ass_fallback: params.allow_ass_fallback === true,
                   keep_caption_overlay: params.keep_caption_overlay === true,
+                  write_clean_variant: params.write_clean_variant === true,
                   ...(keepSegments && { segments: keepSegments }),
+                  hook,
                 },
               ],
               transcript_words: params.transcript_words,
@@ -675,6 +808,7 @@ export function createServer(): McpServer {
               keep_caption_overlay: params.keep_caption_overlay === true,
               edit_project_id: editProjectId,
               edit_revision: editRevision,
+              write_clean_variant: params.write_clean_variant === true,
             }),
           });
           if (webRes.ok) {
@@ -722,7 +856,7 @@ export function createServer(): McpServer {
           // Notify UI that export is starting
           await uiPing({ phase: "exporting" });
 
-          finalResult = await handleCreateClip(params);
+          finalResult = await handleCreateClip({ ...params, hook });
           const parsed = JSON.parse(finalResult);
 
           // Record to history
@@ -740,6 +874,9 @@ export function createServer(): McpServer {
             duration: parsed.duration,
             content_type: parsed.content_type,
             transcript_slice: parsed.transcript_slice,
+            payoff: parsed.payoff,
+            context_line: parsed.context_line,
+            preview_text: parsed.preview_text,
           });
           const uiStateForRecipe = await readUIState().catch(() => null);
           const recipeSettings = uiStateForRecipe?.settings ?? {};
@@ -750,6 +887,7 @@ export function createServer(): McpServer {
             introPath: recipeSettings.introPath || null,
             cleanFillers: params.clean_fillers ?? recipeSettings.cleanFillers ?? true,
             keepSegments: keepSegments ?? undefined,
+            hook,
           });
 
           // Notify UI that export is done
@@ -796,11 +934,19 @@ export function createServer(): McpServer {
             format: z.enum(["vertical", "horizontal", "square"]).optional(),
             allow_ass_fallback: z.boolean().optional(),
             keep_caption_overlay: z.boolean().optional(),
+            write_clean_variant: z.boolean().optional(),
+            hook: hookSchema.nullable().optional(),
           }),
         )
         .optional()
         .describe(
           "Array of clips to create. Auto-loaded from suggestions if omitted.",
+        ),
+      write_clean_variant: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also render a clean (no burned captions) variant per clip, batch-level default; per-clip overrides. Returns clean_output_path.",
         ),
       keep_caption_overlay: z
         .boolean()
@@ -863,7 +1009,20 @@ export function createServer(): McpServer {
               "") as string;
           if (!resolvedTranscriptWords) {
             const transcript = uiState?.transcript;
-            if (transcript?.words) resolvedTranscriptWords = transcript.words;
+            if (transcript?.words) {
+              // handleBatchClips only runs this guard when transcript_words
+              // arrives null, so filling it from state here has to run the
+              // check itself or an offline render against a swapped video
+              // would silently skip it.
+              const mismatch = transcriptVideoMismatch(
+                uiState?.transcriptVideoIdentity,
+                resolvedVideoPath as string,
+              );
+              if (mismatch) {
+                return { content: [{ type: "text" as const, text: mismatch }], isError: true };
+              }
+              resolvedTranscriptWords = transcript.words;
+            }
           }
 
           if (params.export_selected) {
@@ -882,6 +1041,7 @@ export function createServer(): McpServer {
                 allow_ass_fallback: false,
                 ...(s.segments &&
                   s.segments.length > 0 && { keep_segments: s.segments }),
+                hook: s.hook ?? null,
               })) as any;
           } else if (params.clip_numbers) {
             resolvedClips = (params.clip_numbers as number[])
@@ -901,6 +1061,7 @@ export function createServer(): McpServer {
                   allow_ass_fallback: false,
                   ...(s.segments &&
                     s.segments.length > 0 && { keep_segments: s.segments }),
+                  hook: s.hook ?? null,
                 };
               }) as any;
           }
@@ -922,6 +1083,7 @@ export function createServer(): McpServer {
                 clean_fillers: params.clean_fillers,
               }),
               keep_caption_overlay: params.keep_caption_overlay === true,
+              write_clean_variant: params.write_clean_variant === true,
             }),
           });
           if (webRes.ok) {
@@ -1398,13 +1560,22 @@ export function createServer(): McpServer {
     },
     async ({ include_transcript }) => {
       try {
-        const res = await fetch(`${webServerUrl}/api/ui-state`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const state = (await res.json()) as ServerUIState;
+        const state = await readUIState();
+        if (!state) {
+          const guidance = await getWorkflowGuidance();
+          return { content: [{ type: "text" as const, text: guidance }] };
+        }
 
         const lines: string[] = [];
         lines.push(`Phase: ${state.phase}`);
         lines.push(`Video: ${state.videoPath || state.filePath || "(none)"}`);
+        if (state.videoMissing) {
+          lines.push(
+            "WARNING: the video file above was not found on disk at last check (e.g. an external " +
+              "drive may be unmounted). The session (transcript, suggestions) is kept, but create_clip/" +
+              "batch_create_clips will fail until the file is reachable again.",
+          );
+        }
         lines.push(
           `Settings: caption=${state.settings?.captionStyle}, crop=${state.settings?.cropStrategy}, logo=${state.settings?.logoPath || "none"}`,
         );
@@ -1433,7 +1604,11 @@ export function createServer(): McpServer {
                 ? `${Math.round(end - start)}s`
                 : "?";
             const style = clip.suggested_caption_style || "hormozi";
-            const tag = deselected.includes(i) ? " [DESELECTED]" : "";
+            const tag = deselected.includes(i)
+              ? " [DESELECTED]"
+              : clip.changedSinceSelection
+                ? " [CHANGED SINCE SELECTION, re-confirm before exporting]"
+                : "";
             lines.push(
               `  #${num}: "${title}" (${start}s–${end}s, ${duration}) [${style}]${tag}`,
             );
@@ -1492,17 +1667,6 @@ export function createServer(): McpServer {
         return { content: [{ type: "text" as const, text: lines.join("\n") }] };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
-          const guidance = await getWorkflowGuidance();
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Web UI is not running. Start with: npm run ui\n\n${guidance}`,
-              },
-            ],
-          };
-        }
         return {
           content: [
             { type: "text" as const, text: `Error reading UI state: ${msg}` },
@@ -1518,7 +1682,7 @@ export function createServer(): McpServer {
   // =============================================
   server.tool(
     "modify_clip",
-    "Adjust a suggested clip before exporting. Change timing, title, or caption style. " +
+    "Adjust a suggested clip before exporting. Change timing, title, caption style, or opening hook. " +
       "Use action='delete' to remove a clip entirely. Reference clips by clip_number (from get_ui_state).",
     {
       clip_number: z
@@ -1543,11 +1707,18 @@ export function createServer(): McpServer {
           title: z.string().optional(),
           start_second: z.number().optional(),
           end_second: z.number().optional(),
+          payoff: z.string().optional(),
+          standalone: z.string().optional(),
+          context_line: z.string().optional(),
           reasoning: z.string().optional(),
           preview_text: z.string().optional(),
           suggested_caption_style: z
             .enum(["hormozi", "karaoke", "subtle", "branded"])
             .optional(),
+          hook: hookSchema
+            .nullable()
+            .optional()
+            .describe("Set the opening hook, or pass null to clear it."),
         })
         .optional()
         .describe(
@@ -1561,7 +1732,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "No updates provided. Specify at least one field: title, start_second, end_second, reasoning, preview_text, or suggested_caption_style.",
+                text: "No updates provided. Specify at least one field: title, start_second, end_second, payoff, standalone, context_line, reasoning, preview_text, suggested_caption_style, or hook.",
               },
             ],
           };
@@ -1613,7 +1784,10 @@ export function createServer(): McpServer {
           content: [
             {
               type: "text" as const,
-              text: `Updated clip #${data.index + 1}: "${data.clip.title}" (${data.clip.start_second}s–${data.clip.end_second}s, ${data.clip.duration}s)`,
+              text: `Updated clip #${data.index + 1}: "${data.clip.title}" (${data.clip.start_second}s-${data.clip.end_second}s, ${data.clip.duration}s` +
+                (data.clip.hook
+                  ? `, opens with a ${data.clip.hook.mode} hook ${data.clip.hook.start}s-${data.clip.hook.end}s)`
+                  : ")"),
             },
           ],
         };
@@ -1624,7 +1798,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -1707,7 +1881,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -1799,13 +1973,76 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
         }
         return {
           content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: record_decisions
+  // =============================================
+  server.registerTool(
+    "record_decisions",
+    {
+      description:
+        "Record per-episode workflow decisions (clip count, clip duration range, caption style, captions on/off, " +
+        "language, whether thumbnails are wanted, delivery target, free-form notes) so later runs against the same " +
+        "video never ask the same question twice. Keyed by the video's path + file size, not by session, so these " +
+        "answers survive a new episode overwriting ui-state.json. Pass only the fields you have an answer for; " +
+        "existing answers are preserved unless explicitly overwritten. get_ui_state lists any fields still unanswered " +
+        "as open questions.",
+      inputSchema: recordDecisionsInputSchema,
+    },
+    async ({ video_path, clip_count, clip_duration_min, clip_duration_max, caption_style, captions_enabled, language, thumbnails_wanted, delivery_target, notes }) => {
+      try {
+        const keyPath = await resolveEpisodeKeyPath(video_path);
+        const decisions: Record<string, unknown> = {};
+        if (clip_count !== undefined) decisions.clipCount = clip_count;
+        if (clip_duration_min !== undefined || clip_duration_max !== undefined) {
+          const existing = await episodeState.get(keyPath);
+          // A side nobody gave stays absent; 0 would read as a real limit.
+          const min = clip_duration_min ?? existing?.clipDurationRange?.min;
+          const max = clip_duration_max ?? existing?.clipDurationRange?.max;
+          decisions.clipDurationRange = {
+            ...(min !== undefined && { min }),
+            ...(max !== undefined && { max }),
+          };
+        }
+        if (caption_style !== undefined) decisions.captionStyle = caption_style;
+        if (captions_enabled !== undefined) decisions.captionsEnabled = captions_enabled;
+        if (language !== undefined) decisions.language = language;
+        if (thumbnails_wanted !== undefined) decisions.thumbnailsWanted = thumbnails_wanted;
+        if (delivery_target !== undefined) decisions.deliveryTarget = delivery_target;
+        if (notes !== undefined) decisions.notes = notes;
+
+        if (Object.keys(decisions).length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No decisions provided. Pass at least one field to record." }],
+          };
+        }
+
+        const recorded = await episodeState.record(keyPath, decisions);
+        const remaining = await episodeState.openQuestions(keyPath);
+        const lines = [
+          `Recorded: ${Object.keys(decisions).join(", ")}`,
+          remaining.length > 0
+            ? `Still open: ${remaining.map((q) => q.question).join(" / ")}`
+            : "All episode decisions answered.",
+        ];
+        void recorded;
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Error recording decisions: ${msg}` }],
           isError: true,
         };
       }
@@ -1853,7 +2090,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -1990,7 +2227,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2008,17 +2245,35 @@ export function createServer(): McpServer {
   // =============================================
   server.tool(
     "manage_thumbnail_config",
-    "Show, export, import, or reset the thumbnail template (colors, fonts, frame, box, layout) podcli uses to generate thumbnails. 'show' returns the effective config; 'export' writes it to a file path; 'import' replaces it from a file path; 'reset' reverts to the generic default.",
+    "Show, export, import, or reset the thumbnail template (colors, fonts, frame, box, layout) podcli uses to generate thumbnails. 'show' returns the effective config; 'export' writes it to a file path; 'import' replaces it from a file path; 'reset' reverts to the generic default; 'set_layout' picks the layout: 'single' (one face) or 'pair' (two people from the clip, guest left and host right, for interview clips; falls back to one face when podcli cannot tell two people apart).",
     {
-      action: z.enum(["show", "export", "import", "reset"]).describe("Config action"),
+      action: z.enum(["show", "export", "import", "reset", "set_layout"]).describe("Config action"),
       path: z.string().optional().describe("File path for export (destination) or import (source)"),
+      layout: z
+        .enum(["single", "pair"])
+        .optional()
+        .describe("For set_layout. single: one face behind the headline. pair: the guest left and the host right, both from the clip's own footage"),
     },
-    async ({ action, path: filePath }) => {
+    async ({ action, path: filePath, layout }) => {
       try {
         if ((action === "export" || action === "import") && !filePath) {
           return mcpError(`'path' is required for action '${action}'.`);
         }
+        if (action === "set_layout" && !layout) {
+          return mcpError("'layout' is required for action 'set_layout': 'single' or 'pair'.");
+        }
         const base = `${webServerUrl}/api/thumbnail-config`;
+        if (action === "set_layout") {
+          const current = await fetch(base);
+          if (!current.ok) throw new Error(`HTTP ${current.status}`);
+          const res = await fetch(base, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...(await current.json()), layout }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return { content: [{ type: "text" as const, text: `Thumbnail layout set to ${layout}.` }] };
+        }
         if (action === "show") {
           const res = await fetch(base);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2042,7 +2297,7 @@ export function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
-          return { content: [{ type: "text" as const, text: "Web UI is not running. Start with: npm run ui" }] };
+          return { content: [{ type: "text" as const, text: `Web UI is not running. Start with: ${studioStartCommand()}` }] };
         }
         return mcpError(msg);
       }
@@ -2142,7 +2397,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2244,7 +2499,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2253,6 +2508,136 @@ export function createServer(): McpServer {
           content: [{ type: "text" as const, text: `Error: ${msg}` }],
           isError: true,
         };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_multicam
+  // =============================================
+  server.tool(
+    "manage_multicam",
+    "Edit a full multicam podcast episode: map every camera and mic file to a person, sync them by audio (with clock-drift correction), " +
+      "auto-cut cameras to whoever is speaking, then render an MP4 or export a Premiere XML / FCPXML timeline that points at the original files. " +
+      "Flow: 'new' (folder or files, people) → check the guessed mapping with 'show' and fix it with 'map' → 'sync' → 'plan' → 'render' or 'export'. " +
+      "'new' returns the session with guessed roles; calling it again on the same files reopens that edit. " +
+      "'sync', 'plan' and 'render' start a background job and return job_id: poll job_status, then call 'show'. " +
+      "Mapping fields (people, sources, range_start, range_end, cut_settings, speaker_map, look, removals) apply on 'map', 'sync' and 'plan'; 'render' takes only look and stems. " +
+      "Changing who is in a file or where it sits clears the cut, so run 'plan' again. 'render' skips work when nothing changed and reuses shots it already encoded. " +
+      "Every render checks the finished file (frame count, a full decode, loudness and true peak) and reports outputs.validation; only a broken decode or a picture more than a frame off the cut fails it, the rest are warnings. " +
+      "Other actions: 'list', 'cut' (index, source_id: swap one shot's camera), 'set_cuts' (cuts: replace the whole cut with back-to-back shots), " +
+      "'activity' (who speaks when, as spans per person), 'previews' (still frames per camera, looks: true adds every color look on every camera), " +
+      "'preview' (background job: playback proxies, a mic mix and stills, for a browser editor such as podcli cloud), 'delete'. " +
+      "'cloud' (background job, needs podcli login and Pro: sends previews and the edit to the podcli cloud editor; camera files stay here) and " +
+      "'pull' (background job: renders the cut made in that editor from the files here). " +
+      "'export' with review: true writes a review timeline: the whole episode, every camera on its own track under the cut, and each removal left in place, named 'Remove', labelled orange in Premiere and marked with its reason. " +
+      "'import_timeline' (path) reads an FCP 7 XML timeline edited in Premiere or Resolve back as the cut and removals: deleted stretches become removals, kept ones are restored. " +
+      "With the DaVinci Resolve MCP server connected, import the review timeline into a Resolve project, color the 'Remove' clips, let the editor review, export the timeline as FCP 7 XML, then call 'import_timeline'. " +
+      "Call recordings work too: one file per person becomes a split screen, one gallery recording is split into a camera per tile; Premiere and FCPXML export refuse those layouts for now.",
+    {
+      action: z
+        .enum(["new", "list", "show", "map", "sync", "plan", "cut", "set_cuts", "activity", "previews", "preview", "render", "export", "import_timeline", "cloud", "pull", "delete"])
+        .describe("What to do"),
+      session_id: z.string().optional().describe("Session id returned by 'new' (every action except new/list)"),
+      folder: z.string().optional().describe("For 'new': folder holding one episode's recordings, scanned recursively"),
+      files: z.array(z.string()).optional().describe("For 'new': explicit media file paths, alone or with folder"),
+      people: z
+        .array(z.union([z.string(), z.object({ id: z.string().optional(), name: z.string(), role: z.enum(["host", "guest"]).optional() })]))
+        .optional()
+        .describe("For 'new': speaker names, or {name, role} (default Host, Guest; without roles the last one is the guest). For 'map': the full people list, with ids to keep and role host or guest; a guest's long answers are held on their camera"),
+      name: z.string().optional().describe("For 'new': episode name"),
+      sources: z
+        .array(
+          z.object({
+            id: z.string(),
+            role: z.enum(["camera", "mic", "ignore"]).optional(),
+            person: z.string().optional().describe("Camera: a person id or 'wide'. Mic: a person id, or '' for a shared room mic"),
+            channel_people: z.array(z.string()).optional().describe("Mic: one person id per channel when a recorder puts two people on L/R"),
+            input_lut: z.string().optional().describe("Camera: absolute path to a 3D .cube LUT (log to Rec.709, say) applied before the look in renders and stills; '' clears it. Exports list it in color_handoff.json beside the timeline"),
+            audio_stream_index: z.number().int().min(0).optional().describe("Which audio stream in the container to use, for cameras (often MXF) that carry one mono stream per mic instead of packing channels into a single stream"),
+            offset: z.number().optional().describe("Timeline seconds where this file starts, to override sync"),
+            nudge: z.number().optional().describe("Seconds to shift the synced offset by"),
+            anchors: z
+              .array(z.object({ timeline: z.number(), source: z.number() }))
+              .min(1)
+              .optional()
+              .describe(
+                "Manual sync for a file that can't sync by sound (a camera with no audio, or a fit that's off): " +
+                  "pairs of the same moment as {timeline, source} seconds. One pair sets the offset; two or more also fit clock drift by least squares. " +
+                  "Pairs must move forward together, and drift must stay within 1000 ppm. The fit reports its residual and survives later syncs unless force is true",
+              ),
+          }),
+        )
+        .optional()
+        .describe("Per-source corrections. An offset set here survives later syncs unless force is true"),
+      range_start: z.number().nullable().optional().describe("For 'map'/'plan': episode start on the timeline, null for automatic"),
+      range_end: z.number().nullable().optional().describe("For 'map'/'plan': episode end on the timeline, null for automatic"),
+      cut_settings: z
+        .object({
+          min_shot: z.number().optional().describe("Shortest shot in seconds (studio 2, remote 4)"),
+          max_shot: z.number().optional().describe("Break a longer single-host shot with a wide shot; 0 disables (studio 30, remote 0)"),
+          wide_insert: z.number().optional().describe("Length of that wide shot in seconds (default 4)"),
+          backchannel: z.number().optional().describe("Interjections shorter than this many seconds inside someone's turn never cut away (default 1.2)"),
+          hold_guest: z.boolean().optional().describe("Never cut away from a guest mid-answer (default true)"),
+          style: z.enum(["auto", "studio", "remote"]).optional().describe("studio: everyone's camera. remote: split screen, guest full frame on long answers. auto picks remote for call recordings; a new style resets the other settings to its defaults"),
+          host_solo: z.boolean().optional().describe("Give hosts their own camera when they talk (studio true, remote false)"),
+          guest_min: z.number().optional().describe("Guest turns shorter than this stay on the wide shot (remote 8 s)"),
+          guest_delay: z.number().optional().describe("A long guest answer opens on the wide shot for this long first (remote 4 s)"),
+        })
+        .optional(),
+      speaker_map: z.record(z.string(), z.string()).optional().describe("For shared-audio shows: diarization label → person id"),
+      look: z.enum(["none", "natural", "warm", "contrast"]).optional().describe("Color look used by 'render'"),
+      force: z.boolean().optional().describe("For 'sync': also re-measure offsets that were set by hand"),
+      stems: z.boolean().optional().describe("For 'render': also write one WAV per person (default true)"),
+      format: z.enum(["premiere", "fcpxml"]).optional().describe("For 'export': premiere (FCP7 XML, also opens in Resolve) or fcpxml (Final Cut Pro, Resolve)"),
+      review: z.boolean().optional().describe("For 'export': keep the whole episode with every camera on its own track and the removals in place, marked"),
+      path: z.string().optional().describe("For 'import_timeline': an FCP 7 XML timeline exported from Premiere or Resolve"),
+      index: z.number().int().min(0).optional().describe("For 'cut': 0-based shot index"),
+      source_id: z.string().optional().describe("For 'cut': camera source id to use for that shot"),
+      removals: z
+        .array(z.object({ start: z.number(), end: z.number(), reason: z.string().optional() }))
+        .optional()
+        .describe("Stretches cut out of the episode on every camera and mic, in timeline seconds; [] restores everything"),
+      cuts: z
+        .array(z.object({ start: z.number(), end: z.number(), source_id: z.string() }))
+        .optional()
+        .describe("For 'set_cuts': the full cut, shots back to back on the timeline"),
+      looks: z.boolean().optional().describe("For 'previews': include one still per color look"),
+      at: z.number().optional().describe("For 'previews': timeline second to take the stills at"),
+    },
+    async (params) => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/multicam`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+        const data = (await res.json()) as ApiError & Record<string, unknown>;
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+        const validation = (data.outputs as { validation?: { warnings?: string[] } } | undefined)?.validation;
+        const warnings = validation?.warnings?.length
+          ? `\n\n[Render warnings]\n${validation.warnings.map((w) => `  - ${w}`).join("\n")}`
+          : "";
+        const text = typeof data.job_id === "string"
+          ? withNextStep(
+              JSON.stringify(data, null, 2),
+              `Poll job_status("${data.job_id}", wait_seconds: 30) until done, then manage_multicam(action: "show", session_id) to read the result.`,
+            )
+          : JSON.stringify(data, null, 2) + warnings;
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [{ type: "text" as const, text: `Web UI is not running. Start with: ${studioStartCommand()}` }],
+          };
+        }
+        return mcpError(err);
       }
     },
   );
@@ -2309,7 +2694,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2410,7 +2795,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2443,8 +2828,15 @@ export function createServer(): McpServer {
         .optional()
         .default(0)
         .describe("Offset in seconds to add to all timestamps"),
+      language: z
+        .string()
+        .optional()
+        .describe(
+          "ISO language code of the transcript (e.g. 'ka'). This format has no language " +
+            "info of its own, so omitting it labels the result 'und' rather than guessing.",
+        ),
     },
-    async ({ file_path, raw_text, total_duration, time_adjust }) => {
+    async ({ file_path, raw_text, total_duration, time_adjust, language }) => {
       try {
         const res = await fetch(`${webServerUrl}/api/parse-transcript`, {
           method: "POST",
@@ -2454,6 +2846,7 @@ export function createServer(): McpServer {
             raw_text,
             total_duration,
             time_adjust,
+            language,
           }),
         });
         if (!res.ok) {
@@ -2498,7 +2891,7 @@ export function createServer(): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: "Web UI is not running. Start with: npm run ui",
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
               },
             ],
           };
@@ -2507,6 +2900,73 @@ export function createServer(): McpServer {
           content: [{ type: "text" as const, text: `Error: ${msg}` }],
           isError: true,
         };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: mine_channel
+  // =============================================
+  server.tool(
+    mineChannelToolDef.name,
+    mineChannelToolDef.description,
+    {
+      action: z.enum(["list", "mine"]).describe("'list' = a channel's uploads, 'mine' = one video's captions"),
+      channel_url: z
+        .string()
+        .optional()
+        .refine((v) => v === undefined || isHttpUrl(v), { message: "channel_url must be an http(s) URL" })
+        .describe("Channel or uploads URL (required for action=list)"),
+      video_url: z
+        .string()
+        .optional()
+        .refine((v) => v === undefined || isHttpUrl(v), { message: "video_url must be an http(s) URL" })
+        .describe("Video URL (required for action=mine)"),
+      limit: z.number().optional().describe("Max uploads to list (action=list)"),
+      cookies_from_browser: z
+        .string()
+        .optional()
+        .describe("Browser to read cookies from for members-only or unlisted content"),
+    },
+    async (input) => {
+      try {
+        const text = await handleMineChannel(input);
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: compare_transcription_engines
+  // =============================================
+  server.tool(
+    compareEnginesToolDef.name,
+    compareEnginesToolDef.description,
+    {
+      file_path: z.string().describe("Absolute path to the podcast file"),
+      engine_a: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).describe("First engine to compare"),
+      engine_b: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).describe("Second engine to compare"),
+      start_seconds: z.number().optional().describe("Sample start, seconds into the source. Default: 0."),
+      duration_seconds: z.number().optional().describe("Sample length in seconds. Default: 120."),
+      window_seconds: z.number().optional().describe("Report window size in seconds. Default: 20."),
+      model_size: z
+        .enum(["tiny", "base", "small", "medium", "large"])
+        .optional()
+        .describe("Model size for engines that take one. Default: base."),
+      language: z.string().optional().describe("ISO language code. Leave empty for auto-detect."),
+      output_dir: z
+        .string()
+        .optional()
+        .describe("Where to write comparison.json/.html. Defaults under the podcli output directory."),
+    },
+    async (input) => {
+      try {
+        const text = await handleCompareEngines(input);
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
       }
     },
   );
@@ -2551,7 +3011,8 @@ export function createServer(): McpServer {
               "- Questions that hook the viewer",
               "",
               "For each moment, note the start/end timestamps and craft a catchy title.",
-              "Aim for 15-45 second clips (target 20-35s). Then call suggest_clips with your picks.",
+              "Aim for 15-45 second clips (target 20-35s). If a moment is an answer, start on the question. "
+                + "Then call suggest_clips with your picks, each carrying a payoff and a standalone check.",
               "",
               "## Step 5: Export",
               "Call batch_create_clips(export_selected: true) to render all clips.",

@@ -441,7 +441,8 @@ def _run_ai_command(
         result = subprocess.run(
             [
                 cli_path, "exec",
-                "--full-auto",
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
                 "-o", output_file,
                 prompt,
             ],

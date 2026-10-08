@@ -77,6 +77,68 @@ class StudioFormatTests(unittest.TestCase):
         cmd = _run_studio(args)
         self.assertEqual(cmd[cmd.index("--format") + 1], "vertical")
 
+    def test_old_callers_keep_the_original_layout_defaults(self):
+        cmd = _run_studio(_studio_args())
+        self.assertEqual(cmd[cmd.index("--caption-position") + 1], "auto")
+        self.assertEqual(cmd[cmd.index("--caption-scale") + 1], "1.0")
+        self.assertEqual(cmd[cmd.index("--logo-position") + 1], "top-left")
+        self.assertEqual(cmd[cmd.index("--logo-scale") + 1], "1.0")
+
+
+class StudioTranscriptTests(unittest.TestCase):
+    def test_supplied_words_reach_the_render_script(self):
+        cmd = _run_studio(_studio_args(transcript="/tmp/window-words.json"))
+        self.assertEqual(cmd[cmd.index("--transcript") + 1], "/tmp/window-words.json")
+
+    def test_no_transcript_sends_no_transcript_flag(self):
+        self.assertNotIn("--transcript", _run_studio(_studio_args()))
+
+    def test_the_flag_is_in_the_help_the_cloud_worker_reads(self):
+        import subprocess
+        script = os.path.join(os.path.dirname(cli_mod.__file__), "cli.py")
+        shown = subprocess.run([sys.executable, script, "studio", "--help"], capture_output=True, text=True)
+        self.assertIn("--transcript", shown.stdout)
+
+
+class StudioStyleTests(unittest.TestCase):
+    """`--style` travels to clip_studio.py the same way `--brand` does."""
+
+    def test_style_reaches_the_render_script(self):
+        cmd = _run_studio(_studio_args(style='{"pack": "collage"}'))
+        self.assertIn("--style", cmd)
+        self.assertEqual(cmd[cmd.index("--style") + 1], '{"pack": "collage"}')
+
+    def test_no_style_sends_no_style_flag(self):
+        cmd = _run_studio(_studio_args())
+        self.assertNotIn("--style", cmd)
+
+
+class ClipStudioStyleValidationTests(unittest.TestCase):
+    """clip_studio.py validates --style itself: it is also run standalone."""
+
+    def test_missing_value_is_none(self):
+        import clip_studio
+
+        self.assertIsNone(clip_studio._json_object_arg(None, "--style"))
+
+    def test_a_valid_object_passes_through(self):
+        import clip_studio
+
+        parsed = clip_studio._json_object_arg('{"pack": "collage"}', "--style")
+        self.assertEqual(parsed, {"pack": "collage"})
+
+    def test_malformed_json_exits(self):
+        import clip_studio
+
+        with self.assertRaises(SystemExit):
+            clip_studio._json_object_arg("not json", "--style")
+
+    def test_a_json_array_is_not_an_object(self):
+        import clip_studio
+
+        with self.assertRaises(SystemExit):
+            clip_studio._json_object_arg("[1, 2]", "--style")
+
 
 class StudioCanvasTests(unittest.TestCase):
     """Each stage must be handed the canvas, and it must be the spec's."""

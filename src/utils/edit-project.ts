@@ -5,6 +5,7 @@ import type {
   TranscriptSegment,
   WordTimestamp,
 } from "../models/index.js";
+import { playbackRanges, validateHook, type ClipHook } from "./clip-hook.js";
 
 export const MIN_SEGMENT_DURATION = 0.04;
 const EPSILON = 0.0005;
@@ -29,6 +30,7 @@ export interface EditedClipRangeInput {
   end_second: number;
   segments?: Array<{ start: number; end: number }>;
   keep_segments?: Array<{ start: number; end: number }>;
+  hook?: ClipHook | null;
 }
 
 export function seconds(value: number): number {
@@ -234,14 +236,18 @@ export function mapEditedClipToSource(
     : clip.keep_segments?.length
       ? clip.keep_segments
       : [{ start: clip.start_second, end: clip.end_second }];
-  return ranges.flatMap((range) => {
+  const validatedRanges = ranges.map((range) => {
     const start = Number(range.start);
     const end = Number(range.end);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
       throw new Error("Clip has an invalid edited range");
     }
-    return mapEditedRangeToSource(timeline, start, end);
+    return { start, end };
   });
+  const hookError = validateHook(clip.hook, clip.start_second, clip.end_second, validatedRanges);
+  if (hookError) throw new Error(hookError);
+  return playbackRanges(clip.start_second, clip.end_second, validatedRanges, clip.hook)
+    .flatMap((range) => mapEditedRangeToSource(timeline, range.start, range.end));
 }
 
 export function retainSourceRanges(

@@ -6,8 +6,10 @@ or any external tools.
 """
 
 import os
+import tempfile
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BACKEND_ROOT = os.path.join(ROOT, "backend")
@@ -261,3 +263,232 @@ class BlendSignalScoresTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExistingShortsTests(unittest.TestCase):
+    def _write(self, body):
+        path = os.path.join(self.tmp.name, "03-episodes-database.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_shipped_template_yields_nothing(self):
+        shipped = os.path.join(
+            ROOT, "backend", "templates", "knowledge", "03-episodes-database.md"
+        )
+        self.assertEqual(cs._load_existing_shorts(shipped), [])
+
+    def test_titles_come_out_of_the_shipped_table_shape(self):
+        path = self._write(
+            "| # | Moment (timestamps) | Title | Platform | Status |\n"
+            "|---|---------------------|-------|----------|--------|\n"
+            "| 1 | [00:14:20-00:15:05] | The pricing mistake | YouTube Shorts | published |\n"
+            "| 2 | [00:31:02-00:31:40] | Why we fired our best engineer | TikTok | published |\n"
+        )
+        self.assertEqual(
+            cs._load_existing_shorts(path),
+            ["The pricing mistake", "Why we fired our best engineer"],
+        )
+
+    def test_the_older_numbered_shape_still_reads(self):
+        path = self._write("1. An older entry — hot take\n2. Another one — story\n")
+        self.assertEqual(cs._load_existing_shorts(path), ["An older entry", "Another one"])
+
+    def test_a_dropped_moment_stays_available(self):
+        path = self._write(
+            "| # | Moment | Title | Platform | Status |\n"
+            "|---|--------|-------|----------|--------|\n"
+            "| 1 | [00:01-00:30] | Shipped one | YouTube Shorts | published |\n"
+            "| 2 | [00:40-01:10] | Considered and cut | - | dropped |\n"
+            "| 3 | [02:00-02:30] | Queued one | TikTok | scheduled |\n"
+        )
+        self.assertEqual(cs._load_existing_shorts(path), ["Shipped one", "Queued one"])
+
+    def test_unfilled_cells_are_not_titles(self):
+        path = self._write(
+            "| # | Moment | Title | Platform | Status |\n"
+            "|---|--------|-------|----------|--------|\n"
+            "| 1 | [00:00-00:30] | [published title] | [YouTube Shorts] | [published] |\n"
+        )
+        self.assertEqual(cs._load_existing_shorts(path), [])
+
+    def test_published_titles_reach_the_prompt_one_per_line(self):
+        with mock.patch.object(
+            cs, "_load_existing_shorts", return_value=["First short", "Second short"]
+        ):
+            prompt = cs._build_prompt(
+                transcript_text="[0.0s] hello",
+                segment_count=1,
+                duration_min=1.0,
+                top_n=3,
+            )
+        self.assertIn("ALREADY PUBLISHED", prompt)
+        self.assertIn("\n- First short\n- Second short", prompt)
+
+    def test_no_published_titles_means_no_heading(self):
+        with mock.patch.object(cs, "_load_existing_shorts", return_value=[]):
+            prompt = cs._build_prompt(
+                transcript_text="[0.0s] hello",
+                segment_count=1,
+                duration_min=1.0,
+                top_n=3,
+            )
+        self.assertNotIn("ALREADY PUBLISHED", prompt)
+
+
+class CaptionStyleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _guide(self, line):
+        with open(
+            os.path.join(self.tmp.name, "04-shorts-creation-guide.md"), "w", encoding="utf-8"
+        ) as fh:
+            fh.write("# Guide\n\n" + line + "\n")
+        return self.tmp.name
+
+    def test_an_unfilled_placeholder_falls_back_to_the_preset(self):
+        kb = self._guide("- Caption style: [branded / hormozi / karaoke / subtle]")
+        self.assertEqual(cs._preferred_caption_style(kb), "branded")
+
+    def test_a_chosen_style_wins(self):
+        kb = self._guide("- Caption style: karaoke")
+        self.assertEqual(cs._preferred_caption_style(kb), "karaoke")
+
+    def test_an_unknown_style_falls_back_rather_than_shipping_garbage(self):
+        kb = self._guide("- Caption style: neon")
+        self.assertEqual(cs._preferred_caption_style(kb), "branded")
+
+    def test_a_missing_knowledge_base_falls_back(self):
+        self.assertEqual(cs._preferred_caption_style("/nonexistent"), "branded")
+
+
+class ClipBoundsTests(unittest.TestCase):
+    def test_vertical_is_the_shorts_window(self):
+        b = cs.ClipBounds.of("vertical")
+        self.assertEqual((b.dur_min, b.dur_max), (20, 45))
+        self.assertIn("SHORTER IS BETTER", b.pacing)
+
+    def test_horizontal_is_minutes_not_seconds(self):
+        b = cs.ClipBounds.of("horizontal")
+        self.assertEqual((b.dur_min, b.dur_max), (60, 300))
+        self.assertEqual((b.target_min, b.target_max), (90, 240))
+        self.assertNotIn("SHORTER IS BETTER", b.pacing)
+
+    def test_an_explicit_override_narrows_the_format(self):
+        b = cs.ClipBounds.of("horizontal", 90, 120)
+        self.assertEqual((b.dur_min, b.dur_max), (90, 120))
+        self.assertTrue(b.dur_min <= b.target_min <= b.target_max <= b.dur_max)
+
+    def test_an_inverted_override_falls_back_to_the_format(self):
+        b = cs.ClipBounds.of("vertical", 90, 30)
+        self.assertEqual((b.dur_min, b.dur_max), (20, 45))
+
+    def test_an_unknown_format_falls_back_rather_than_raising(self):
+        b = cs.ClipBounds.of("hexagonal")
+        self.assertEqual((b.dur_min, b.dur_max), (20, 45))
+
+    def test_keeps_is_inclusive_at_both_ends(self):
+        b = cs.ClipBounds.of("vertical")
+        self.assertTrue(b.keeps(20))
+        self.assertTrue(b.keeps(45))
+        self.assertFalse(b.keeps(19.9))
+        self.assertFalse(b.keeps(45.1))
+
+    def test_a_horizontal_length_survives_the_filter_that_used_to_drop_it(self):
+        self.assertFalse(cs.ClipBounds.of("vertical").keeps(120))
+        self.assertTrue(cs.ClipBounds.of("horizontal").keeps(120))
+
+
+class FormatFramingTests(unittest.TestCase):
+    def test_the_prompt_asks_for_the_format_it_will_render(self):
+        prompt = cs._build_prompt(
+            transcript_text="[0.0s] hello",
+            segment_count=1,
+            duration_min=90.0,
+            top_n=3,
+            bounds=cs.ClipBounds.of("horizontal"),
+        )
+        self.assertIn("60", prompt)
+        self.assertIn("90-240 seconds", prompt)
+        self.assertNotIn("SHORTER IS BETTER", prompt)
+        self.assertNotIn("TikTok editor", prompt)
+
+    def test_the_vertical_prompt_is_unchanged_in_substance(self):
+        prompt = cs._build_prompt(
+            transcript_text="[0.0s] hello",
+            segment_count=1,
+            duration_min=30.0,
+            top_n=3,
+        )
+        self.assertIn("20-35 seconds", prompt)
+        self.assertIn("SHORTER IS BETTER", prompt)
+        self.assertIn("TikTok", prompt)
+
+
+class TotalScoreTests(unittest.TestCase):
+    """One malformed field used to raise inside the normalization loop and take
+    down the whole suggestion run rather than costing a single clip."""
+
+    def test_the_normal_case_still_sums(self):
+        clip = {"scores": {"standalone": 4, "hook": 5, "relevance": 4, "quotability": 3}}
+        self.assertEqual(cs._total_score(clip), 16)
+
+    def test_a_string_score_does_not_raise(self):
+        clip = {"scores": {"standalone": 4, "hook": "5"}}
+        self.assertEqual(cs._total_score(clip), 9)
+
+    def test_an_unparseable_score_is_skipped_not_fatal(self):
+        clip = {"scores": {"standalone": 4, "hook": "very good"}}
+        self.assertEqual(cs._total_score(clip), 4)
+
+    def test_all_scores_unusable_falls_back_to_total_score(self):
+        clip = {"scores": {"hook": None}, "total_score": 12}
+        self.assertEqual(cs._total_score(clip), 12)
+
+    def test_a_missing_or_junk_total_score_is_zero(self):
+        self.assertEqual(cs._total_score({}), 0.0)
+        self.assertEqual(cs._total_score({"total_score": "nope"}), 0.0)
+
+    def test_a_non_dict_scores_field_does_not_raise(self):
+        self.assertEqual(cs._total_score({"scores": [4, 5], "total_score": 9}), 9)
+
+
+class CodexTranscriptTests(unittest.TestCase):
+    """Codex takes its prompt as an argv argument and silently truncates it.
+    Cutting the tail is what clusters every clip in the opening minutes."""
+
+    def _transcript(self, n=4000):
+        return "\n".join(f"[{i * 3.0:.1f}s] line {i}" for i in range(n))
+
+    def test_a_short_transcript_is_untouched(self):
+        text = self._transcript(10)
+        self.assertEqual(cs._sample_transcript(text), text)
+
+    def test_a_long_transcript_is_thinned_not_truncated(self):
+        text = self._transcript()
+        out = cs._sample_transcript(text)
+        self.assertLess(len(out), len(text))
+        self.assertIn("line 0", out)
+        # The last line is the half a tail truncation would have thrown away.
+        self.assertIn(f"line {3999}", out)
+
+    def test_only_codex_is_adapted(self):
+        text = self._transcript()
+        prompt = "RULES\n\n" + text
+        adapt = cs._codex_adapter(text)
+        self.assertEqual(adapt("claude", prompt), prompt)
+        self.assertNotEqual(adapt("codex", prompt), prompt)
+
+    def test_the_adapted_prompt_keeps_the_rules_and_says_it_sampled(self):
+        text = self._transcript()
+        prompt = "RULES THAT MUST SURVIVE\n\n" + text
+        out = cs._codex_adapter(text)("codex", prompt)
+        self.assertIn("RULES THAT MUST SURVIVE", out)
+        self.assertIn("sampled across the full episode", out)
+        self.assertLess(len(out), len(prompt))

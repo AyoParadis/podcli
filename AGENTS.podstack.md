@@ -8,7 +8,7 @@ PodStack turns your AI tool into a podcast content team: Episode Architect, Cont
 
 ## How to use
 
-Each skill below is a self-contained instruction file in `commands/` (or `.claude/commands/`, `.codex/prompts/`, `.cursor/rules/`, `.opencode/commands/`, depending on which host installed it).
+Each skill below is a self-contained instruction file in `commands/` (or `.claude/commands/`, `~/.codex/skills/<name>/SKILL.md`, `.cursor/rules/`, `.opencode/commands/`, depending on which host installed it).
 
 **To run a skill:** ask your agent to "run the [skill-name] skill" or invoke its slash command (`/[skill-name]`) where supported. The agent opens the corresponding file and follows it step by step.
 
@@ -30,7 +30,7 @@ Each skill below is a self-contained instruction file in `commands/` (or `.claud
 
 - **role:** Episode Architect
 - **description:** Design questions, story arc, and moment map BEFORE recording
-- **allowed-tools:** Read, Write
+- **allowed-tools:** Read, Write, mcp__podcli__knowledge_base
 - **triggers:** plan episode, upcoming recording, guest prep, prepare for interview
 - **outputs:** episode plan written to `episodes/ep[XX]-[guest]-plan.md`
 - **next:** record → `/process-transcript`
@@ -39,7 +39,7 @@ Each skill below is a self-contained instruction file in `commands/` (or `.claud
 
 - **role:** Content Analyst
 - **description:** Extract, score, classify best moments from a raw transcript
-- **allowed-tools:** Read, Write
+- **allowed-tools:** Read, Write, mcp__podcli__knowledge_base
 - **triggers:** transcript, process transcript, extract moments, podcast transcript
 - **outputs:** moment brief with timestamps, scores, titles, thumbnails, descriptions
 - **next:** `/generate-titles` or `/produce-shorts`
@@ -48,7 +48,7 @@ Each skill below is a self-contained instruction file in `commands/` (or `.claud
 
 - **role:** Title Writer
 - **description:** Generate 8 verified title options for a clip or moment
-- **allowed-tools:** Read
+- **allowed-tools:** Read, mcp__podcli__knowledge_base
 - **triggers:** titles for, title options, write titles, generate titles
 - **outputs:** 8 titles + 2 top picks with rationale
 
@@ -80,7 +80,7 @@ Each skill below is a self-contained instruction file in `commands/` (or `.claud
 
 - **role:** Producer (master orchestrator)
 - **description:** Full pipeline from transcript to publish-ready content package
-- **allowed-tools:** Read, Write, Edit, Task
+- **allowed-tools:** Read, Write, Edit, Task, mcp__podcli__knowledge_base
 - **triggers:** process episode, produce shorts, full pipeline, prep episode, make content package
 - **outputs:** complete content package in `episodes/ep[XX]-[guest]-content-package.md`
 - **orchestrates:** process-transcript → generate-titles → generate-descriptions → plan-thumbnails → review-content
@@ -114,16 +114,16 @@ Skill files read the 14 knowledge files at `.podcli/knowledge/`; the full file t
 
 PodStack ships one source-of-truth (`commands/`) and installs to the right location for each tool:
 
-| Host | Install location | Primary doc |
-|------|-----------------|-------------|
-| Claude Code | `.claude/commands/*.md` | `CLAUDE.md` |
-| OpenAI Codex | `.codex/prompts/*.md` | `AGENTS.podstack.md` (this file) |
-| Cursor | `.cursor/rules/*.mdc` | `AGENTS.podstack.md` |
-| opencode | `.opencode/commands/*.md` | `AGENTS.podstack.md` |
-| Generic | `commands/*.md` | `AGENTS.podstack.md` |
+| Host | Install location | Installed by | Primary doc |
+|------|-----------------|--------------|-------------|
+| Claude Code | `.claude/commands/*.md` (per project) | `podcli auto` / any PodStack command | `CLAUDE.md` |
+| OpenAI Codex | `~/.codex/skills/<name>/SKILL.md` (global) | `podcli auto` / any PodStack command, when the `codex` CLI is on PATH | `AGENTS.podstack.md` (this file) |
+| Cursor | `.cursor/rules/*.mdc` | not automated yet, copy by hand | `AGENTS.podstack.md` |
+| opencode | `.opencode/commands/*.md` | not automated yet, copy by hand | `AGENTS.podstack.md` |
+| Generic | `commands/*.md` | not automated yet, copy by hand | `AGENTS.podstack.md` |
 
-These command files ship with podcli; place the set for your tool (left column) in
-its command dir. See `README.md` for per-host usage examples.
+Claude and Codex installs are automatic and kept in sync on upgrade; see `README.md`
+for per-host usage examples and manual steps for the other hosts.
 
 ---
 

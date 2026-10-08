@@ -1,11 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 import { PageHeader } from "./Page";
 import { Link, useParams, useNavigate } from "react-router-dom";
-import { api, upload, fmt, basename, labelStyle } from "./lib";
+import { api, upload, fmt, basename, labelStyle, describePeople } from "./lib";
+import { needsFrame, type ThumbnailLayout, type ThumbnailPerson } from "../../utils/thumbnail-layout";
 import ClipPlayer from "./ClipPlayer";
 import { BackIcon } from "./icons";
 import ReframeEditor from "./ReframeEditor";
 import CopyButton from "./CopyButton";
+import AssetPicker from "./AssetPicker";
 
 interface ThumbnailConfig {
   text?: string;
@@ -15,6 +17,8 @@ interface ThumbnailConfig {
   timestamp?: number;
   preview_path?: string;
   variations?: string[];
+  layout?: ThumbnailLayout;
+  people?: ThumbnailPerson[];
 }
 
 interface Clip {
@@ -28,6 +32,9 @@ interface Clip {
   duration: number;
   file_size_mb?: number;
   output_path: string;
+  logo_path?: string;
+  logo_backup_path?: string;
+  logo_position?: string;
   created_at: string;
   content_type?: string;
   transcript_slice?: string;
@@ -41,6 +48,7 @@ interface Clip {
 }
 
 const CAPTION_STYLES = ["branded", "hormozi", "karaoke", "subtle"];
+const LOGO_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right"];
 const img = (p: string, bust: number) => `/api/image?path=${encodeURIComponent(p)}&t=${bust}`;
 
 export default function ClipDetail() {
@@ -59,12 +67,18 @@ export default function ClipDetail() {
   const [frameOpts, setFrameOpts] = useState<any[]>([]);
   const [frameIdx, setFrameIdx] = useState(0);
   const [selFrame, setSelFrame] = useState<{ path: string; info?: any } | null>(null);
+  const [thumbLayout, setThumbLayout] = useState<ThumbnailLayout>("single");
+  const [swapSides, setSwapSides] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [msgErr, setMsgErr] = useState(false);
   const [bust, setBust] = useState(1);
   const [davinciOn, setDavinciOn] = useState(false);
   const [reframing, setReframing] = useState(false);
+  const [trimming, setTrimming] = useState(false);
+  const [logoPath, setLogoPath] = useState("");
+  const [logoPosition, setLogoPosition] = useState("top-right");
+  const [logoPreviews, setLogoPreviews] = useState<Array<{ position: string; path: string }>>([]);
 
   const load = () => {
     api("/history?limit=500")
@@ -74,9 +88,12 @@ export default function ClipDetail() {
         if (found) {
           setTitle(found.title);
           setCaptionStyle(found.caption_style);
+          setLogoPath(found.logo_path || "");
+          setLogoPosition(found.logo_position || "top-right");
           const tc = found.thumbnail_config || {};
           setLine1(tc.line1 ?? "");
           setLine2(tc.line2 ?? "");
+          setThumbLayout(tc.layout ?? "single");
         }
       })
       .finally(() => setLoading(false));
@@ -130,18 +147,61 @@ export default function ClipDetail() {
     } catch (e: any) { setMsg(`Upload failed: ${e.message}`); setMsgErr(true); } finally { setBusy(null); }
   };
 
+  const pairLayout = thumbLayout === "pair";
+
   const renderThumb = async () => {
-    if (!selFrame) { setMsg("Select or upload a frame first"); setMsgErr(true); return; }
+    if (!selFrame && needsFrame(thumbLayout)) { setMsg("Select or upload a frame first"); setMsgErr(true); return; }
     setBusy("render"); setMsg(null); setMsgErr(false);
     try {
       const r = await api(`/clips/${clip.id}/thumbnail/render`, {
         method: "POST",
-        body: JSON.stringify({ line1: line1 || undefined, line2: line2 || undefined, frame_path: selFrame.path, frame_info: selFrame.info }),
+        body: JSON.stringify({
+          line1: line1 || undefined, line2: line2 || undefined,
+          frame_path: selFrame?.path, frame_info: selFrame?.info,
+          layout: thumbLayout, swap: pairLayout && swapSides,
+        }),
       });
       if (r.error) throw new Error(r.error);
       setBust(Date.now()); load();
-      setMsg("Thumbnail generated"); setMsgErr(false);
+      if (r.note) { setMsg(r.note); setMsgErr(true); }
+      else { setMsg(r.people?.length ? `Thumbnail generated: ${describePeople(r.people)}` : "Thumbnail generated"); setMsgErr(false); }
     } catch (e: any) { setMsg(`Generate failed: ${e.message}`); setMsgErr(true); } finally { setBusy(null); }
+  };
+
+  const loadLogoPreviews = async () => {
+    if (!logoPath) { setMsg("Select a logo first"); setMsgErr(true); return; }
+    setBusy("logo-preview"); setMsg(null); setMsgErr(false);
+    try {
+      const r = await api(`/clips/${clip.id}/logo/previews?logo_path=${encodeURIComponent(logoPath)}`);
+      if (r.error) throw new Error(r.error);
+      setLogoPreviews(r.previews || []);
+      if (r.previews?.[0]?.position) setLogoPosition(r.previews[0].position);
+    } catch (e: any) { setMsg(`Logo previews failed: ${e.message}`); setMsgErr(true); } finally { setBusy(null); }
+  };
+
+  const applyLogo = async () => {
+    if (!logoPath) { setMsg("Select a logo first"); setMsgErr(true); return; }
+    setBusy("logo-apply"); setMsg(null); setMsgErr(false);
+    try {
+      const r = await api(`/clips/${clip.id}/logo`, {
+        method: "POST",
+        body: JSON.stringify({ action: "apply", logo_path: logoPath, logo_position: logoPosition }),
+      });
+      if (r.error) throw new Error(r.error);
+      setBust(Date.now()); load();
+      setMsg("Logo applied. Backup saved for removal"); setMsgErr(false);
+    } catch (e: any) { setMsg(`Logo apply failed: ${e.message}`); setMsgErr(true); } finally { setBusy(null); }
+  };
+
+  const removeLogo = async () => {
+    setBusy("logo-remove"); setMsg(null); setMsgErr(false);
+    try {
+      const r = await api(`/clips/${clip.id}/logo`, { method: "POST", body: JSON.stringify({ action: "remove" }) });
+      if (r.error) throw new Error(r.error);
+      setLogoPreviews([]);
+      setBust(Date.now()); load();
+      setMsg("Logo removed from backup"); setMsgErr(false);
+    } catch (e: any) { setMsg(`Logo remove failed: ${e.message}`); setMsgErr(true); } finally { setBusy(null); }
   };
 
   // Pull a different frame from the clip (cycles the ranked candidates) and
@@ -236,14 +296,17 @@ export default function ClipDetail() {
       <div className="clip-detail">
         <div className="clip-detail-player">
           {clip.output_path ? <ClipPlayer key={previewUrl} src={previewUrl} poster={posterUrl} onTime={(t) => (playerTime.current = t)} /> : <div className="phone-empty">No rendered output</div>}
-          <button
-            className="btn btn-ghost btn-sm"
-            style={{ width: "100%", marginTop: 10 }}
-            onClick={() => setReframing(true)}
-            disabled={Boolean(clip.edit_project_id)}
-            title={clip.edit_project_id ? "Edited clips already contain assembled cuts; choose framing in Episode Workspace before exporting." : undefined}
-          >Reframe (fix camera)</button>
-          {clip.edit_project_id && <div className="hint" style={{ marginTop: 6 }}>For edited episodes, choose framing before export.</div>}
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button className="btn btn-ghost btn-sm" style={{ flex: 1 }} onClick={() => setTrimming(true)} disabled={Boolean(clip.edit_project_id)}>Trim length</button>
+            <button
+              className="btn btn-ghost btn-sm"
+              style={{ flex: 1 }}
+              onClick={() => setReframing(true)}
+              disabled={Boolean(clip.edit_project_id)}
+              title={clip.edit_project_id ? "Edited clips already contain assembled cuts; choose framing in Episode Workspace before exporting." : undefined}
+            >Reframe</button>
+          </div>
+          {clip.edit_project_id && <div className="hint" style={{ marginTop: 6 }}>For edited episodes, trim in Editor and choose framing before export.</div>}
           <div className="clip-meta">
             <span>{fmt(clip.start_second)}-{fmt(clip.end_second)} · {clip.duration}s</span>
             <span>{clip.crop_strategy}</span>
@@ -266,6 +329,43 @@ export default function ClipDetail() {
               <button className="btn btn-primary btn-sm" onClick={save} disabled={!dirty || busy !== null}>
                 {busy === "save" ? <div className="spinner sm" /> : "Save"}
               </button>
+            </div>
+          </div>
+
+          <div className="section">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <label style={{ ...labelStyle, marginBottom: 0 }}>Logo</label>
+              {clip.logo_backup_path && <span className="hint">Backup ready</span>}
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <AssetPicker type="logo" value={logoPath} onChange={(p) => { setLogoPath(p); setLogoPreviews([]); }} disabled={busy !== null} />
+              <button className="btn btn-ghost btn-sm" onClick={loadLogoPreviews} disabled={busy !== null || !logoPath}>
+                {busy === "logo-preview" ? <><div className="spinner sm" /> Loading…</> : "Preview"}
+              </button>
+              <button className="btn btn-primary btn-sm" onClick={applyLogo} disabled={busy !== null || !logoPath}>
+                {busy === "logo-apply" ? <div className="spinner sm" /> : "Apply"}
+              </button>
+              <button className="btn btn-danger btn-sm" onClick={removeLogo} disabled={busy !== null || !clip.logo_backup_path}>
+                {busy === "logo-remove" ? <div className="spinner sm" /> : "Remove"}
+              </button>
+            </div>
+            {logoPreviews.length > 0 ? (
+              <div className="thumb-variations" style={{ marginTop: 12 }}>
+                {logoPreviews.map((preview) => (
+                  <button key={preview.position} className={`thumb-variation ${logoPosition === preview.position ? "selected" : ""}`} onClick={() => setLogoPosition(preview.position)} disabled={busy !== null} title={preview.position}>
+                    <img src={img(preview.path, bust)} alt={preview.position} />
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="hint" style={{ marginTop: 8 }}>Preview a few placements, select one, then apply.</div>
+            )}
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+              {LOGO_POSITIONS.map((position) => (
+                <button key={position} className={`btn btn-ghost btn-sm ${logoPosition === position ? "selected" : ""}`} onClick={() => setLogoPosition(position)} disabled={busy !== null}>
+                  {position}
+                </button>
+              ))}
             </div>
           </div>
 
@@ -296,10 +396,19 @@ export default function ClipDetail() {
                 </div>
               </div>
               <div className="thumb-edit-controls">
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+                  <button className={`btn btn-ghost btn-sm ${!pairLayout ? "selected" : ""}`} onClick={() => setThumbLayout("single")} disabled={busy !== null}>One person</button>
+                  <button className={`btn btn-ghost btn-sm ${pairLayout ? "selected" : ""}`} onClick={() => setThumbLayout("pair")} disabled={busy !== null}>Two people</button>
+                  {pairLayout && (
+                    <label className="meta" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="checkbox" checked={swapSides} onChange={(e) => setSwapSides(e.target.checked)} disabled={busy !== null} /> Swap sides
+                    </label>
+                  )}
+                </div>
                 <input type="text" value={line1} onChange={(e) => setLine1(e.target.value)} placeholder="Line 1" style={{ width: "100%" }} />
                 <input type="text" value={line2} onChange={(e) => setLine2(e.target.value)} placeholder="Line 2 (highlighted)" style={{ width: "100%", marginTop: 8 }} />
                 <div className="set-actions" style={{ marginTop: 10 }}>
-                  <button className="btn btn-primary btn-sm" onClick={renderThumb} disabled={busy !== null || !selFrame}>
+                  <button className="btn btn-primary btn-sm" onClick={renderThumb} disabled={busy !== null || (!selFrame && needsFrame(thumbLayout))}>
                     {busy === "render" ? <div className="spinner sm" /> : (tc.preview_path ? "Regenerate" : "Generate")}
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={newFrame} disabled={busy !== null} title="Pull a different frame from the clip">
@@ -310,7 +419,13 @@ export default function ClipDetail() {
                   </button>
                   <input ref={fileRef} type="file" accept=".png,.jpg,.jpeg,.webp" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && uploadFrame(e.target.files[0])} />
                 </div>
-                <div className="hint" style={{ marginTop: 8 }}>Leave line 1 and line 2 empty to auto-write the text.</div>
+                <div className="hint" style={{ marginTop: 8 }}>
+                  Leave line 1 and line 2 empty to auto-write the text.
+                  {pairLayout && " Two people puts the guest left and the host right, both from this clip. A selected frame is used if podcli cannot tell them apart."}
+                </div>
+                {tc.layout === "pair" && tc.people?.length ? (
+                  <div className="hint" style={{ marginTop: 4 }}>Current thumbnail: {describePeople(tc.people)}</div>
+                ) : null}
               </div>
             </div>
 
@@ -422,6 +537,17 @@ export default function ClipDetail() {
           caption_style={clip.caption_style}
           onClose={() => setReframing(false)}
           onDone={() => { setReframing(false); setBust(Date.now()); setMsg("Reframed & re-rendered"); setMsgErr(false); load(); }}
+        />
+      )}
+      {trimming && (
+        <ReframeEditor
+          clipId={clip.id}
+          start={clip.start_second}
+          end={clip.end_second}
+          caption_style={clip.caption_style}
+          trimOnly
+          onClose={() => setTrimming(false)}
+          onDone={() => { setTrimming(false); setBust(Date.now()); setMsg("Trimmed & re-rendered"); setMsgErr(false); load(); }}
         />
       )}
     </div>

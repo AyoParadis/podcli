@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 import textwrap
 import time
 from pathlib import Path
@@ -72,7 +73,7 @@ def _reveal_in_os(path: str) -> None:
 
 from config.paths import paths
 from config.server import DEFAULT_PORT, resolve_web_server_port, web_server_url
-from presets import MIN_CLIP_DURATION, MAX_CLIP_DURATION, TARGET_CLIP_DURATION_MIN, TARGET_CLIP_DURATION_MAX
+from presets import DEFAULT_PRESET, MIN_CLIP_DURATION, MAX_CLIP_DURATION, TARGET_CLIP_DURATION_MIN, TARGET_CLIP_DURATION_MAX
 from services.knowledge_base import is_empty as kb_is_empty, kb_files
 
 
@@ -83,32 +84,111 @@ def _parse_json_transcript(raw_text):
     return data.get("words", []), data.get("segments", []), data
 
 
-def _cached_face_map(video_path: str):
-    """Face maps are keyed by video content, not by transcript, so an imported
-    transcript can still borrow the map from an earlier run on the same file."""
+def _json_file_arg(raw: str | None, name: str):
+    """JSON given inline or named as a file, or nothing.
+
+    Both, because the two callers differ: keyframes are a handful of numbers
+    and have always been passed inline, while a face map is a per-second record
+    of every face in the video, which an argument list will not carry. Missing
+    or malformed loses the framing hint, never the run.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    try:
+        if text.startswith("{") or text.startswith("["):
+            return json.loads(text)
+        with open(text, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"  Warning: {name} could not be read ({exc}); ignoring it", file=sys.stderr)
+        return None
+
+
+def _json_object_arg(raw: str | None, name: str):
+    """A JSON object argument, or nothing. Malformed or non-object stops the run.
+
+    Unlike `_json_file_arg`, this one refuses rather than warns: a style theme
+    silently ignored would render with the wrong look and nothing to say why.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        print(f"Error: {name} is not valid JSON ({exc})", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(parsed, dict):
+        print(f"Error: {name} must be a JSON object", file=sys.stderr)
+        sys.exit(1)
+    return parsed
+
+
+def _cached_transcript(video_path: str) -> dict:
+    """The cached transcript for this video, or {} when there is none."""
     try:
         from services.transcript_packer import load_cached_transcript_for_video
 
-        cached = load_cached_transcript_for_video(video_path)
+        return load_cached_transcript_for_video(video_path) or {}
     except Exception:
-        return None
-    return (cached or {}).get("face_map")
+        return {}
+
+
+def _cached_face_map(video_path: str):
+    """Face maps are keyed by video content, not by transcript, so an imported
+    transcript can still borrow the map from an earlier run on the same file."""
+    return _cached_transcript(video_path).get("face_map")
 
 
 def _suggestions_session_path(cache_hash: str) -> str:
     return os.path.join(paths["home"], "sessions", f"clips-{cache_hash}.json")
 
 
+def _explicit_clip_bounds(config: dict) -> tuple[int | None, int | None]:
+    """Duration bounds the user actually chose, or (None, None).
+
+    config is seeded from DEFAULT_PRESET, which carries the vertical numbers,
+    so passing them through unconditionally would override every other format
+    with 20-45s and make --format horizontal a no-op for selection.
+    """
+    out = []
+    for key in ("min_clip_duration", "max_clip_duration"):
+        value = config.get(key)
+        out.append(value if value != DEFAULT_PRESET.get(key) else None)
+    return out[0], out[1]
+
+
 def _selection_signature(config: dict) -> str:
-    """Flags that change which clips get selected. A cached session is only
-    valid for a re-run with the same signature, otherwise it would serve clips
-    that ignore the new --no-ai / --min-duration / --max-duration flags."""
-    return "|".join(str(x) for x in (
-        bool(config.get("ai_select", True)),
+    """Everything that changes which clips get selected.
+
+    A cached session is only replayed for a re-run with the same signature.
+    The knowledge base is in here because editing it and re-running is the
+    whole iteration loop, and serving the previous picks under the new rules
+    teaches people the knowledge base does nothing. It is folded in only for
+    AI selection, since the saliency and heuristic engines never read it and
+    would otherwise throw away sessions that cost real audio analysis.
+    """
+    ai_select = bool(config.get("ai_select", True))
+    parts = [
+        ai_select,
         config.get("min_clip_duration", MIN_CLIP_DURATION),
         config.get("max_clip_duration", MAX_CLIP_DURATION),
         config.get("format", "vertical"),
-    ))
+        config.get("profile") or "",
+        bool(config.get("energy_boost", True)),
+    ]
+    if ai_select:
+        try:
+            from services.claude_suggest import PROMPT_VERSION, kb_signature
+            parts.append(PROMPT_VERSION)
+            parts.append(kb_signature())
+        except Exception:
+            # Unique per call, so a run that could not read the knowledge base
+            # neither replays an older session nor becomes one. A constant here
+            # would make two failed lookups compare equal and serve stale picks
+            # across a knowledge-base edit.
+            parts.append("kb-unavailable-" + uuid.uuid4().hex)
+    return "|".join(str(x) for x in parts)
 
 
 def _load_suggestions_session(cache_hash: str, top_n: int, signature: str) -> list | None:
@@ -425,16 +505,70 @@ def cmd_studio(args):
         cmd += ["--language", args.language]
     if getattr(args, "engine", None):
         cmd += ["--engine", args.engine]
+    if getattr(args, "transcript", None):
+        cmd += ["--transcript", args.transcript]
     env = os.environ.copy()
     if getattr(args, "assemblyai_api_key", None):
         env["ASSEMBLYAI_API_KEY"] = args.assemblyai_api_key
     cmd += [
         "--caption-style", args.caption_style,
+        "--caption-position", getattr(args, "caption_position", "auto"),
+        "--caption-scale", str(getattr(args, "caption_scale", 1.0)),
         "--crop", args.crop,
         "--format", getattr(args, "format", None) or "vertical",
+    ]
+    # Where the faces are, and where somebody put the frame by hand. Both are
+    # what the crop needs and neither could be handed to it before, so a caller
+    # that already knew — the cloud worker scans the window before it renders —
+    # had no way to say so and watched `speaker` fall through to a letterbox.
+    # A path is made absolute because the script runs from elsewhere; JSON
+    # given inline is handed straight through.
+    def _pass_through(value):
+        text = str(value).strip()
+        return text if text.startswith(("{", "[")) else os.path.abspath(text)
+
+    if getattr(args, "face_map", None):
+        cmd += ["--face-map", _pass_through(args.face_map)]
+    if getattr(args, "crop_keyframes", None):
+        cmd += ["--crop-keyframes", _pass_through(args.crop_keyframes)]
+    cmd += [
+        "--logo-position", getattr(args, "logo_position", "top-left"),
+        "--logo-scale", str(getattr(args, "logo_scale", 1.0)),
         "--intro-seconds", str(args.intro_seconds),
         "--outro-seconds", str(args.outro_seconds),
     ]
+    # Only when asked for, so a studio cut that names none of these is the
+    # same command it was before they existed.
+    # Declared on this command since name cards existed and never handed to the
+    # script that draws them, so every `studio --name-card` accepted the words
+    # and rendered a clip without them.
+    if getattr(args, "name_card", None):
+        cmd += ["--name-card", args.name_card]
+        if getattr(args, "name_card_sub", None):
+            cmd += ["--name-card-sub", args.name_card_sub]
+        if getattr(args, "name_card_seconds", None) is not None:
+            cmd += ["--name-card-seconds", str(args.name_card_seconds)]
+    if getattr(args, "name_card_accent", None):
+        cmd += ["--name-card-accent", args.name_card_accent]
+    if getattr(args, "no_captions", False):
+        cmd += ["--no-captions"]
+    if getattr(args, "topic", None):
+        cmd += ["--topic", args.topic,
+                "--topic-position", getattr(args, "topic_position", "top-left") or "top-left"]
+    if getattr(args, "progress", False):
+        cmd += ["--progress"]
+        if getattr(args, "progress_color", None):
+            cmd += ["--progress-color", args.progress_color]
+    if getattr(args, "cards", None):
+        cmd += ["--cards", args.cards]
+    if getattr(args, "hook", None):
+        cmd += ["--hook", args.hook]
+    if getattr(args, "brand", None):
+        cmd += ["--brand", args.brand]
+    if getattr(args, "style", None):
+        cmd += ["--style", args.style]
+    if getattr(args, "font_family", None):
+        cmd += ["--font-family", args.font_family]
     if args.outro_title is not None:
         cmd += ["--outro-title", args.outro_title]
     if args.platforms is not None:
@@ -447,6 +581,12 @@ def cmd_studio(args):
         cmd += ["--intro-title", args.intro_title]
     if args.handle:
         cmd += ["--handle", args.handle]
+    if getattr(args, "logo", None):
+        cmd += ["--logo", args.logo]
+    if getattr(args, "intro", None):
+        cmd += ["--intro", args.intro]
+    if getattr(args, "outro", None):
+        cmd += ["--outro", args.outro]
     if args.output:
         cmd += ["--output", os.path.abspath(args.output)]
     if args.no_intro:
@@ -518,6 +658,375 @@ def cmd_reel(args):
               "edit <session> N <op> [secs] | build <session> | delete <session>")
 
 
+def _fmt_time(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    return f"{h}:{rem // 60:02d}:{rem % 60:02d}" if h else f"{rem // 60}:{rem % 60:02d}"
+
+
+def _multicam_table(session) -> None:
+    from services import multicam as mc
+
+    names = {p.id: p.name for p in session.people}
+    names.update({"wide": "Everyone (wide)", "": "Shared room mic"})
+    people = ", ".join(f"{p.name} ({p.role})" for p in session.people)
+    print(f"\n  {session.name}  ·  people: {people}  ·  session {session.session_id}")
+    print(f"  {'#':>2}  {'File':<28} {'Role':<7} {'Who':<22} {'Length':>8}  {'Format':<10} Sync")
+    for i, s in enumerate(session.sources, 1):
+        if s.role == "ignore":
+            who = ""
+        elif s.channel_people:
+            who = " / ".join(names.get(p, p) for p in s.channel_people)
+        else:
+            who = names.get(s.person, s.person)
+        size = "layout" if s.virtual else f"{s.width}x{s.height}" if s.kind == "video" else f"{s.audio_channels}ch"
+        sync = {"reference": "reference", "ok": "synced", "rough": "rough sync", "manual": "set by hand",
+                "assumed": "starts with the others", "failed": "not synced"}.get(s.sync.get("status", ""), "")
+        if s.synced:
+            drift = s.sync.get("drift_ppm") or 0
+            sync = f"{s.offset:+.3f}s {sync}" + (f", drift {drift:+.0f} ppm" if abs(drift) >= 5 else "")
+        flag = "  (guessed)" if s.guessed and s.role != "ignore" else ""
+        name = mc.source_label(session, s)
+        print(f"  {i:>2}  {name[:28]:<28} {s.role:<7} {who[:22]:<22} {_fmt_time(s.duration):>8}  {size:<10} {sync}{flag}")
+
+
+def _multicam_progress(label: str):
+    """One self-overwriting status line on a terminal, plain lines otherwise."""
+    tty = sys.stdout.isatty()
+    last = [""]
+
+    def report(percent: float, message: str) -> None:
+        line = f"  {label} {round(percent):>3}%  {message}"[:110]
+        if tty:
+            print("\r" + line.ljust(len(last[0])), end="", flush=True)
+            last[0] = line
+        elif message != last[0]:
+            print(line)
+            last[0] = message
+
+    def done() -> None:
+        if tty and last[0]:
+            print()
+
+    return report, done
+
+
+def _apply_multicam_fixes(session, fixes: list[str]):
+    """--set FILE=ROLE[:PERSON[,PERSON]] edits, matched by 1-based number or filename."""
+    from services.multicam import update_mapping
+
+    people = {p.name.lower(): p.id for p in session.people} | {p.id: p.id for p in session.people}
+    people.update({"wide": "wide", "room": "", "shared": ""})
+    edits = []
+    for fix in fixes:
+        target, _, value = fix.partition("=")
+        role, _, who = value.partition(":")
+        role = {"cam": "camera", "mic": "mic", "camera": "camera", "ignore": "ignore", "skip": "ignore"}.get(role.strip().lower())
+        if not target or not role:
+            raise ValueError(f"Can't read --set {fix!r}. Use FILE=camera:NAME, FILE=mic:NAME, or FILE=ignore")
+        target = target.strip()
+        if target.isdigit() and 1 <= int(target) <= len(session.sources):
+            source = session.sources[int(target) - 1]
+        else:
+            matches = [s for s in session.sources if not s.virtual
+                       and os.path.basename(s.path).lower().startswith(target.lower())]
+            if len(matches) != 1:
+                raise ValueError(f"--set {fix!r} matches {len(matches)} files. Use the file's number from the table.")
+            source = matches[0]
+        edit = {"id": source.id, "role": role}
+        names = [n.strip().lower() for n in who.split(",") if n.strip()]
+        unknown = [n for n in names if n not in people]
+        if unknown:
+            raise ValueError(f"Unknown person {unknown[0]!r}. People: {', '.join(p.name for p in session.people)}")
+        if role == "mic" and len(names) == 2:
+            edit["channel_people"] = [people[n] for n in names]
+        elif names:
+            edit["person"] = people[names[0]]
+            edit["channel_people"] = []
+        edits.append(edit)
+    return update_mapping(session, {"sources": edits}) if edits else session
+
+
+def _review_multicam_interactively(session):
+    """Let the user fix guessed roles before the slow steps. Returns None to quit."""
+    import questionary
+    from services import multicam as mc
+    from services.multicam import rename_people, update_mapping
+
+    while True:
+        _multicam_table(session)
+        choice = questionary.select(
+            "Does this look right?",
+            choices=[
+                questionary.Choice("Yes, sync and cut", value="go"),
+                questionary.Choice("Fix a file", value="fix"),
+                questionary.Choice("Rename people", value="people"),
+                questionary.Choice("Quit", value="quit"),
+            ],
+        ).ask()
+        if choice in (None, "quit"):
+            return None
+        if choice == "go":
+            # Confirming the table counts as mapping every file, so the next run doesn't ask again.
+            return update_mapping(session, {"sources": [{"id": s.id, "role": s.role} for s in session.sources]})
+        if choice == "people":
+            raw = questionary.text("People, comma separated:", default=", ".join(p.name for p in session.people)).ask()
+            if raw:
+                session = rename_people(session, [n.strip() for n in raw.split(",") if n.strip()])
+            continue
+        source = questionary.select(
+            "Which file?",
+            choices=[questionary.Choice(mc.source_label(session, s), value=s) for s in session.sources],
+        ).ask()
+        if source is None:
+            continue
+        roles = ["camera", "mic", "ignore"] if source.kind == "video" else ["mic", "ignore"]
+        role = questionary.select("It is a", choices=roles, default=source.role if source.role in roles else roles[0]).ask()
+        if role is None:
+            continue
+        edit = {"id": source.id, "role": role}
+        if role != "ignore":
+            options = [questionary.Choice(p.name, value=p.id) for p in session.people]
+            options.append(questionary.Choice("Everyone (wide)", value="wide") if role == "camera"
+                           else questionary.Choice("Shared room mic", value=""))
+            who = questionary.select("Who does it show or record?" if role == "camera" else "Whose voice?", choices=options).ask()
+            if who is None:
+                continue
+            edit.update({"person": who, "channel_people": []})
+        session = update_mapping(session, {"sources": [edit]})
+
+
+def _open_multicam_session(target: str, people):
+    from services import multicam as mc
+
+    if os.path.isdir(target):
+        report, done = _multicam_progress("Reading files")
+        session = mc.new_session(folder=target, people=people, progress_callback=report)
+        done()
+    else:
+        session = mc.open_session(target)
+    # Reopening keeps the saved names; --people on a re-run renames them.
+    if people and people != [p.name for p in session.people]:
+        session = mc.rename_people(session, people)
+    return session
+
+
+def cmd_multicam(args):
+    """Edit a full multicam episode: map every file, sync, auto-cut, then render or export.
+
+    With --json, everything human goes to stderr and stdout carries exactly one
+    JSON object: the edit (plus activity and transcript when asked), a deletion
+    receipt, or {"error": ...}. Scripts and the cloud worker rely on that.
+    """
+    import contextlib
+    from services import multicam as mc
+
+    out = sys.stdout
+
+    def fail(message: str, code: int):
+        sys.stdout.flush()
+        if args.json:
+            print(json.dumps({"error": message}), file=out)
+        print(f"  ✗ {message}", file=sys.stderr)
+        sys.exit(code)
+
+    target = _clean_path(args.target) if args.target else ""
+    if target == "list":
+        sessions = mc.list_sessions()
+        if args.json:
+            print(json.dumps({"sessions": sessions}))
+            return
+        if not sessions:
+            print("  No multicam edits yet. Start one with: podcli multicam <folder>")
+        for s in sessions:
+            state = "rendered" if s["video"] else f"{s['shots']} shots" if s["shots"] else "synced" if s["synced"] else "mapped"
+            print(f"  {s['session_id']}  {s['name'][:32]:<32} {s['sources']} files  {state}")
+        return
+    if not target:
+        if args.json:
+            fail("Give an episode folder, a session id, or list.", 2)
+        print("  Usage: podcli multicam <folder | session id | list> [options]\n"
+              "  Example: podcli multicam ~/Podcasts/ep12 --people \"Nika, Ana\"")
+        sys.exit(2)
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext():
+            result = _run_multicam(args, mc, target)
+            data = result
+            if isinstance(result, mc.MulticamSession):
+                data = mc.payload(result)
+                if args.json and args.activity:
+                    data["activity"] = mc.activity(result)
+                if args.json and args.transcript:
+                    data["transcript"] = mc.transcript(result, model_size=args.model, engine=args.engine)
+        if args.json and data is not None:
+            print(json.dumps(data, allow_nan=False), file=out)
+    except Exception as e:
+        fail(str(e) or type(e).__name__, 1)
+
+
+def _load_json(path: str, what: str):
+    try:
+        with open(_clean_path(path), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"Can't read the {what} from {path}: {e}")
+
+
+def _load_cuts(path: str) -> list:
+    data = _load_json(path, "cut")
+    return data.get("cuts", data) if isinstance(data, dict) else data
+
+
+def _run_multicam(args, mc, target: str):
+    if args.delete:
+        session = (mc.find_session(mc.collect_files(target)) if os.path.isdir(target)
+                   else mc.MulticamSession.load(target))
+        if not session:
+            raise ValueError(f"No multicam edit for {target}")
+        mc.delete_session(session.session_id)
+        print(f"  ✓ Deleted multicam edit {session.session_id}. Your recordings are untouched.")
+        return {"deleted": True, "session_id": session.session_id}
+
+    if args.pull:
+        return _pull_multicam(args, mc, target)
+
+    people = [n.strip() for n in (args.people or "").split(",") if n.strip()] or None
+    session = _open_multicam_session(target, people)
+    if args.state:
+        session = mc.apply_state(session, _load_json(args.state, "saved edit"))
+    session = _apply_multicam_fixes(session, args.set or [])
+    if args.guests is not None:
+        guests = {n.strip().lower() for n in args.guests.split(",") if n.strip()}
+        unknown = guests - {p.name.lower() for p in session.people}
+        if unknown:
+            raise ValueError(f"No person named {sorted(unknown)[0]!r}. People: {', '.join(p.name for p in session.people)}")
+        session = mc.update_mapping(session, {"people": [
+            {"id": p.id, "name": p.name, "role": "guest" if p.name.lower() in guests else "host"} for p in session.people
+        ]})
+
+    guessed = any(s.guessed and s.role != "ignore" for s in session.sources)
+    if guessed and sys.stdin.isatty() and sys.stdout.isatty() and not (args.yes or args.json):
+        session = _review_multicam_interactively(session)
+        if session is None:
+            return None
+    else:
+        _multicam_table(session)
+        if guessed:
+            print("  Using the guessed roles above. Fix any with --set FILE=ROLE:NAME.")
+
+    if args.resync or mc.needs_sync(session):
+        report, done = _multicam_progress("Syncing")
+        session = mc.sync_session(session, force=args.resync, progress_callback=report)
+        done()
+        _multicam_table(session)
+        if mc.needs_sync(session):
+            failed = [s for s in session.sources if not s.virtual and s.role != "ignore" and not s.synced]
+            numbers = {s.id: i for i, s in enumerate(session.sources, 1)}
+            names = ", ".join(f"{numbers[s.id]} ({mc.source_label(session, s)})" for s in failed)
+            raise ValueError(f"Couldn't sync {names}. Ignore it with --set {numbers[failed[0].id]}=ignore, "
+                             "or set its offset in the studio (podcli ui).")
+
+    cut_edits = {
+        **({"range_start": args.start} if args.start is not None else {}),
+        **({"range_end": args.end} if args.end is not None else {}),
+        **({"cut_settings": {k: v for k, v in (("style", args.style), ("min_shot", args.min_shot),
+                                               ("max_shot", args.max_shot)) if v is not None}}
+           if any(v is not None for v in (args.style, args.min_shot, args.max_shot)) else {}),
+        **({"look": args.look} if args.look else {}),
+    }
+    if cut_edits:
+        session = mc.update_mapping(session, cut_edits)
+    if args.timeline and (args.cuts or args.removals):
+        raise ValueError("--timeline sets the cut and the removals itself. Drop --cuts and --removals.")
+    if args.timeline:
+        got = mc.import_timeline(session, args.timeline)
+        print(f"  ✓ Took the cut from {os.path.basename(args.timeline)}: {got['shots']} shots, "
+              f"{got['removals']} stretches removed"
+              + (f", {got['skipped_clips']} clips of other files left out" if got["skipped_clips"] else ""))
+    elif args.cuts:
+        session = mc.set_cuts(session, _load_cuts(args.cuts))
+    elif not session.cuts:
+        report, done = _multicam_progress("Cutting")
+        session = mc.plan_session(session, progress_callback=report)
+        done()
+    if args.removals:
+        data = _load_json(args.removals, "removals")
+        session = mc.set_removals(session, data.get("removals", []) if isinstance(data, dict) else data)
+    stats = mc.cut_stats(session)
+    names = {s.id: mc.source_label(session, s) for s in session.sources}
+    share = ", ".join(f"{names[k]} {v:.0%}" for k, v in sorted(stats["share"].items(), key=lambda kv: -kv[1]))
+    print(f"\n  {stats['shots']} shots over {_fmt_time(stats['duration'])}, average {stats['average_shot']:.1f}s, "
+          f"{mc.resolved_style(session)} style  ({share})")
+    if session.removals:
+        removed = sum(r["end"] - r["start"] for r in session.removals)
+        print(f"  {len(session.removals)} stretches removed, {_fmt_time(removed)} in all")
+    if args.activity and not args.json:
+        spoken = mc.activity(session)["people"]
+        print("  Talk time: " + ", ".join(
+            f"{p.name} {_fmt_time(sum(b - a for a, b in spoken.get(p.id, [])))}" for p in session.people))
+
+    for fmt in (["premiere", "fcpxml"] if args.export == "all" else [args.export] if args.export else []):
+        try:
+            print(f"  ✓ {mc.export_xml(session, fmt, review=args.review)}")
+        except ValueError as e:
+            print(f"  ! Skipped the {fmt} export: {e}", file=sys.stderr)
+    if args.transcript:
+        report, done = _multicam_progress("Transcribing")
+        words = mc.transcript(session, model_size=args.model, engine=args.engine, progress_callback=report)["words"]
+        done()
+        print(f"  ✓ Transcribed {len(words)} words")
+    if args.preview:
+        report, done = _multicam_progress("Preview")
+        session = mc.build_preview(session, progress_callback=report)
+        done()
+        print(f"  ✓ Preview proxies and mix in {os.path.dirname(session.preview['audio'])}")
+    if args.cloud:
+        from services import multicam_cloud
+        report, done = _multicam_progress("Sending")
+        session = multicam_cloud.push(session, model_size=args.model, engine=args.engine, progress_callback=report)
+        done()
+        print(f"  ✓ Open the edit: {session.cloud['url']}")
+        print(f"  Render it here when you're done: podcli multicam {session.session_id} --pull")
+        return session
+    if not args.no_render:
+        _render_multicam(args, mc, session)
+    print(f"\n  Change anything and re-run: podcli multicam {session.session_id} [options]")
+    video = session.outputs.get("video")
+    if video and os.path.exists(video):
+        print(f"  Make clips from it:         podcli process \"{video}\"")
+    return session
+
+
+def _render_multicam(args, mc, session):
+    report, done = _multicam_progress("Rendering")
+    outputs = mc.render_session(session, stems=not args.no_stems, validate=args.validate, progress_callback=report)
+    done()
+    for path in [outputs["video"], *(outputs.get("stems") or [])]:
+        print(f"  ✓ {path}")
+    for warning in (outputs.get("validation") or {}).get("warnings") or []:
+        print(f"  ! {warning}", file=sys.stderr)
+
+
+def _pull_multicam(args, mc, target: str):
+    """Renders the cut made in the podcli cloud editor from the camera files on this computer."""
+    from services import multicam_cloud
+
+    session = multicam_cloud.pull(multicam_cloud.resolve(target))
+    stats = mc.cut_stats(session)
+    removed = sum(r["end"] - r["start"] for r in session.removals)
+    print(f"  Pulled the cloud edit: {stats['shots']} shots over {_fmt_time(stats['duration'])}"
+          + (f", {_fmt_time(removed)} cut out" if removed else ""))
+    for fmt in (["premiere", "fcpxml"] if args.export == "all" else [args.export] if args.export else []):
+        try:
+            print(f"  ✓ {mc.export_xml(session, fmt)}")
+        except ValueError as e:
+            print(f"  ! Skipped the {fmt} export: {e}", file=sys.stderr)
+    if not args.no_render:
+        _render_multicam(args, mc, session)
+    return session
+
+
 def cmd_process(args):
     """Full auto pipeline: transcribe → suggest → export."""
     from services.clip_generator import generate_clip
@@ -551,6 +1060,14 @@ def cmd_process(args):
         print(f"Error: Video not found: {video_path}", file=sys.stderr)
         sys.exit(1)
 
+    # An episode with no picture is cut the same way and drawn differently. Said
+    # here rather than discovered later: this used to run all the way through
+    # Whisper and then die inside get_dimensions on "No video stream found".
+    from services.audiogram import is_audio_only
+    if is_audio_only(video_path):
+        print("  Audio-only episode: clips will be rendered as audiograms "
+              "(waveform + captions).")
+
     # Resolve transcript from preset if not given on CLI
     if not args.transcript and config.get("transcript_path"):
         args.transcript = config["transcript_path"]
@@ -563,6 +1080,11 @@ def cmd_process(args):
         if merged != global_corr:
             save_corrections(merged)
 
+    # A named look, fetched from the account it belongs to. Applied before the
+    # flags below, so anything typed on the command line still wins over it.
+    if getattr(args, "template", None):
+        _apply_template(config, args.template)
+
     # CLI overrides
     if getattr(args, "engine", None):
         os.environ["PODCLI_ENGINE"] = args.engine
@@ -570,14 +1092,35 @@ def cmd_process(args):
         os.environ["ASSEMBLYAI_API_KEY"] = args.assemblyai_api_key
     if args.caption_style:
         config["caption_style"] = args.caption_style
+    if getattr(args, "caption_position", None):
+        config["caption_position"] = args.caption_position
+    if getattr(args, "caption_scale", None) is not None:
+        config["caption_font_scale"] = round(args.caption_scale * 100)
     if args.crop:
         config["crop_strategy"] = args.crop
     if getattr(args, "format", None):
         config["format"] = args.format
     if getattr(args, "profile", None):
         config["profile"] = args.profile
+    if getattr(args, "name_card", None):
+        config["name_card"] = {
+            "title": args.name_card,
+            "subtitle": getattr(args, "name_card_sub", None),
+            "seconds": getattr(args, "name_card_seconds", None),
+            "accent": getattr(args, "name_card_accent", None),
+        }
+    if getattr(args, "motion", None):
+        try:
+            config["motion"] = json.loads(args.motion)
+        except (TypeError, ValueError):
+            print("  Warning: --motion is not valid JSON; using each style's own motion",
+                  file=sys.stderr)
+    if getattr(args, "bookend_fade", None) is not None:
+        config["bookend_fade"] = args.bookend_fade
     if getattr(args, "thumbnails", None) is not None:
         config["generate_thumbnails"] = args.thumbnails
+    if getattr(args, "thumbnail_placement", None):
+        config["thumbnail_placement"] = args.thumbnail_placement
     if args.top:
         config["top_clips"] = args.top
     if getattr(args, "review_each", False):
@@ -592,6 +1135,32 @@ def cmd_process(args):
         else:
             print(f"  Warning: Logo '{args.logo}' not found (checked assets and filesystem)", file=sys.stderr)
             config["logo_path"] = args.logo  # pass through anyway
+    if getattr(args, "logo_position", None):
+        config["logo_position"] = args.logo_position
+    if getattr(args, "logo_scale", None) is not None:
+        config["logo_scale"] = args.logo_scale
+    # Switched-on parts of the look. Absent stays absent: the renderer draws
+    # nothing for a key that is not here, which is what every render did before
+    # these flags existed.
+    if getattr(args, "topic", None):
+        config["topic"] = {
+            "label": args.topic,
+            "position": getattr(args, "topic_position", "top-left") or "top-left",
+        }
+    if getattr(args, "progress", False):
+        config["progress"] = (
+            {"color": args.progress_color} if getattr(args, "progress_color", None) else {}
+        )
+    if getattr(args, "brand", None):
+        try:
+            config["brand"] = json.loads(args.brand)
+        except (ValueError, TypeError):
+            print("  Warning: --brand is not valid JSON; using the default colours",
+                  file=sys.stderr)
+    if getattr(args, "style", None):
+        config["style"] = _json_object_arg(args.style, "--style")
+    if getattr(args, "font_family", None):
+        config["font_family"] = args.font_family
     if getattr(args, "no_outro", False):
         config["outro_path"] = ""
     elif args.outro:
@@ -634,6 +1203,12 @@ def cmd_process(args):
         config["no_speakers"] = True
     if getattr(args, "no_cache", False):
         config["no_cache"] = True
+    # Told rather than detected. Detection reads the opening seconds, so an
+    # episode that starts with music, an English intro clip, or a guest saying
+    # hello in a second language gets transcribed in the wrong one for its whole
+    # hour, and every caption is then a translation nobody asked for.
+    if getattr(args, "language", None):
+        config["language"] = args.language
     if args.quality:
         config["quality"] = args.quality
     if getattr(args, "allow_ass_fallback", False):
@@ -671,6 +1246,13 @@ def cmd_process(args):
         explicit_output_dir=args.output,
     )
     os.makedirs(output_dir, exist_ok=True)
+
+    # Handed over before any local analysis: the cloud worker runs this same
+    # engine, so transcribing here first would be the whole job done twice.
+    if getattr(args, "cloud", False):
+        from services import cloud_render
+        cloud_render.main(video_path, config, output_dir, args)
+        return
 
     enc_info = get_encoder_info()
     print(f"\n  podcli — processing")
@@ -722,7 +1304,12 @@ def cmd_process(args):
     if skip_transcript:
         # Reuse an existing transcript so highlight boundaries snap to whole sentences;
         # only skip transcription outright when there is none (true no-dialogue footage).
-        cached = load_cached_transcript_for_video(video_path)
+        cached = load_cached_transcript_for_video(
+            video_path,
+            engine=os.environ.get("PODCLI_ENGINE"),
+            model=config.get("whisper_model", "base"),
+            language=config.get("language"),
+        )
         if cached and not config.get("no_cache", False):
             words = cached["words"]
             segments = cached["segments"]
@@ -763,8 +1350,16 @@ def cmd_process(args):
             else:
                 print("         No cached face map, crop falls back to per-clip face tracking")
     elif not skip_transcript:
-        # Check cache first
-        cached = load_cached_transcript_for_video(video_path)
+        # Check cache first, with the same (engine, model, language) the
+        # transcribe call below would run with, so a hit here is guaranteed
+        # to be the combo this invocation actually asked for, not a
+        # different one that happens to share the file.
+        cached = load_cached_transcript_for_video(
+            video_path,
+            engine=os.environ.get("PODCLI_ENGINE"),
+            model=config.get("whisper_model", "base"),
+            language=config.get("language"),
+        )
         if cached and not config.get("no_cache", False):
             print("  [1/4] Loaded from cache (instant)")
             words = cached["words"]
@@ -808,6 +1403,7 @@ def cmd_process(args):
                     file_path=video_path,
                     model_size=config.get("whisper_model", "base"),
                     engine=os.environ.get("PODCLI_ENGINE") or None,
+                    language=config.get("language") or None,
                     enable_diarization=not config.get("no_speakers", False),
                     progress_callback=_transcribe_progress,
                     wav_path=shared_wav.get() if config.get("energy_boost", True) else None,
@@ -823,8 +1419,16 @@ def cmd_process(args):
             segments = result["segments"]
             print(f"         Done: {len(segments)} segments, {len(words)} words")
 
-            # Save to cache for next run
-            save_cached_transcript_for_video(video_path, result)
+            # Save to cache for next run, under the same key the read above
+            # checked. result["engine"] is what actually ran, which can
+            # differ from the env var on a fallback (see transcribe_file).
+            save_cached_transcript_for_video(
+                video_path,
+                result,
+                engine=result.get("engine") or os.environ.get("PODCLI_ENGINE"),
+                model=config.get("whisper_model", "base"),
+                language=config.get("language"),
+            )
 
     # Apply word corrections (Whisper misheard proper nouns, brand names)
     from services.corrections import apply_corrections
@@ -832,6 +1436,45 @@ def cmd_process(args):
 
     # Extract face_map before result gets overwritten in clip loop
     face_map = result.get("face_map")
+
+    # A map handed in on the command line wins over one the transcriber found,
+    # because the caller who bothered to pass it scanned this video rather than
+    # inferring the layout from who was speaking. It is also the only map there
+    # is when the transcript came from an engine that does not diarize, which is
+    # the case where `speaker` framing used to fall through to a letterbox.
+    given = _json_file_arg(getattr(args, "face_map", None), "--face-map")
+    if given:
+        face_map = given
+        print("         Using the face map passed in (speaker framing preserved)")
+
+    # Still nothing, and the crop about to run needs one. Scanning costs a
+    # minute on a long episode and buys back every clip in it: without a map,
+    # `speaker` and `face` skip every rung that could place a frame and land on
+    # the whole wide source letterboxed into the cut.
+    if not face_map and config.get("crop_strategy") in ("face", "speaker", "speaker-hardcut"):
+        try:
+            from services.face_analysis import analyze_faces
+            print("         No face map yet; scanning the episode for faces")
+            # The last word's end, because the scan only uses this to decide
+            # how many frames to sample; it reads the real frame count off the
+            # file itself and spreads the samples across all of it.
+            spoken = max((float(w.get("end") or 0) for w in words), default=0.0)
+            found = analyze_faces(
+                video_path,
+                [{"speaker": w["speaker"], "start": w["start"], "end": w["end"]}
+                 for w in words if w.get("speaker")],
+                spoken,
+                progress_callback=lambda p, m: None,
+            )
+        except Exception as exc:
+            print(f"         Face scan failed ({type(exc).__name__}: {exc}); "
+                  "the crop will fall back", file=sys.stderr)
+            found = None
+        if found and found.get("clusters"):
+            face_map = found
+            print(f"         Found {len(found['clusters'])} face position(s)")
+        else:
+            print("         No faces found; the crop will fall back")
 
     # Check speaker data availability (needed for smart cropping)
     speakers_in_words = set(w.get("speaker") for w in words if w.get("speaker"))
@@ -856,9 +1499,23 @@ def cmd_process(args):
     events_data = None
     reaction_times = None
     if config.get("energy_boost", True):
-        print("  [2/4] Analyzing audio energy...")
+        # The Studio has cached these since it first transcribed the episode.
+        # Reading them here is the difference between re-running YAMNet over a
+        # whole hour on every `podcli process` and not.
+        from services.signal_cache import load_signals, save_signals
+
+        cached = load_signals(video_path) if video_path else {}
+        cached_energy = cached.get("energy_data")
+        cached_events = cached.get("events_data")
+        print(
+            "  [2/4] Scoring cached audio analysis..."
+            if cached_energy and cached_events
+            else "  [2/4] Analyzing audio energy..."
+        )
         try:
-            profile = get_energy_profile(video_path, segments, wav_path=shared_wav.get())
+            profile = get_energy_profile(
+                video_path, segments, wav_path=shared_wav.get(), energy_data=cached_energy
+            )
             energy_scores = profile["segment_scores"]
             energy_data = profile["energy_data"]
             print(f"         {len(profile['peak_times'])} peak moments found")
@@ -866,7 +1523,9 @@ def cmd_process(args):
             print(f"         Skipped (error: {e})")
         if audio_events_available():
             try:
-                reactions = get_event_profile(video_path, segments, wav_path=shared_wav.get())
+                reactions = get_event_profile(
+                    video_path, segments, wav_path=shared_wav.get(), events_data=cached_events
+                )
                 reaction_scores = reactions["segment_scores"]
                 events_data = reactions["events_data"]
                 reaction_times = reactions["reaction_times"]
@@ -875,6 +1534,10 @@ def cmd_process(args):
                     print(f"         {n} laughter/reaction moments found")
             except Exception as e:
                 print(f"         Reactions skipped (error: {e})")
+        # Written even on a cache hit so a run that only had one half fills the
+        # other, and so the Studio sees what the CLI just computed.
+        if video_path and (energy_data or events_data):
+            save_signals(video_path, energy_data=energy_data, events_data=events_data)
     else:
         print("  [2/4] Audio analysis skipped (--no-energy)")
 
@@ -923,7 +1586,7 @@ def cmd_process(args):
     # Try an AI CLI first (uses PodStack knowledge base for intelligent selection)
     from services import ai_provider
     from services.ai_cli import _engine_label
-    from services.claude_suggest import blend_signal_scores, suggest_initial_with_claude
+    from services.claude_suggest import ClipBounds, select_clips_with_signal_scores, suggest_initial_with_claude
 
     providers = ai_provider.status()["providers"]
     if clips:
@@ -931,14 +1594,22 @@ def cmd_process(args):
     elif providers and config.get("ai_select", True):
         ai_label = providers[0]["label"]
         print(f"  [3/4] Selecting moments with {ai_label} (PodStack)...")
+        candidate_top_n = top_n * 2
         clips = suggest_initial_with_claude(
             segments=segments,
-            top_n=top_n,
+            top_n=candidate_top_n,
             progress_callback=lambda pct, msg: print(f"         {msg}") if msg else None,
             reaction_times=reaction_times,
+            bounds=ClipBounds.of(config.get("format"), *_explicit_clip_bounds(config)),
         )
         if clips:
-            blend_signal_scores(clips, energy_data=energy_data, events_data=events_data)
+            clips = select_clips_with_signal_scores(
+                clips,
+                top_n=top_n,
+                energy_data=energy_data,
+                events_data=events_data,
+                progress_callback=lambda pct, msg: print(f"         {msg}") if msg else None,
+            )
             engine_id = next((c.get("_ai_engine") for c in clips if c.get("_ai_engine")), "")
             actual_engine = _engine_label(engine_id) if engine_id in ("claude", "codex") else ai_label
             print(f"         ✓ {actual_engine} selected {len(clips)} clips")
@@ -1006,7 +1677,14 @@ def cmd_process(args):
                 )
         except Exception:
             pass
+    if config.get("thumbnail_seconds"):
+        _thumb_intro_duration = float(config["thumbnail_seconds"])
     _thumb_intro_duration = max(0.5, min(_thumb_intro_duration, 1.0))
+
+    # Where the picture goes in the video, which is a separate question from
+    # whether one is drawn at all. "start" keeps what podcli has always done.
+    _thumb_placement = config.get("thumbnail_placement", "start")
+    _thumb_style = config.get("thumbnail_style") or None
 
     # Per-clip content generation needs any provider, not specifically a binary.
     from services import ai_provider
@@ -1019,7 +1697,7 @@ def cmd_process(args):
     _thumb_photo = None
     if _thumb_enabled:
         try:
-            from services.thumbnail_ai import generate_variations as _tv, thumbnail_to_video_frame as _ttv
+            from services.thumbnail_ai import render_variations as _tv, thumbnail_to_video_frame as _ttv
             _thumb_gen = _tv
             _thumb_to_video = _ttv
             _thumb_logo = config.get("logo_path") or None
@@ -1048,6 +1726,15 @@ def cmd_process(args):
                         start_second=clip["start_second"],
                         end_second=clip["end_second"],
                         caption_style=config.get("caption_style", "branded"),
+                        caption_position=config.get("caption_position", "auto"),
+                        caption_font_scale=config.get("caption_font_scale", 100),
+                        logo_position=config.get("logo_position", "top-left"),
+                        logo_scale=config.get("logo_scale", 1.0),
+                        topic=config.get("topic"),
+                        progress=config.get("progress"),
+                        brand=config.get("brand"),
+                        theme=config.get("style"),
+                        font_family=config.get("font_family"),
                         crop_strategy=config.get("crop_strategy", "face"),
                         format=config.get("format", "vertical"),
                         transcript_words=words,
@@ -1056,7 +1743,11 @@ def cmd_process(args):
                         logo_path=config.get("logo_path") or None,
                         outro_path=config.get("outro_path") or None,
                         intro_path=config.get("intro_path") or None,
+                        name_card=config.get("name_card"),
+                        motion=config.get("motion"),
+                        bookend_fade=config.get("bookend_fade", 0.0),
                         keep_segments=clip.get("segments"),
+                        hook=_clip_hook(clip),
                         face_map=face_map,
                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                         use_ass_captions=config.get("use_ass_captions", False),
@@ -1080,7 +1771,7 @@ def cmd_process(args):
                         output_path=os.path.join(clip_thumb_dir, "_lead_frame.jpg"),
                         start_second=result.get("start_second", clip.get("start_second", 0)),
                     )
-                    thumb_paths = _thumb_gen(
+                    rendered_thumbs = _thumb_gen(
                         title=clip.get("title", f"Clip {i+1}"),
                         output_dir=clip_thumb_dir,
                         photo_path=lead_frame or _thumb_photo,
@@ -1088,8 +1779,19 @@ def cmd_process(args):
                         start_second=result.get("start_second", clip.get("start_second")),
                         end_second=result.get("end_second", clip.get("end_second")),
                         logo_path=_thumb_logo,
+                        config=_thumb_style,
+                        grounding=_clip_grounding(clip),
+                        face_map=face_map,
+                        segments=segments,
                     )
-                    if thumb_paths:
+                    thumb_paths = rendered_thumbs["paths"]
+                    _pair = rendered_thumbs["pair"]
+                    if _pair and _pair["layout"] != "pair":
+                        print(f"                 ℹ {_pair['reason']}")
+                    if thumb_paths and _thumb_placement == "off":
+                        print(f"                 + {len(thumb_paths)} thumbnail(s) in "
+                              f"{os.path.basename(clip_thumb_dir)}/")
+                    elif thumb_paths:
                         thumb_video = os.path.join(clip_thumb_dir, "thumb_frame.mp4")
                         _thumb_to_video(thumb_paths[0], thumb_video, duration=_thumb_intro_duration)
                         from services.video_processor import concat_outro
@@ -1262,6 +1964,15 @@ def cmd_process(args):
                                 start_second=clip["start_second"],
                                 end_second=clip["end_second"],
                                 caption_style=config.get("caption_style", "branded"),
+                                caption_position=config.get("caption_position", "auto"),
+                                caption_font_scale=config.get("caption_font_scale", 100),
+                                logo_position=config.get("logo_position", "top-left"),
+                                logo_scale=config.get("logo_scale", 1.0),
+                                topic=config.get("topic"),
+                                progress=config.get("progress"),
+                                brand=config.get("brand"),
+                                theme=config.get("style"),
+                                font_family=config.get("font_family"),
                                 crop_strategy=config.get("crop_strategy", "face"),
                                 format=config.get("format", "vertical"),
                                 transcript_words=words,
@@ -1271,9 +1982,12 @@ def cmd_process(args):
                                 outro_path=config.get("outro_path") or None,
                                 intro_path=config.get("intro_path") or None,
                                 keep_segments=clip.get("segments"),
+                                hook=_clip_hook(clip),
                                 face_map=face_map,
                                 allow_ass_fallback=config.get("allow_ass_fallback", False),
                                 use_ass_captions=config.get("use_ass_captions", False),
+                                name_card=config.get("name_card"),
+                                bookend_fade=config.get("bookend_fade", 0.0),
                             )
                             results[-1] = result
                             print(f"         ✓ Re-rendered: {result['file_size_mb']}MB")
@@ -1520,6 +2234,24 @@ def _review_clips(clips: list, segments: list, energy_scores: list | None, confi
                 print(f"         No additional suggestions found.")
 
 
+def _clip_hook(clip: dict) -> dict | None:
+    """The clip's opening hook when it still fits the clip, else None.
+
+    Review can move a clip's edges after the hook was proposed. A hook left
+    outside the body would fail the whole render, so it is dropped with a note
+    and the clip renders without it.
+    """
+    from services.opening_hook import validate_hook
+
+    if not clip.get("hook"):
+        return None
+    try:
+        return validate_hook(clip["hook"], clip["start_second"], clip["end_second"], clip.get("segments"))
+    except ValueError as e:
+        print(f"         Opening hook dropped: {e}")
+        return None
+
+
 def _filter_duplicate_clip_suggestions(candidates: list, existing: list, overlap_threshold: float = 5.0) -> list:
     """Drop suggestions that significantly overlap already-selected clips."""
     filtered = []
@@ -1596,9 +2328,11 @@ def _post_render_loop(
                     outro_path=config.get("outro_path") or None,
                     intro_path=config.get("intro_path") or None,
                     keep_segments=clip.get("segments"),
+                    hook=_clip_hook(clip),
                     face_map=face_map,
                     allow_ass_fallback=config.get("allow_ass_fallback", False),
                     use_ass_captions=config.get("use_ass_captions", False),
+                    theme=config.get("style"),
                 )
                 r["result"] = new_result
                 ok = True
@@ -1782,9 +2516,11 @@ def _post_render_loop(
                                         outro_path=config.get("outro_path") or None,
                                         intro_path=config.get("intro_path") or None,
                                         keep_segments=f_clip.get("segments"),
+                                        hook=_clip_hook(f_clip),
                                         face_map=face_map,
                                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                                         use_ass_captions=config.get("use_ass_captions", False),
+                                        theme=config.get("style"),
                                     )
                                     rendered.append({"clip": f_clip, "result": new_result, "index": len(clips)})
                                     clips.append(f_clip)
@@ -1838,9 +2574,11 @@ def _post_render_loop(
                                         outro_path=config.get("outro_path") or None,
                                         intro_path=config.get("intro_path") or None,
                                         keep_segments=nc.get("segments"),
+                                        hook=_clip_hook(nc),
                                         face_map=face_map,
                                         allow_ass_fallback=config.get("allow_ass_fallback", False),
                                         use_ass_captions=config.get("use_ass_captions", False),
+                                        theme=config.get("style"),
                                     )
                                     rendered.append({"clip": nc, "result": new_result, "index": len(clips)})
                                     clips.append(nc)
@@ -2451,12 +3189,30 @@ def cmd_thumbnail_config(args):
     raise ValueError(f"unknown thumbnail-config action: {action}")
 
 
+def _clip_grounding(clip: dict) -> dict | None:
+    """A suggestion's payoff, question and opening line, for grounding thumbnail copy."""
+    grounding = {k: clip.get(k) for k in ("payoff", "context_line", "preview_text")}
+    return grounding if any(grounding.values()) else None
+
+
+def _grounding_from_args(args) -> dict | None:
+    """Collect the clip's payoff/question/opening-line CLI flags into the dict
+    thumbnail_ai expects, or None if the caller passed none of them (e.g. a
+    bare title with no clip behind it, as in the standalone thumbnail studio)."""
+    grounding = {
+        "payoff": getattr(args, "payoff", None),
+        "context_line": getattr(args, "context_line", None),
+        "preview_text": getattr(args, "preview_text", None),
+    }
+    return grounding if any(grounding.values()) else None
+
+
 def cmd_thumbnail_options(args):
     """Emit candidate headline text pairs and face frames for the thumbnail picker."""
     from services.thumbnail_ai import generate_headline_variations, extract_candidate_frames
 
     os.makedirs(args.output, exist_ok=True)
-    texts = generate_headline_variations(args.title, args.texts) or []
+    texts = generate_headline_variations(args.title, args.texts, grounding=_grounding_from_args(args)) or []
     frames = []
     if args.video:
         frames = extract_candidate_frames(
@@ -2466,33 +3222,115 @@ def cmd_thumbnail_options(args):
     print(json.dumps({"texts": [list(t) for t in texts], "frames": frames}))
 
 
+_BROWSER_IMAGE_FORMATS = {"PNG", "JPEG", "WEBP", "GIF", "AVIF", "BMP", "ICO"}
+
+
+def _check_frame(path):
+    """Refuse a frame the renderer would fail to draw, while it is still a message.
+
+    A thumbnail is an HTML page photographed by headless Chrome, so the frame is
+    an <img>. A file the browser cannot decode is not an error there: the page
+    renders anyway, the caption box and the logo land on bg_color, and this
+    command exits 0 with a path to a blank card carrying a 15px broken-image
+    glyph. A missing frame is worse, because it also moves the box to the
+    no-photo height. Callers cannot tell either apart from a picture that
+    worked, so neither is allowed past here.
+    """
+    if not os.path.exists(path):
+        print(f"thumbnail render failed: no frame at {path}", file=sys.stderr)
+        sys.exit(1)
+    if path.lower().endswith(".svg"):
+        return
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            fmt = im.format
+    except Exception as err:
+        print(f"thumbnail render failed: {path} is not an image ({err})", file=sys.stderr)
+        sys.exit(1)
+    if fmt not in _BROWSER_IMAGE_FORMATS:
+        print(
+            f"thumbnail render failed: {path} is {fmt}, which the renderer cannot draw. "
+            "Convert it to PNG, JPEG or WebP first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _pair_from_args(args, output_dir: str) -> dict | None:
+    """The two-person panels the thumbnail flags ask for, or None for one face.
+
+    The template's own layout applies when --layout is not given. Speaker
+    turns and the face map come from the cached transcript of --video.
+    """
+    from services.thumbnail_ai import _load_brand_config, resolve_pair
+
+    video = getattr(args, "video", None)
+    cached = _cached_transcript(video) if video else {}
+    try:
+        return resolve_pair(
+            _load_brand_config(), output_dir, video,
+            getattr(args, "start", None), getattr(args, "end", None),
+            layout=getattr(args, "layout", None),
+            left_image=getattr(args, "left_image", None),
+            right_image=getattr(args, "right_image", None),
+            swap=bool(getattr(args, "swap", False)),
+            face_map=cached.get("face_map"), segments=cached.get("segments"),
+        )
+    except ValueError as err:
+        print(f"thumbnail failed: {err}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _layout_report(pair: dict | None) -> dict:
+    """What a thumbnail result says about its layout: which people, from which source seconds."""
+    if not pair:
+        return {"layout": "single"}
+    if pair["layout"] != "pair":
+        return {"layout": "single", "note": pair["reason"]}
+    return {"layout": "pair", "roles": pair["roles"], "swapped": pair["swapped"], "people": pair["people"]}
+
+
 def cmd_thumbnail_render(args):
     """Render one final thumbnail from a chosen frame + headline.
 
     Empty line1/line2 let the AI write the text; a chosen frame is used as-is.
+    With the pair layout the two people come from --video between --start and
+    --end, or from --left-image and --right-image, and the frame is the
+    fallback when two people cannot be told apart.
     """
     from services.thumbnail_ai import generate_thumbnail_with_template
     from services.asset_store import resolve_logo
 
-    frame_info = json.loads(args.frame_info) if args.frame_info else None
+    pair = _pair_from_args(args, os.path.dirname(os.path.abspath(args.output)))
+    people = pair["people"] if pair and pair["layout"] == "pair" else None
+    if not people:
+        if not args.frame:
+            reason = f" {pair['reason']}" if pair else ""
+            print(f"thumbnail render failed: no frame to fall back on.{reason}", file=sys.stderr)
+            sys.exit(1)
+        _check_frame(args.frame)
+    frame_info = json.loads(args.frame_info) if args.frame_info and not people else None
     out = generate_thumbnail_with_template(
         title=args.title,
-        frame_path=args.frame,
+        frame_path=None if people else args.frame,
         output_path=args.output,
         logo_path=resolve_logo(args.logo) if args.logo else None,
         frame_info=frame_info,
         line1_override=args.line1 or None,
         line2_override=args.line2 or None,
+        grounding=_grounding_from_args(args),
+        people=people,
     )
     if not out:
         print("thumbnail render failed", file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"path": out}))
+    print(json.dumps({"path": out, **_layout_report(pair)}))
 
 
 def cmd_thumbnails(args):
     """Generate thumbnail variations for a title."""
-    from services.thumbnail_ai import generate_variations
+    from services.thumbnail_ai import render_variations
     from services.asset_store import resolve as resolve_asset, resolve_logo
 
     accent = "\033[38;2;212;135;74m"
@@ -2536,23 +3374,41 @@ def cmd_thumbnails(args):
         print(f"\n  {bold}Generating {args.variations} thumbnail variations...{reset}")
         print(f"  Title: {accent}{args.title}{reset}")
 
-    paths = generate_variations(
-        title=args.title,
-        output_dir=args.output,
-        photo_path=photo,
-        video_path=video,
-        start_second=getattr(args, "start", None),
-        end_second=getattr(args, "end", None),
-        logo_path=logo,
-        config={"variations": args.variations},
-        line1=getattr(args, "line1", None),
-        line2=getattr(args, "line2", None),
-    )
+    cached = _cached_transcript(video) if video else {}
+    try:
+        rendered = render_variations(
+            title=args.title,
+            output_dir=args.output,
+            photo_path=photo,
+            video_path=video,
+            start_second=getattr(args, "start", None),
+            end_second=getattr(args, "end", None),
+            logo_path=logo,
+            config={"variations": args.variations},
+            line1=getattr(args, "line1", None),
+            line2=getattr(args, "line2", None),
+            layout=getattr(args, "layout", None),
+            left_image=getattr(args, "left_image", None),
+            right_image=getattr(args, "right_image", None),
+            swap=bool(getattr(args, "swap", False)),
+            face_map=cached.get("face_map"),
+            segments=cached.get("segments"),
+        )
+    except ValueError as err:
+        print(f"  {red}✗{reset} {err}", file=sys.stderr)
+        sys.exit(1)
+    paths = rendered["paths"]
+    report = _layout_report(rendered["pair"])
 
     if as_json:
-        print(json.dumps({"paths": paths}))
+        print(json.dumps({"paths": paths, **report}))
         return
 
+    if report.get("note"):
+        print(f"  {gray}{report['note']}{reset}")
+    for person in report.get("people", []):
+        when = f" at {person['source_time']:.1f}s" if person.get("source_time") is not None else ""
+        print(f"  {gray}{person['side'].capitalize()}: {person.get('role') or 'person'}{when}{reset}")
     for p in paths:
         print(f"  {green}✓{reset} {p}")
     print(f"\n  {gray}Open the folder to preview and pick the best one.{reset}\n")
@@ -3373,6 +4229,40 @@ def cmd_cache(args):
     print(f"  {gray}Run {accent}podcli cache clear{reset} {gray}to delete all{reset}\n")
 
 
+def cmd_compare_engines(args):
+    """Transcribe the same sample window with two engines and report where they disagree."""
+    from services.engine_comparison import compare_engines
+
+    accent = "\033[38;2;212;135;74m"
+    gray = "\033[38;5;245m"
+    reset = "\033[0m"
+
+    if not os.path.exists(args.video):
+        print(f"podcli: file not found: {args.video}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Comparing {accent}{args.engine_a}{reset} vs {accent}{args.engine_b}{reset} "
+          f"on {args.duration:.0f}s starting at {args.start:.0f}s...")
+
+    report = compare_engines(
+        args.video,
+        args.engine_a,
+        args.engine_b,
+        start_seconds=args.start,
+        duration_seconds=args.duration,
+        window_seconds=args.window,
+        model_size=args.model_size,
+        language=args.language,
+        output_dir=args.output,
+    )
+
+    print(f"\nOverall disagreement: {accent}{report['overall_disagreement']:.2f}{reset} "
+          f"(0 = identical output, 1 = completely different; not accuracy against a transcript)")
+    if report["both_empty_window_count"]:
+        print(f"{gray}{report['both_empty_window_count']} window(s) had no words from either engine{reset}")
+    print(f"{gray}Wrote {report['json_path']} and {report['html_path']}{reset}")
+
+
 def cmd_info(args):
     """Show system info."""
     from services.encoder import get_encoder_info
@@ -3605,7 +4495,7 @@ def print_help():
     print(f"    {green}-n{reset}, {green}--top{reset} {gray}<N>{reset}            Export top N clips {dim}(default: 5){reset}")
     print(f"    {green}-o{reset}, {green}--output{reset} {gray}<dir>{reset}        Output directory {dim}(default: ./clips){reset}")
     print(f"    {green}-p{reset}, {green}--preset{reset} {gray}<name>{reset}       Load a saved preset")
-    print(f"    {green}--caption-style{reset} {gray}<style>{reset}  branded | hormozi | karaoke | subtle")
+    print(f"    {green}--caption-style{reset} {gray}<style>{reset}  branded | hormozi | karaoke | outline | subtle")
     print(f"    {green}--crop{reset} {gray}<strategy>{reset}       speaker | speaker-hardcut | face | center")
     print(f"    {green}--fast{reset}                 Draft mode: tiny Whisper, heuristic clips, low quality")
     print(f"    {green}--logo{reset} {gray}<asset|path>{reset}     Overlay logo image")
@@ -3641,31 +4531,183 @@ def print_help():
     print()
 
 
-def cmd_login(args):
-    import getpass
+def cmd_templates(args):
+    """List the looks this account can cut in."""
     from services import podcli_cloud
 
-    email = (args.email or input("Email: ")).strip()
-    # Prefer the prompt: a password in argv is visible in ps output and lands in
-    # the user's shell history.
-    password = args.password or getpass.getpass("Password: ")
-    if not email or not password:
-        print("Email and password are required.")
+    accent = "\033[38;2;212;135;74m"
+    gray = "\033[38;5;245m"
+    bold = "\033[1m"
+    reset = "\033[0m"
+
+    if not podcli_cloud.signed_in():
+        print(f"\n  Templates come with podcli Pro.")
+        print(f"  {gray}Sign in with{reset} {accent}podcli login{reset}"
+              f"{gray}, or set the look with flags:{reset}")
+        print(f"  {gray}--caption-style --crop --format --logo --name-card --motion{reset}\n")
+        return
+
+    try:
+        found = podcli_cloud.templates()
+    except podcli_cloud.CloudError as exc:
+        print(f"  Could not load templates: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not found:
+        print(f"\n  {gray}No templates yet. Make one in the studio.{reset}\n")
+        return
+
+    print()
+    for template in found:
+        look = template.get("config") or {}
+        cut = look.get("cut") or {}
+        facts = [
+            (look.get("captions") or {}).get("preset"),
+            cut.get("crop"),
+            cut.get("format"),
+        ]
+        mark = f" {accent}default{reset}" if template.get("is_default") else ""
+        print(f"  {bold}{template.get('name', '?')}{reset}{mark}")
+        print(f"    {gray}{' · '.join(f for f in facts if f)}{reset}")
+    print(f"\n  {gray}Use one:{reset} {accent}podcli process video.mp4 --template "
+          f"\"{found[0].get('name', 'Default')}\"{reset}\n")
+
+
+def _apply_template(config: dict, name_or_id: str) -> None:
+    """Fill the render config from a Pro template.
+
+    Templates live with the account rather than on a machine, so the same name
+    means the same look on a laptop and in the studio. Everything a template
+    sets is something this CLI already takes as a flag — the template is a name
+    for a set of them, not a second way to render.
+    """
+    from services import podcli_cloud
+
+    if not podcli_cloud.signed_in():
+        print("  Templates come with podcli Pro. Sign in with `podcli login`, "
+              "or set the look with flags.", file=sys.stderr)
         sys.exit(1)
 
     try:
-        podcli_cloud.login(email, password)
-        account = podcli_cloud.me()
-        podcli_cloud.remember_plan(account.get("plan", ""))
+        template = podcli_cloud.find_template(name_or_id)
+    except podcli_cloud.CloudError as exc:
+        print(f"  Could not load templates: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not template:
+        try:
+            known = ", ".join(t.get("name", "?") for t in podcli_cloud.templates()) or "none yet"
+        except podcli_cloud.CloudError:
+            known = "unknown"
+        print(f"  No template called '{name_or_id}'. This account has: {known}", file=sys.stderr)
+        sys.exit(1)
+
+    look = template.get("config") or {}
+    cut = look.get("cut") or {}
+    if cut.get("crop"):
+        config["crop_strategy"] = cut["crop"]
+    if cut.get("format"):
+        config["format"] = cut["format"]
+    if cut.get("topN"):
+        config["top_clips"] = cut["topN"]
+    if (look.get("captions") or {}).get("preset"):
+        config["caption_style"] = look["captions"]["preset"]
+
+    # The template says which of the show's assets take part; the asset store
+    # says which file each one is.
+    from services.asset_store import default_intro, default_logo, default_outro
+
+    if (look.get("watermark") or {}).get("enabled"):
+        config["logo_path"] = config.get("logo_path") or default_logo()
+    if (look.get("intro") or {}).get("kind") == "asset":
+        config["intro_path"] = config.get("intro_path") or default_intro()
+    if (look.get("outro") or {}).get("kind") == "asset":
+        config["outro_path"] = config.get("outro_path") or default_outro()
+
+    card = look.get("thumbnailCard") or {}
+    if card:
+        config["generate_thumbnails"] = bool(card.get("auto", True))
+        config["thumbnail_placement"] = card.get("placement", "off")
+        if card.get("seconds"):
+            config["thumbnail_seconds"] = card["seconds"]
+        if card.get("style"):
+            config["thumbnail_style"] = card["style"]
+
+    print(f"  Template: {template.get('name', name_or_id)}")
+
+
+def cmd_login(args):
+    """
+    Sign in through the browser, so no password is ever typed at a terminal.
+
+    A password at the prompt lands in scrollback, and one passed as a flag lands
+    in shell history and in `ps`. The browser already holds a session; this asks
+    podcli.com to lend one to this machine.
+    """
+    import getpass
+    import socket
+    import time
+    import webbrowser
+    from services import podcli_cloud
+
+    accent = "\033[38;2;212;135;74m"
+    gray = "\033[38;5;245m"
+    bold = "\033[1m"
+    reset = "\033[0m"
+
+    label = f"{getpass.getuser()}@{socket.gethostname()}"
+    try:
+        start = podcli_cloud.start_cli_auth(label)
     except podcli_cloud.CloudError as exc:
         print(f"Sign-in failed: {exc}")
         sys.exit(1)
 
+    url, code = start["verifyUrl"], start["userCode"]
+    print(f"\n  Approve this machine at {accent}{url}{reset}")
+    print(f"  Your code is {bold}{code}{reset}")
+    print(f"  {gray}Only approve it if your browser shows the same code.{reset}\n")
+
+    # A machine without a browser is the normal case over SSH, and opening one
+    # there prints an error into the middle of the code we just asked them to
+    # read. The link above is the fallback either way.
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    interval = max(1, int(start.get("interval") or 3))
+    deadline = time.monotonic() + int(start.get("expiresIn") or 600)
+    session = None
+    print(f"  {gray}Waiting for approval…{reset}", end="", flush=True)
+    while session is None and time.monotonic() < deadline:
+        time.sleep(interval)
+        try:
+            session = podcli_cloud.poll_cli_auth(start["deviceCode"])
+        except podcli_cloud.CloudError as exc:
+            # A dropped connection mid-wait is not a refusal; the request is
+            # still open on the server and the next poll picks it back up.
+            if not exc.retryable and exc.status:
+                print(f"\r  {exc}{' ' * 20}")
+                sys.exit(1)
+    print("\r" + " " * 40 + "\r", end="")
+
+    if session is None:
+        print("  That code expired. Run `podcli login` again.")
+        sys.exit(1)
+
+    try:
+        account = podcli_cloud.me()
+        podcli_cloud.remember_plan(account.get("plan", ""))
+    except podcli_cloud.CloudError as exc:
+        print(f"Signed in, but the account could not be read: {exc}")
+        sys.exit(1)
+
     workspace = account.get("workspace") or {}
-    print(f"Signed in to {workspace.get('name', 'your workspace')} "
+    print(f"  Signed in to {workspace.get('name', 'your workspace')} "
           f"({account.get('plan', 'free')} plan, {account.get('role', 'member')}).")
     if account.get("plan") == "free":
-        print("This workspace has no active subscription — podcli will keep using "
+        print("  This workspace has no active subscription — podcli will keep using "
               "your local AI CLI until one starts.")
 
     # Everything already rendered on this machine belongs in the workspace too,
@@ -3675,9 +4717,9 @@ def cmd_login(args):
     except Exception:
         synced, failed = 0, 0
     if synced:
-        print(f"Synced {synced} existing clip{'s' if synced != 1 else ''} to your workspace.")
+        print(f"  Synced {synced} existing clip{'s' if synced != 1 else ''} to your workspace.")
     if failed:
-        print(f"{failed} could not be synced — `podcli whoami` will retry later.")
+        print(f"  {failed} could not be synced — `podcli whoami` will retry later.")
 
 
 def cmd_logout(args):
@@ -3686,6 +4728,12 @@ def cmd_logout(args):
     if not podcli_cloud.signed_in():
         print("Not signed in.")
         return
+    # The local file goes either way: a server that cannot be reached is not a
+    # reason to leave a machine looking signed in.
+    try:
+        podcli_cloud.revoke_session()
+    except podcli_cloud.CloudError as exc:
+        print(f"Signed out here, but the session may still be live: {exc}")
     podcli_cloud.clear_token()
     print("Signed out. podcli will use your local AI CLI from now on.")
 
@@ -3947,6 +4995,15 @@ def _first_run_setup() -> bool:
     return True
 
 
+def _add_pair_args(parser) -> None:
+    parser.add_argument("--layout", choices=["single", "pair"],
+                        help="single: one face. pair: the guest left and the host right, from the clip's "
+                             "footage. Defaults to the template's layout")
+    parser.add_argument("--left-image", dest="left_image", help="Image of the person on the left (pair layout)")
+    parser.add_argument("--right-image", dest="right_image", help="Image of the person on the right (pair layout)")
+    parser.add_argument("--swap", action="store_true", help="Swap the two people's sides (pair layout)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="podcli",
@@ -3959,9 +5016,9 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # ── podcli Pro account ──
-    login_p = sub.add_parser("login", help="Sign in to podcli Pro")
-    login_p.add_argument("--email", help="Account email (prompted if omitted)")
-    login_p.add_argument("--password", help="Password (prompted if omitted; prefer the prompt)")
+    login_p = sub.add_parser("login", help="Sign in to podcli Pro through your browser")
+    login_p.add_argument("--no-browser", action="store_true",
+                         help="Print the link instead of opening it, for SSH sessions")
     sub.add_parser("logout", help="Sign out of podcli Pro on this machine")
     sub.add_parser("whoami", help="Show the signed-in podcli Pro account")
     ws_p = sub.add_parser("workspace", help="Switch between shows in podcli Pro")
@@ -3979,17 +5036,68 @@ def main():
     proc.add_argument("-n", "--top", type=int, help="Number of top clips to export (default: 5)")
     proc.add_argument("-o", "--output", help="Output directory (default: ./clips)")
     proc.add_argument("-p", "--preset", help="Load a saved preset")
-    proc.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine (default: whisper-py; whispercpp is local; assemblyai uses ASSEMBLYAI_API_KEY)")
+    proc.add_argument("--cloud", action="store_true",
+                      help="Render on podcli.com instead of this machine (needs `podcli login`)")
+    proc.add_argument("--template-id",
+                      help="Cut in a saved cloud template, by id (with --cloud)")
+    proc.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"], help="Transcription engine (default: whisper-py; whispercpp is local; assemblyai uses ASSEMBLYAI_API_KEY)")
+    proc.add_argument("--language", help="Language of the recording (e.g. es, pt-BR, ka). Auto-detect if omitted.")
     proc.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
     proc.add_argument("--fast", action="store_true", help="Draft mode: tiny Whisper, heuristic selection, center crop, low quality")
     proc.add_argument("--thumbnails", dest="thumbnails", action="store_true", default=None, help="Force thumbnail generation on")
     proc.add_argument("--no-thumbnails", dest="thumbnails", action="store_false", help="Skip thumbnail generation")
-    proc.add_argument("--caption-style", choices=["branded", "hormozi", "karaoke", "subtle"])
-    proc.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut"])
+    proc.add_argument("--thumbnail-placement", dest="thumbnail_placement",
+                      choices=["off", "start"],
+                      help="Where the thumbnail goes in the video itself. "
+                           "off keeps the pictures and leaves the video alone (default: start)")
+    proc.add_argument("--template", help="Cut in a saved look (podcli Pro). Name or id.")
+    proc.add_argument("--caption-style", choices=["branded", "hormozi", "karaoke", "subtle", "outline"])
+    proc.add_argument("--caption-position", choices=["auto", "upper", "center", "lower"],
+                      help="Caption placement (default: follows the chosen style)")
+    proc.add_argument("--caption-scale", type=float, choices=[0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5],
+                      help="Caption size multiplier (default: 1)")
+    proc.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut", "manual"])
+    proc.add_argument("--face-map", dest="face_map", default=None,
+                      help="Where the faces sit in this video, as JSON. Skips detection and lets "
+                           "speaker framing work on a transcript that carries no speaker labels.")
+    proc.add_argument("--crop-keyframes", dest="crop_keyframes", default=None,
+                      help="Hand-placed crop positions, as JSON. Used by --crop manual.")
     proc.add_argument("--format", choices=["vertical", "horizontal", "square"], help="Output aspect ratio (default: vertical)")
     proc.add_argument("--profile", choices=["podcast", "party", "action"], help="Detection profile: podcast (transcript-first, default), party/action (laughter/energy highlights)")
     proc.add_argument("--logo", help="Logo image (asset name or path)")
+    proc.add_argument("--logo-position", choices=["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"],
+                      help="Logo placement (default: top-left)")
+    proc.add_argument("--logo-scale", type=float, choices=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5],
+                      help="Logo size multiplier (default: 1)")
+    # The parts a show's look switches on. Each is off unless asked for, so a
+    # command that names none of them cuts exactly what it cut before.
+    proc.add_argument("--topic", help="Standing label saying what the clip is about")
+    proc.add_argument("--topic-position", dest="topic_position", choices=["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"],
+                      default="top-left", help="Where the topic label sits (default: top-left)")
+    proc.add_argument("--progress", action="store_true",
+                      help="Draw how much of the clip is left along the bottom edge")
+    proc.add_argument("--progress-color", dest="progress_color",
+                      help="Colour of the progress bar, e.g. '#3B9CFF'")
+    proc.add_argument("--brand", help="Show colours as JSON: "
+                                      '{"accent":"#4C9DF5","ink":"#FFFFFF","surface":"#0A0D14"}')
+    proc.add_argument("--style", help='Visual theme as JSON: '
+                                      '{"pack":"collage","motion":"stop-motion"}')
+    proc.add_argument("--font-family", dest="font_family",
+                      help="The show's own typeface, ahead of the built-in stack")
     proc.add_argument("--outro", help="Outro video (asset name or path)")
+    proc.add_argument("--name-card", dest="name_card",
+                      help="Lower third naming the speaker, shown for the first seconds")
+    proc.add_argument("--name-card-sub", dest="name_card_sub",
+                      help="Second line of the lower third")
+    proc.add_argument("--name-card-seconds", dest="name_card_seconds", type=float,
+                      help="How long the lower third holds (default 3)")
+    proc.add_argument("--name-card-accent", dest="name_card_accent",
+                      help="Underline colour on the lower third")
+    proc.add_argument("--motion", dest="motion",
+                      help='How each part arrives and leaves, as JSON: '
+                           '{"captions":{"enter":"rise","exit":"fade","duration":5,"feel":"soft"}}')
+    proc.add_argument("--bookend-fade", dest="bookend_fade", type=float, default=None,
+                      help="Seconds of crossfade into an intro or outro (default 0, a cut)")
     proc.add_argument("--no-outro", action="store_true", help="Do not append an outro (default for highlight profiles)")
     proc.add_argument("--intro", help="Intro video (asset name or path)")
     proc.add_argument("--time-adjust", type=float, help="Timestamp offset in seconds")
@@ -4029,6 +5137,78 @@ def main():
     rbd = reel_sub.add_parser("build", help="Rebuild the reel (re-cuts only changed moments)")
     rbd.add_argument("session")
 
+    # ── multicam (full-episode edit from several cameras and mics) ──
+    mc_p = sub.add_parser(
+        "multicam",
+        help="Edit a multicam episode: sync cameras and mics, auto-cut to the speaker, render or export",
+        description="Point at one episode's folder. podcli guesses who each file belongs to, syncs everything by audio, "
+                    "cuts to whoever is talking, and renders an MP4. Re-run with the session id to change anything; "
+                    "finished steps are reused.",
+        epilog="Examples:\n"
+               "  podcli multicam ~/Podcasts/ep12 --people \"Nika, Ana\"\n"
+               "  podcli multicam ~/Podcasts/ep12 --set cam_b.mp4=camera:Ana --set zoom_lr.wav=mic:Nika,Ana -y\n"
+               "  podcli multicam 3f9c2a1b7e40 --export premiere --no-render\n"
+               "  podcli multicam 3f9c2a1b7e40 --export premiere --review --no-render\n"
+               "  podcli multicam 3f9c2a1b7e40 --timeline ~/Desktop/edited.xml\n"
+               "  podcli multicam list",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mc_p.add_argument("target", nargs="?", help="Episode folder, a session id to resume, or 'list'")
+    mc_p.add_argument("--people", help="Comma-separated speaker names (default: Host, Guest)")
+    mc_p.add_argument("--guests", help="Comma-separated names of the guests, whose answers are held on their camera "
+                                         "(default: the last person)")
+    mc_p.add_argument("--set", action="append", metavar="FILE=ROLE[:NAME]",
+                      help="Fix a file's role: camera:NAME, camera:wide, mic:NAME, mic:NAME,NAME (stereo L/R), mic:room, or ignore. "
+                           "FILE is its number in the table or the start of its name; tiles and split screens go by "
+                           "number. Repeatable.")
+    mc_p.add_argument("--start", type=float, help="Episode start on the synced timeline, in seconds")
+    mc_p.add_argument("--end", type=float, help="Episode end on the synced timeline, in seconds")
+    mc_p.add_argument("--style", choices=["auto", "studio", "remote"],
+                      help="How to cut: studio (everyone's camera) or remote (split screen, guest full frame on long "
+                           "answers). Default auto: remote for call recordings")
+    mc_p.add_argument("--min-shot", type=float, dest="min_shot", help="Shortest shot in seconds (studio 2, remote 4)")
+    mc_p.add_argument("--max-shot", type=float, dest="max_shot",
+                      help="Cut to the wide shot after this many seconds on one host; 0 never (studio 30, remote 0)")
+    mc_p.add_argument("--look", choices=["none", "natural", "warm", "contrast"], help="Color look for the render")
+    mc_p.add_argument("--export", choices=["premiere", "fcpxml", "all"],
+                      help="Also write an editor timeline that points at the original files")
+    mc_p.add_argument("--review", action="store_true",
+                      help="With --export: keep the whole episode, every camera on its own track, and the removals in "
+                           "place, marked, for an editor to judge")
+    mc_p.add_argument("--timeline", metavar="FILE",
+                      help="Take the cut and removals from an edited FCP 7 XML timeline (Premiere, or Resolve's "
+                           "File > Export > Timeline > FCP 7 XML)")
+    mc_p.add_argument("--no-render", action="store_true", dest="no_render", help="Skip the MP4 render (fast, export only)")
+    mc_p.add_argument("--no-stems", action="store_true", dest="no_stems", help="Skip the per-person WAV files")
+    mc_p.add_argument("--validate", choices=["sample", "full"], default="sample",
+                      help="How hard to check the rendered episode decodes cleanly: 'sample' (default) checks the "
+                           "first and last 10s plus a few points in between; 'full' decodes the whole thing, which "
+                           "costs minutes per hour of 1080p")
+    mc_p.add_argument("--resync", action="store_true",
+                      help="Sync every file again, including offsets you set by hand")
+    mc_p.add_argument("-y", "--yes", action="store_true", help="Don't stop to review guessed roles")
+    mc_p.add_argument("--delete", action="store_true", help="Delete this multicam edit (source files are untouched)")
+    mc_p.add_argument("--state", metavar="FILE",
+                      help="Restore a prepared edit (a saved --json result) so these files render without syncing again")
+    mc_p.add_argument("--cuts", metavar="FILE",
+                      help="Use this cut instead of the automatic one: a JSON list of {start, end, source_id}, back to back")
+    mc_p.add_argument("--removals", metavar="FILE",
+                      help="Cut these stretches out of the episode: a JSON list of {start, end} on the timeline; [] restores everything")
+    mc_p.add_argument("--preview", action="store_true",
+                      help="Also build small playback proxies of each camera and a mic mix on the timeline")
+    mc_p.add_argument("--transcript", action="store_true",
+                      help="Transcribe the episode with each word credited to whoever's mic was speaking")
+    mc_p.add_argument("--model", default="base", help="Whisper model for --transcript (default base)")
+    mc_p.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"],
+                      help="Transcription engine for --transcript (default: the one podcli is set up with)")
+    mc_p.add_argument("--activity", action="store_true", help="Report who speaks when (talk time, or spans with --json)")
+    mc_p.add_argument("--cloud", action="store_true",
+                      help="Send the edit to the podcli cloud editor (Pro). Only previews go up; camera files stay here")
+    mc_p.add_argument("--pull", action="store_true",
+                      help="Render the cut made in the podcli cloud editor. Target is this edit's session id or cloud id")
+    mc_p.add_argument("--json", action="store_true",
+                      help="Print the edit as one JSON object on stdout; progress and messages go to stderr")
+
     # ── studio ──
     studio = sub.add_parser("studio", help="Cut a fragment + add Remotion intro/outro (follow-us) bookends")
     studio.add_argument("video", nargs="?", default=None, help="Path to the source video (omit only with --save-brand)")
@@ -4036,12 +5216,57 @@ def main():
     studio.add_argument("--end", type=float, help="Fragment end (seconds)")
     studio.add_argument("--paragraph", help="Find the fragment by matching this text in the transcript")
     studio.add_argument("--language", help="Transcription language (e.g. es). Auto-detect if omitted.")
-    studio.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], help="Transcription engine")
+    studio.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"], help="Transcription engine")
+    studio.add_argument("--transcript", help="Word timings JSON for this video ({words:[...]} or a list); skips transcription")
     studio.add_argument("--assemblyai-api-key", help="AssemblyAI API key for --engine assemblyai. Prefer ASSEMBLYAI_API_KEY; command-line secrets can appear in process listings.")
-    studio.add_argument("--caption-style", choices=["hormozi", "karaoke", "subtle", "branded"], default="hormozi")
-    studio.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut"], default="face")
+    studio.add_argument("--caption-style", choices=["hormozi", "karaoke", "subtle", "branded", "outline"], default="hormozi")
+    studio.add_argument("--caption-position", choices=["auto", "upper", "center", "lower"], default="auto")
+    studio.add_argument("--caption-scale", type=float, default=1.0)
+    studio.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut", "manual"], default="face")
+    studio.add_argument("--face-map", dest="face_map", default=None,
+                        help="Where the faces sit in this video, as JSON. Skips detection and lets "
+                             "speaker framing work on a transcript that carries no speaker labels.")
+    studio.add_argument("--crop-keyframes", dest="crop_keyframes", default=None,
+                        help="Hand-placed crop positions, as JSON. Used by --crop manual.")
     studio.add_argument("--format", choices=["vertical", "horizontal", "square"], default="vertical",
                         help="Output aspect ratio (default: vertical)")
+    studio.add_argument("--template", help="Cut in a saved look (podcli Pro). Name or id.")
+    studio.add_argument("--logo", help="Logo image (asset name or path)")
+    studio.add_argument("--logo-position", choices=["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"], default="top-left")
+    studio.add_argument("--logo-scale", type=float, default=1.0)
+    studio.add_argument("--no-captions", dest="no_captions", action="store_true",
+                        help="Draw the logo, chip, bar and cards, and burn no words. "
+                             "For footage that already carries its own captions.")
+    studio.add_argument("--topic", help="Standing label saying what the clip is about")
+    studio.add_argument("--topic-position", dest="topic_position", choices=["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"],
+                        default="top-left")
+    studio.add_argument("--progress", action="store_true",
+                        help="Draw how much of the clip is left along the bottom edge")
+    studio.add_argument("--progress-color", dest="progress_color")
+    studio.add_argument("--cards", help="On-screen cards as JSON, each with kind/start/end")
+    studio.add_argument("--hook", help='Opening hook as JSON, on the source clock: '
+                                       '{"start":41.2,"end":45.8,"mode":"repeat"}. '
+                                       "Plays a 1-15 s passage from inside the fragment first; "
+                                       '"move" lifts it out of the body')
+    studio.add_argument("--brand", help="Show colours as JSON: "
+                                        '{"accent":"#4C9DF5","ink":"#FFFFFF","surface":"#0A0D14"}')
+    studio.add_argument("--style", help='Visual theme as JSON: '
+                                        '{"pack":"collage","motion":"stop-motion"}')
+    studio.add_argument("--font-family", dest="font_family",
+                        help="The show's own typeface, ahead of the built-in stack")
+    studio.add_argument("--intro", help="Intro video (asset name or path)")
+    studio.add_argument("--outro", help="Outro video (asset name or path)")
+    studio.add_argument("--name-card", dest="name_card",
+                        help="Lower third naming the speaker, shown for the first seconds")
+    studio.add_argument("--name-card-sub", dest="name_card_sub",
+                        help="Second line of the lower third")
+    studio.add_argument("--name-card-seconds", dest="name_card_seconds", type=float,
+                        help="How long the lower third holds (default 3)")
+    studio.add_argument("--name-card-accent", dest="name_card_accent",
+                        help="Colour of the rule under the lower third")
+    studio.add_argument("--motion", dest="motion",
+                        help='How each part arrives and leaves, as JSON: '
+                             '{"captions":{"enter":"rise","exit":"fade","duration":5,"feel":"soft"}}')
     studio.add_argument("-o", "--output", help="Final output path")
     studio.add_argument("--intro-title", help="Intro headline (default: derived from first words)")
     studio.add_argument("--outro-title", default=None)
@@ -4070,7 +5295,7 @@ def main():
     pre_save.add_argument("--video", help="Default video path")
     pre_save.add_argument("--transcript", help="Default transcript path")
     pre_save.add_argument("--output", help="Default output directory")
-    pre_save.add_argument("--caption-style", choices=["branded", "hormozi", "karaoke", "subtle"])
+    pre_save.add_argument("--caption-style", choices=["branded", "hormozi", "karaoke", "subtle", "outline"])
     pre_save.add_argument("--crop", choices=["center", "face", "speaker", "speaker-hardcut"])
     pre_save.add_argument("--logo", help="Logo (asset name or path)")
     pre_save.add_argument("--outro", help="Outro (asset name or path)")
@@ -4143,6 +5368,7 @@ def main():
     thumb.add_argument("--line1", help="Explicit first thumbnail line (skips AI rewrite)")
     thumb.add_argument("--line2", help="Explicit second thumbnail line")
     thumb.add_argument("--json", action="store_true", help="Emit JSON {paths:[...]} to stdout")
+    _add_pair_args(thumb)
 
     # ── thumbnail-config ──
     tcfg = sub.add_parser("thumbnail-config", help="Show, export, import, or reset the thumbnail template")
@@ -4163,16 +5389,27 @@ def main():
     topt.add_argument("--end", type=float, help="Frame window end (seconds)")
     topt.add_argument("--texts", type=int, default=6, help="Number of headline options")
     topt.add_argument("--frames", type=int, default=6, help="Number of frame options")
+    topt.add_argument("--payoff", help="Clip's payoff line, so headline copy is grounded in it rather than the title alone")
+    topt.add_argument("--context-line", dest="context_line", help="The question this clip answers, if any")
+    topt.add_argument("--preview-text", dest="preview_text", help="Clip's verbatim opening line")
 
     # ── thumbnail-render (one final thumbnail from a chosen frame + headline) ──
     trnd = sub.add_parser("thumbnail-render", help="Render one thumbnail PNG from a chosen frame + headline")
     trnd.add_argument("title", help="Clip/episode title")
-    trnd.add_argument("--frame", required=True, help="Background frame image path")
+    trnd.add_argument("--frame", help="Background frame image path. Optional with the pair layout, "
+                                      "where it is the fallback when two people cannot be told apart")
+    trnd.add_argument("--video", help="Source video the pair layout takes both people from")
+    trnd.add_argument("--start", type=float, help="Clip start in --video (seconds)")
+    trnd.add_argument("--end", type=float, help="Clip end in --video (seconds)")
+    _add_pair_args(trnd)
     trnd.add_argument("-o", "--output", required=True, help="Destination PNG path")
     trnd.add_argument("--line1", help="Headline line 1 (empty = AI writes it)")
     trnd.add_argument("--line2", help="Headline line 2 (empty = AI writes it)")
     trnd.add_argument("--frame-info", dest="frame_info", help="JSON face metadata for the frame")
     trnd.add_argument("--logo", help="Logo (asset name or path)")
+    trnd.add_argument("--payoff", help="Clip's payoff line, so headline copy is grounded in it rather than the title alone")
+    trnd.add_argument("--context-line", dest="context_line", help="The question this clip answers, if any")
+    trnd.add_argument("--preview-text", dest="preview_text", help="Clip's verbatim opening line")
 
     # ── swap-thumbnail ──
     st = sub.add_parser("swap-thumbnail", help="Regenerate thumbnail on an existing clip")
@@ -4187,6 +5424,9 @@ def main():
     st.add_argument("--pick", type=int, default=1, help="Which variation to use (1-3, default 1)")
     st.add_argument("-n", "--variations", type=int, default=3, help="Number of variations to generate")
     st.add_argument("--thumb-duration", type=float, default=1.5, help="Duration of thumbnail end card (default 1.5s)")
+
+    # ── templates ──
+    sub.add_parser("templates", help="List the saved looks on this account (podcli Pro)")
 
     # ── corrections ──
     corr = sub.add_parser("corrections", help="Manage transcript word corrections (Whisper fixes)")
@@ -4221,7 +5461,7 @@ def main():
     clips_edit.add_argument("clip_id", help="Clip id (full or 8-char prefix)")
     clips_edit.add_argument("--title", help="New title")
     clips_edit.add_argument(
-        "--caption-style", choices=["branded", "hormozi", "karaoke", "subtle"], help="New caption style"
+        "--caption-style", choices=["branded", "hormozi", "karaoke", "subtle", "outline"], help="New caption style"
     )
     clips_edit.add_argument("--thumbnail-config", help="Per-clip thumbnail config as a JSON string")
     clips_reopen = clips_sub.add_parser(
@@ -4288,6 +5528,21 @@ def main():
     # ── info ──
     sub.add_parser("info", help="Show system info (encoder, etc.)")
 
+    # ── compare-engines ──
+    cmp_p = sub.add_parser(
+        "compare-engines",
+        help="Transcribe the same sample window with two engines and report where they disagree",
+    )
+    cmp_p.add_argument("video", help="Path to podcast video/audio file")
+    cmp_p.add_argument("engine_a", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
+    cmp_p.add_argument("engine_b", choices=["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
+    cmp_p.add_argument("--start", type=float, default=0.0, help="Sample start, seconds into the source (default: 0)")
+    cmp_p.add_argument("--duration", type=float, default=120.0, help="Sample length in seconds (default: 120)")
+    cmp_p.add_argument("--window", type=float, default=20.0, help="Report window size in seconds (default: 20)")
+    cmp_p.add_argument("--model-size", default="base", help="Model size for engines that take one (default: base)")
+    cmp_p.add_argument("--language", help="ISO language code. Auto-detect if omitted.")
+    cmp_p.add_argument("-o", "--output", default="./engine-comparison", help="Output directory for comparison.json/.html")
+
     init_thumb = sub.add_parser(
         "init-thumbnail",
         help="Scaffold .podcli/thumbnail-config.json so podcli generates thumbnails for you",
@@ -4300,7 +5555,13 @@ def main():
 
     args = parser.parse_args()
 
-    _auto_migrate_cli(args)
+    if getattr(args, "json", False):
+        # --json promises stdout holds only the JSON result.
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            _auto_migrate_cli(args)
+    else:
+        _auto_migrate_cli(args)
 
     if getattr(args, "show_help", False) and args.command is None:
         print_help()
@@ -4326,6 +5587,10 @@ def main():
         cmd_studio(args)
     elif args.command == "reel":
         cmd_reel(args)
+    elif args.command == "multicam":
+        cmd_multicam(args)
+    elif args.command == "templates":
+        cmd_templates(args)
     elif args.command == "thumbnails":
         cmd_thumbnails(args)
     elif args.command == "thumbnail-config":
@@ -4358,6 +5623,8 @@ def main():
         cmd_cache(args)
     elif args.command == "info":
         cmd_info(args)
+    elif args.command == "compare-engines":
+        cmd_compare_engines(args)
     elif args.command == "init-thumbnail":
         cmd_init_thumbnail(args)
     elif args.command in ("ui", "webui"):
@@ -5193,7 +6460,7 @@ def _interactive_presets():
     # Caption style
     caption_style = questionary.select(
         "Caption style:",
-        choices=["branded", "hormozi", "karaoke", "subtle"],
+        choices=["branded", "hormozi", "karaoke", "subtle", "outline"],
         default=config.get("caption_style", "branded"),
         style=qstyle,
     ).ask()

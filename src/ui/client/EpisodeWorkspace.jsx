@@ -39,10 +39,20 @@ import AssetPicker from './AssetPicker';
 import { assetSrc, useAssets } from './useAssets';
 import RecentSources from './RecentSources';
 import MomentTrim from './MomentTrim';
+import { playbackDuration, playbackRanges, validateHook } from '../../utils/clip-hook';
 import { useDialog } from './useDialog';
 import { PageHeader } from './Page';
 import { buildPreviewChunks, activePreviewChunk, selectPreviewWords } from './captionChunks';
-import { findClipResult, resultBoundsKey, clipKey, buildEnergyMap, dropEnergy, clampClipIndex, resolveAssetName, formatTranscriptText, canGenerateClipSuggestions } from './lib';
+import { findClipResult, resultBoundsKey, clipKey, buildEnergyMap, dropEnergy, clampClipIndex, resolveAssetName, formatTranscriptText, canGenerateClipSuggestions, safeUpper, buildUiStateSyncPayload } from './lib';
+
+// Mirrors backend/services/formats.py. A horizontal cutdown is minutes long,
+// so a slider capped at 60s could not express one.
+const FORMAT_BOUNDS = {
+  vertical: { min: 20, max: 45, ceiling: 60 },
+  square: { min: 20, max: 45, ceiling: 60 },
+  horizontal: { min: 60, max: 300, ceiling: 360 },
+};
+const boundsFor = (f) => FORMAT_BOUNDS[f] || FORMAT_BOUNDS.vertical;
 
 const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const fmtSaved = (s) => s < 10 ? `${Number(s || 0).toFixed(1)}s` : fmt(s);
@@ -287,7 +297,7 @@ const onKeyActivate = (fn) => (e) => {
 
     function PhoneCaptionBody({ chunk, activeWordInChunk, cfg, singleLine = false }) {
       if (!chunk || !chunk.length) return null;
-      const fmt = (w) => (cfg.uppercase ? w.toUpperCase() : w);
+      const fmt = (w) => (cfg.uppercase ? safeUpper(w) : w);
 
       const renderWord = (w, i, isActive) => {
         if (cfg.activePill && isActive) {
@@ -852,9 +862,17 @@ const onKeyActivate = (fn) => (e) => {
       const [advancedOpen, setAdvancedOpen] = useState(false);
       const [cleanFillers, setCleanFillers] = useState(true);
       const [quality, setQuality] = useState('max');
-      const [minDuration, setMinDuration] = useState(20);
-      const [maxDuration, setMaxDuration] = useState(45);
+      const [minDuration, setMinDuration] = useState(boundsFor("vertical").min);
+      const [maxDuration, setMaxDuration] = useState(boundsFor("vertical").max);
       const [energyBoost, setEnergyBoost] = useState(true);
+
+      // A vertical 20-45s window means nothing to a horizontal cutdown, so the
+      // sliders follow the format rather than pinning it back to shorts length.
+      useEffect(() => {
+        const b = boundsFor(format);
+        setMinDuration(b.min);
+        setMaxDuration(b.max);
+      }, [format]);
       const [showYouTubeFrame, setShowYouTubeFrame] = useState(true);
       const [silenceThreshold, setSilenceThreshold] = useState(0.5);
       const [silenceMinPause, setSilenceMinPause] = useState(0.65);
@@ -862,7 +880,7 @@ const onKeyActivate = (fn) => (e) => {
 
       // Clip editing
       const [editingClip, setEditingClip] = useState(null); // index
-      const [editForm, setEditForm] = useState({ title: '', start: 0, end: 0 });
+      const [editForm, setEditForm] = useState({ title: '', start: 0, end: 0, payoff: '', contextLine: '', hook: null });
       const [editDuration, setEditDuration] = useState(0);
       const editDialogRef = useDialog(editingClip !== null, () => setEditingClip(null));
       const previewDialogRef = useDialog(!!previewFile, () => setPreviewFile(null));
@@ -974,8 +992,28 @@ const onKeyActivate = (fn) => (e) => {
         const clip = suggestions[idx];
         if (!clip) return;
         setEditingClip(idx);
-        setEditForm({ title: clip.title, start: clip.start_second, end: clip.end_second });
+        setEditForm({
+          title: clip.title,
+          start: clip.start_second,
+          end: clip.end_second,
+          payoff: clip.payoff || '',
+          contextLine: clip.context_line || '',
+          hook: clip.hook || null,
+        });
       };
+
+      // Saving drops segments, but the server restores them while the range
+      // stays within half a second, so the hook is checked against the same.
+      const editedClip = editingClip !== null ? suggestions[editingClip] : null;
+      const editSegments = editedClip
+        && Math.abs(editedClip.start_second - editForm.start) < 0.5
+        && Math.abs(editedClip.end_second - editForm.end) < 0.5
+        ? editedClip.segments : undefined;
+      const editHookError = validateHook(editForm.hook, editForm.start, editForm.end, editSegments);
+      const setEditHook = (patch) => setEditForm(f => ({ ...f, hook: patch && { ...f.hook, ...patch } }));
+      const addEditHook = () => setEditForm(f => ({
+        ...f, hook: { start: f.start, end: Math.min(f.end, f.start + 3), mode: 'repeat' },
+      }));
 
       const clampEditTime = (v) => {
         const n = Number.isFinite(v) ? Math.max(0, v) : 0;
@@ -983,12 +1021,22 @@ const onKeyActivate = (fn) => (e) => {
       };
 
       const saveClipEdit = () => {
-        if (editingClip === null || editForm.end <= editForm.start) return;
+        if (editingClip === null || editForm.end <= editForm.start || editHookError) return;
         const edited = suggestions[editingClip];
         const reTimed = edited && (edited.start_second !== editForm.start || edited.end_second !== editForm.end);
         setSuggestions(prev => {
           const next = [...prev];
-          next[editingClip] = { ...next[editingClip], title: editForm.title, start_second: editForm.start, end_second: editForm.end, duration: Math.round(editForm.end - editForm.start), segments: undefined };
+          next[editingClip] = {
+            ...next[editingClip],
+            title: editForm.title,
+            start_second: editForm.start,
+            end_second: editForm.end,
+            payoff: editForm.payoff,
+            context_line: editForm.contextLine,
+            duration: Math.round(playbackDuration(editForm.start, editForm.end, editSegments, editForm.hook)),
+            segments: undefined,
+            hook: editForm.hook || undefined,
+          };
           return next;
         });
         // The score was measured over the old range, so it no longer describes this clip.
@@ -1054,13 +1102,13 @@ const onKeyActivate = (fn) => (e) => {
           const fileData = await api('/select-file', { method: 'POST', body: JSON.stringify({ file_path: vp }) });
           if (fileData.error) { setTranscribing(false); return; }
           setFile(fileData);
-          const engine = transcriptionEngine === 'assemblyai' ? 'assemblyai' : undefined;
+          const engine = transcriptionEngine === 'whisper' ? undefined : transcriptionEngine;
           const data = await api('/transcribe', { method: 'POST', body: JSON.stringify({
             file_path: vp,
             model_size: whisperModel,
             engine,
             assemblyai_api_key: transcriptionEngine === 'assemblyai' ? assemblyAiKey.trim() : undefined,
-            enable_diarization: transcriptionEngine === 'assemblyai' || (speakerStatus?.configured || false),
+            enable_diarization: transcriptionEngine === 'assemblyai' || speakerStatus?.configured !== false,
           }) });
           if (data.error) {
             setError(data.error);
@@ -1124,6 +1172,9 @@ const onKeyActivate = (fn) => (e) => {
       // Sync UI state to server on changes (fire-and-forget)
       // Guard: don't sync until initial SSE state has been received to avoid overwriting persisted state with defaults
       const prevSyncRef = useRef('');
+      // See buildUiStateSyncPayload in lib.ts: transcript rides in this same
+      // request whenever it changed, instead of a request of its own.
+      const prevTranscriptRef = useRef(null);
       useEffect(() => {
         if (!stateHydrated) return;
         const syncable = {
@@ -1148,21 +1199,14 @@ const onKeyActivate = (fn) => (e) => {
           hydrationTargetRef.current = null;
           if (signature !== target) return;
         }
-        const state = { _source: 'ui', filePath: file?.file_path || '', ...syncable };
+        const transcriptChanged = transcript !== prevTranscriptRef.current;
+        const state = buildUiStateSyncPayload(syncable, file?.file_path || '', transcript, transcriptChanged);
         const key = JSON.stringify(state);
         if (key === prevSyncRef.current) return;
         prevSyncRef.current = key;
+        if (transcriptChanged) prevTranscriptRef.current = transcript;
         fetch('/api/ui-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: key }).catch(() => { });
-      }, [stateHydrated, videoPath, file, activeEditProjectId, activeEditRevision, silenceOriginal, silencePlan, suggestions, deselected, captionStyle, captionPosition, captionFontScale, logoPosition, cropStrategy, format, logoPath, outroPath, introPath, cleanFillers, silenceThreshold, silenceMinPause, silencePadding, phase, results, energyData]);
-
-      // Sync transcript separately (large payload)
-      const prevTranscriptRef = useRef(null);
-      useEffect(() => {
-        if (!stateHydrated) return;
-        if (!transcript || transcript === prevTranscriptRef.current) return;
-        prevTranscriptRef.current = transcript;
-        fetch('/api/ui-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ _source: 'ui', transcript }) }).catch(() => { });
-      }, [stateHydrated, transcript]);
+      }, [stateHydrated, videoPath, file, activeEditProjectId, activeEditRevision, silenceOriginal, silencePlan, suggestions, deselected, captionStyle, captionPosition, captionFontScale, logoPosition, cropStrategy, format, logoPath, outroPath, introPath, cleanFillers, silenceThreshold, silenceMinPause, silencePadding, phase, results, energyData, transcript]);
 
       // Sync raw transcript text so MCP can read it before pipeline runs
       const prevRawRef = useRef('');
@@ -1514,6 +1558,7 @@ const onKeyActivate = (fn) => (e) => {
         ...(Array.isArray(c.segments) && c.segments.length > 0 && (activeEditProjectId
           ? { segments: c.segments }
           : { keep_segments: c.segments })),
+        hook: c.hook || null,
       });
 
       const startExport = async () => {
@@ -1698,6 +1743,7 @@ const onKeyActivate = (fn) => (e) => {
               title: c.title, caption_style: captionStyle, caption_position: captionPosition, caption_font_scale: captionFontScale, logo_position: logoPosition, crop_strategy: cropStrategy, format,
               transcript_words: transcript?.words || [], logo_path: logoPath || undefined, outro_path: outroPath || undefined, intro_path: introPath || undefined, clean_fillers: cleanFillers || undefined,
               ...(Array.isArray(c.segments) && c.segments.length > 0 && { keep_segments: c.segments }),
+              hook: c.hook || null,
               edit_project_id: activeEditProjectId || undefined,
               edit_revision: activeEditRevision ?? undefined,
             })
@@ -1880,6 +1926,10 @@ const onKeyActivate = (fn) => (e) => {
               start_second: c.start_second,
               end_second: c.end_second,
               reasoning: c.reasoning || c.content_type || '',
+              payoff: c.payoff || '',
+              standalone: c.standalone || '',
+              context_line: c.context_line || '',
+              preview_text: c.preview_text || '',
               segments: c.segments,
               duration: c.duration ?? Math.round((c.end_second || 0) - (c.start_second || 0)),
             }));
@@ -2097,6 +2147,7 @@ const onKeyActivate = (fn) => (e) => {
                         <label className="field-label">Engine</label>
                         <select value={transcriptionEngine} onChange={e => { setTranscriptionEngine(e.target.value); setTranscript(null); setCachedTranscript(false); autoTranscribeRef.current = ''; }} disabled={isProcessing || transcribing}>
                           <option value="whisper">Whisper</option>
+                          <option value="omnilingual">Omnilingual (1600 languages)</option>
                           <option value="assemblyai">AssemblyAI</option>
                         </select>
                       </div>
@@ -2111,6 +2162,11 @@ const onKeyActivate = (fn) => (e) => {
                         </div>
                       )}
                     </div>
+                    {transcriptionEngine === 'omnilingual' && (
+                      <p className="hint" style={{ marginBottom: 10 }}>
+                        Runs on this machine. The first run downloads a 1 GB model. Text comes back lowercase with no punctuation.
+                      </p>
+                    )}
                     {transcriptionEngine === 'assemblyai' && (
                       <div style={{ marginBottom: 10 }}>
                         <label className="field-label">AssemblyAI API key</label>
@@ -2449,14 +2505,14 @@ const onKeyActivate = (fn) => (e) => {
                       <div className="field">
                         <label className="field-label">Min duration</label>
                         <div className="field-row">
-                          <input type="range" min="10" max="60" step="5" value={minDuration} onChange={e => setMinDuration(parseInt(e.target.value))} />
+                          <input type="range" min="10" max={boundsFor(format).ceiling} step="5" value={minDuration} onChange={e => setMinDuration(parseInt(e.target.value))} />
                           <span className="range-value">{minDuration}s</span>
                         </div>
                       </div>
                       <div className="field">
                         <label className="field-label">Max duration</label>
                         <div className="field-row">
-                          <input type="range" min="30" max="60" step="5" value={maxDuration} onChange={e => setMaxDuration(parseInt(e.target.value))} />
+                          <input type="range" min="30" max={boundsFor(format).ceiling} step="5" value={maxDuration} onChange={e => setMaxDuration(parseInt(e.target.value))} />
                           <span className="range-value">{maxDuration}s</span>
                         </div>
                       </div>
@@ -2744,8 +2800,15 @@ const onKeyActivate = (fn) => (e) => {
 
                         <div className="clip-info">
                           <div className="clip-title">{clip.title}</div>
+                          {clip.payoff && <div className="clip-payoff">{clip.payoff}</div>}
+                          {clip.context_line && (
+                            <div className="clip-context" title={clip.context_line}>
+                              <span>Setup</span> {clip.context_line}
+                            </div>
+                          )}
                           <div className="clip-meta">
                             {fmt(clip.start_second)} {'\u2192'} {fmt(clip.end_second)} {'\u00B7'} {clip.duration}s
+                            {clip.hook && <> {'\u00B7'} opens with {fmt(clip.hook.start)}</>}
                             {energy && (
                               <span className={`energy-badge ${energy.level}`} title={`Energy: ${energy.score}/10`}>
                                 {energy.level === 'high' ? <Activity size={10} /> : energy.level === 'medium' ? '~' : '○'} {energy.score.toFixed(1)}
@@ -3002,6 +3065,19 @@ const onKeyActivate = (fn) => (e) => {
                   <input type="text" value={editForm.title} onChange={e => setEditForm(f => ({ ...f, title: e.target.value }))}
                     onKeyDown={e => { if (e.key === 'Enter') saveClipEdit(); }} autoFocus />
                 </div>
+                <div className="edit-field">
+                  <label htmlFor="clip-edit-payoff">Payoff</label>
+                  <textarea id="clip-edit-payoff" rows={2} value={editForm.payoff}
+                    placeholder="What the viewer walks away with, in one sentence"
+                    onChange={e => setEditForm(f => ({ ...f, payoff: e.target.value }))} />
+                </div>
+                <div className="edit-field">
+                  <label htmlFor="clip-edit-context">Setup line</label>
+                  <input id="clip-edit-context" type="text" value={editForm.contextLine}
+                    placeholder="The question this answers, if it is not in the clip"
+                    onChange={e => setEditForm(f => ({ ...f, contextLine: e.target.value }))}
+                    onKeyDown={e => { if (e.key === 'Enter') saveClipEdit(); }} />
+                </div>
                 {videoPath && !sourceIsUrl && (
                   <div className="edit-field">
                     <label>Trim</label>
@@ -3036,10 +3112,51 @@ const onKeyActivate = (fn) => (e) => {
                     {editForm.end <= editForm.start && <span style={{ color: 'var(--red)' }}> {'·'} end must be after start</span>}
                   </div>
                 </div>
+                <div className="edit-field">
+                  <label>Opening hook</label>
+                  {!editForm.hook ? (
+                    <button className="btn btn-ghost btn-sm" onClick={addEditHook} disabled={editForm.end <= editForm.start}>
+                      <Plus size={12} /> Add a spoken line to open with
+                    </button>
+                  ) : (
+                    <>
+                      <div className="time-row">
+                        <div>
+                          <input type="number" step="0.1" min={editForm.start} max={editForm.end} value={editForm.hook.start}
+                            onChange={e => setEditHook({ start: clampEditTime(parseFloat(e.target.value)) })}
+                            aria-label="Hook start in seconds" style={{ textAlign: 'center' }} />
+                          <div className="hint-xs" style={{ textAlign: 'center', marginTop: 2 }}>{fmt(editForm.hook.start)}</div>
+                        </div>
+                        <div className="arrow"><ArrowRight size={14} /></div>
+                        <div>
+                          <input type="number" step="0.1" min={editForm.start} max={editForm.end} value={editForm.hook.end}
+                            onChange={e => setEditHook({ end: clampEditTime(parseFloat(e.target.value)) })}
+                            aria-label="Hook end in seconds" style={{ textAlign: 'center' }} />
+                          <div className="hint-xs" style={{ textAlign: 'center', marginTop: 2 }}>{fmt(editForm.hook.end)}</div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                        <select value={editForm.hook.mode} onChange={e => setEditHook({ mode: e.target.value })}
+                          aria-label="Hook mode" style={{ flex: 1 }}>
+                          <option value="repeat">Repeat: plays first, then again in place</option>
+                          <option value="move">Move: plays first, cut from its place</option>
+                        </select>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditHook(null)}>Clear hook</button>
+                      </div>
+                      <div className="hint" style={{ marginTop: 6, textAlign: 'center' }}>
+                        {editHookError
+                          ? <span style={{ color: 'var(--red)' }}>{editHookError}</span>
+                          : <>Plays {playbackRanges(editForm.start, editForm.end, editSegments, editForm.hook)
+                              .map(r => `${fmt(r.start)}-${fmt(r.end)}`).join(', then ')}
+                              {' \u00B7 '}{Math.round(playbackDuration(editForm.start, editForm.end, editSegments, editForm.hook))}s total</>}
+                      </div>
+                    </>
+                  )}
+                </div>
                 <div className="clip-edit-actions">
                   <button className="btn btn-ghost btn-sm" onClick={deleteClipEdit} style={{ color: 'var(--red)', marginRight: 'auto' }}>Delete clip</button>
                   <button className="btn btn-ghost btn-sm" onClick={() => setEditingClip(null)}>Cancel</button>
-                  <button className="btn btn-primary btn-sm" onClick={saveClipEdit} disabled={!editForm.title.trim() || editForm.end <= editForm.start}>Save</button>
+                  <button className="btn btn-primary btn-sm" onClick={saveClipEdit} disabled={!editForm.title.trim() || editForm.end <= editForm.start || !!editHookError}>Save</button>
                 </div>
               </div>
             </div>

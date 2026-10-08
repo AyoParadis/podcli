@@ -10,10 +10,14 @@ openai-whisper>=20250625
 
 # Face detection (optional, for smart cropping)
 opencv-python-headless>=4.8.1.78
-numpy>=2.5.1
+numpy>=2.5.2
 
 # Audio-event detection (laughter/reaction channel via YAMNet ONNX — no torch/TF)
 onnxruntime>=1.28.0
+
+# --engine omnilingual: Meta's Omnilingual ASR CTC model via sherpa-onnx, for
+# languages whisper.cpp handles poorly (e.g. Georgian). No torch/TF.
+sherpa-onnx>=1.13.8
 
 # Thumbnails
 Pillow>=12.3.0

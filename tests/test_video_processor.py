@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -50,6 +51,42 @@ class VideoProcessorTests(unittest.TestCase):
         self.assertEqual(out, "/tmp/out.mp4")
         self.assertGreaterEqual(run_ffmpeg.call_count, 2)
         self.assertEqual(run_ffmpeg.call_args_list[1].kwargs.get("label"), "outro_hardcut_soft_audio")
+
+    def test_soft_audio_fallback_removes_the_scaled_outro(self):
+        out_dir = tempfile.mkdtemp()
+        out = os.path.join(out_dir, "clip.mp4")
+        scaled = out + ".outro_scaled.mp4"
+        run_fail = mock.Mock(returncode=1, stdout="", stderr="xfade unavailable")
+
+        def fake_ffmpeg(**kwargs):
+            with open(kwargs["output_path"], "wb") as f:
+                f.write(b"x")
+            return kwargs["output_path"]
+
+        with mock.patch.object(vp, "get_dimensions", return_value=(1080, 1920)), \
+             mock.patch.object(vp, "_get_media_duration_seconds", side_effect=[20.0, 5.0]), \
+             mock.patch.object(vp, "_has_audio_stream", return_value=True), \
+             mock.patch.object(vp, "get_video_encode_flags", return_value=vp.CPU_FLAGS), \
+             mock.patch.object(vp, "_run_ffmpeg_with_fallback", side_effect=fake_ffmpeg), \
+             mock.patch.object(vp, "proc_run", return_value=run_fail):
+            self.assertEqual(vp.concat_outro("/tmp/in.mp4", "/tmp/outro.mp4", out), out)
+
+        self.assertTrue(os.path.exists(out))
+        self.assertFalse(os.path.exists(scaled))
+
+    def test_a_failed_outro_cleanup_keeps_the_finished_join(self):
+        run_fail = mock.Mock(returncode=1, stdout="", stderr="xfade unavailable")
+        with mock.patch.object(vp, "get_dimensions", return_value=(1080, 1920)), \
+             mock.patch.object(vp, "_get_media_duration_seconds", side_effect=[20.0, 5.0]), \
+             mock.patch.object(vp, "_has_audio_stream", return_value=True), \
+             mock.patch.object(vp, "get_video_encode_flags", return_value=vp.CPU_FLAGS), \
+             mock.patch.object(vp.os, "remove", side_effect=PermissionError("locked")), \
+             mock.patch.object(vp, "_run_ffmpeg_with_fallback", side_effect=["/tmp/scaled.mp4", "/tmp/out.mp4"]) as run_ffmpeg, \
+             mock.patch.object(vp, "proc_run", return_value=run_fail):
+            out = vp.concat_outro("/tmp/in.mp4", "/tmp/outro.mp4", "/tmp/out.mp4")
+
+        self.assertEqual(out, "/tmp/out.mp4")
+        self.assertEqual(run_ffmpeg.call_count, 2)
 
     def test_resolve_speaker_sides_does_not_guess_from_transcript_order(self):
         speaker_side = vp._resolve_speaker_sides(
@@ -607,16 +644,17 @@ class VideoProcessorTests(unittest.TestCase):
         self.assertIn("if(between(t\\,0.000\\,0.180)\\,420\\,", expr)
         self.assertNotIn("100+((420-100)", expr)
 
-    def test_build_cam_expr_uses_short_eased_handoff_for_split_layout_jumps(self):
+    def test_build_cam_expr_cuts_split_layout_jumps_without_micro_pan(self):
         expr = vp._build_cam_expr(
             keyframes=[(0.0, 120), (0.20, 360), (1.0, 360)],
             duration=1.0,
             is_split=True,
         )
 
-        # Split transitions should avoid hard snaps and use a brief eased handoff.
-        self.assertNotIn("if(between(t\\,0.000\\,0.200)\\,360\\,", expr)
-        self.assertIn("120+((360-120)", expr)
+        # The source already changes layouts here. Do not add an 80ms crop pan
+        # on top of it: a direct cut removes the transient seam/wall frames.
+        self.assertIn("if(between(t\\,0.000\\,0.200)\\,360\\,", expr)
+        self.assertNotIn("120+((360-120)", expr)
 
     def test_build_motion_blur_filter_targets_only_short_reframes(self):
         blur = vp._build_motion_blur_filter(
@@ -704,7 +742,10 @@ class VideoProcessorTests(unittest.TestCase):
                 strategy="face",
                 transcript_words=[{"word": "hi", "start": 0.0, "end": 0.4, "speaker": None}],
                 clip_start=0.0,
-                face_map={"clusters": [{"center_x": 100, "crop_x": 0}], "video_width": 1920},
+                face_map={
+                    "clusters": [{"center_x": 100, "crop_x": 0}], "video_width": 1920,
+                    "speaker_mappings": {"SPEAKER_00": 0},
+                },
             )
 
         self.assertEqual(result, "ok.mp4")
@@ -712,6 +753,45 @@ class VideoProcessorTests(unittest.TestCase):
         face_map_crop.assert_called_once()
         track_crop.assert_not_called()
         runner.assert_called_once()
+
+    def test_crop_to_vertical_tracks_a_cut_whose_face_map_it_scanned_itself(self):
+        with mock.patch.object(vp, "get_dimensions", return_value=(1920, 1080)), \
+             mock.patch.object(vp, "_use_face_map", return_value="456") as face_map_crop, \
+             mock.patch.object(vp, "_track_and_crop", return_value="tracked.mp4") as track_crop, \
+             mock.patch.object(vp, "_run_ffmpeg_with_fallback", return_value="ok.mp4") as runner:
+            result = vp.crop_to_vertical(
+                input_path="in.mp4",
+                output_path="out.mp4",
+                strategy="speaker",
+                transcript_words=[{"word": "hi", "start": 0.0, "end": 0.4}],
+                clip_start=0.0,
+                face_map={
+                    "clusters": [{"center_x": 100, "crop_x": 0}], "video_width": 1920,
+                    "speaker_mappings": {},
+                },
+            )
+
+        self.assertEqual(result, "tracked.mp4")
+        track_crop.assert_called_once()
+        face_map_crop.assert_not_called()
+        runner.assert_not_called()
+
+    def test_crop_to_vertical_falls_back_to_a_scanned_face_map_when_tracking_fails(self):
+        with mock.patch.object(vp, "get_dimensions", return_value=(1920, 1080)), \
+             mock.patch.object(vp, "_use_face_map", return_value="456") as face_map_crop, \
+             mock.patch.object(vp, "_track_and_crop", return_value=None), \
+             mock.patch.object(vp, "_run_ffmpeg_with_fallback", return_value="ok.mp4"):
+            result = vp.crop_to_vertical(
+                input_path="in.mp4",
+                output_path="out.mp4",
+                strategy="speaker",
+                transcript_words=[{"word": "hi", "start": 0.0, "end": 0.4}],
+                clip_start=0.0,
+                face_map={"clusters": [{"center_x": 100, "crop_x": 0}], "video_width": 1920},
+            )
+
+        self.assertEqual(result, "ok.mp4")
+        face_map_crop.assert_called_once()
 
 
 if __name__ == "__main__":

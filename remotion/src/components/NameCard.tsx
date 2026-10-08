@@ -1,0 +1,104 @@
+import React from "react";
+import { useCurrentFrame, useVideoConfig } from "remotion";
+import { captionScale, FONT } from "../types";
+import { MOTION, motionAt } from "../motion";
+import type { Motion } from "../motion";
+
+export interface NameCardProps {
+  /** Who is speaking, and what they are. One line each. */
+  title: string;
+  subtitle?: string;
+  /** How long it stays, from the top of the clip. */
+  seconds?: number;
+  background?: string;
+  color?: string;
+  accent?: string;
+  /** How far off the bottom it sits, in unscaled units. */
+  bottom?: number;
+  motion?: Motion;
+}
+
+/**
+ * The lower third that says who this is.
+ *
+ * A clip lifted out of an hour of conversation opens on a stranger. Every
+ * show solves it the same way and podcli had no answer at all, so the name
+ * card was drawn somewhere else and burned in by hand.
+ *
+ * Anchored to the bottom rather than centred, sized off the composition the
+ * way captions are, and gone by the time anyone would tire of it.
+ */
+export const NameCard: React.FC<NameCardProps> = ({
+  title,
+  subtitle,
+  seconds = 3,
+  background = "rgba(0,0,0,0.85)",
+  color = "#FFFFFF",
+  accent = "#2ED9C3",
+  bottom = 620,
+  motion,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps, height } = useVideoConfig();
+  const s = captionScale(height);
+
+  if (!title) return null;
+
+  const { opacity, shift, slide } = motionAt({
+    frame, fps, start: 0, end: seconds,
+    motion: motion ?? MOTION.nameCard,
+    scale: 12 * s,
+  });
+  if (opacity <= 0) return null;
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: 0,
+        bottom: bottom * s,
+        maxWidth: "78%",
+        padding: `${18 * s}px ${28 * s}px ${16 * s}px`,
+        background,
+        borderBottom: `${10 * s}px solid ${accent}`,
+        opacity,
+        /*
+         * In from the edge it is anchored to, then the last few pixels up.
+         *
+         * The horizontal travel is a percentage of the card's own width, which
+         * is the only measure that has it entirely off screen at every
+         * composition size. Both are identity under a motion that says
+         * neither, so a card told to rise still only rises.
+         */
+        transform: `translateX(${slide * 100}%) translateY(${shift}px)`,
+      }}
+    >
+      <div
+        style={{
+          fontFamily: FONT,
+          fontSize: 44 * s,
+          fontWeight: 700,
+          lineHeight: 1.2,
+          color,
+        }}
+      >
+        {title}
+      </div>
+      {subtitle && (
+        <div
+          style={{
+            fontFamily: FONT,
+            fontSize: 38 * s,
+            fontWeight: 400,
+            lineHeight: 1.25,
+            marginTop: 4 * s,
+            color,
+            opacity: 0.85,
+          }}
+        >
+          {subtitle}
+        </div>
+      )}
+    </div>
+  );
+};

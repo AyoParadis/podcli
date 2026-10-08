@@ -8,6 +8,7 @@ import EpisodeWorkspace from "./EpisodeWorkspace";
 import ThumbnailStudio from "./ThumbnailStudio";
 import ContentStudio from "./ContentStudio";
 import HighlightsPage from "./HighlightsPage";
+import MulticamPage from "./multicam-page";
 import AssetsPage from "./AssetsPage";
 import AnalyticsPage from "./AnalyticsPage";
 import KnowledgePage from "./KnowledgePage";
@@ -28,6 +29,7 @@ createRoot(document.getElementById("root")!).render(
           <Route path="/editor/:id" element={<EpisodeEditor />} />
           <Route path="/content" element={<ContentStudio />} />
           <Route path="/highlights" element={<HighlightsPage />} />
+          <Route path="/multicam" element={<MulticamPage />} />
           <Route path="/reel" element={<Navigate to="/highlights" replace />} />
           <Route path="/thumbnails" element={<ThumbnailStudio />} />
           <Route path="/thumbnail" element={<Navigate to="/thumbnails" replace />} />

@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import shutil
+import signal
 import subprocess
 import re
 import threading
@@ -30,6 +31,15 @@ from services.video_processor import (
     burn_captions,
     normalize_audio,
     concat_outro,
+)
+from services.video_cut import probe_has_audio_stream, verify_full_decode
+from services.glyph_coverage import check_caption_font_coverage
+from services.subtitle_export import write_sidecars
+from services.opening_hook import (
+    validate_hook,
+    snap_hook_to_words,
+    order_with_hook,
+    keyframes_to_playback,
 )
 from config.caption_styles import get_style
 from services.formats import get_format
@@ -130,6 +140,35 @@ def _get_media_duration(path: str) -> float:
         return 0.0
 
 
+def _bound_range_to_source(
+    start_second: float,
+    end_second: float,
+    keep_segments: Optional[list[dict]],
+    source_duration: float,
+) -> tuple[float, Optional[list[dict]]]:
+    """Clamp the requested range (and any keep_segments) to the source's
+    actual duration, so a too-long end_second can't silently truncate the
+    render instead of failing. source_duration <= 0 means ffprobe couldn't
+    read it; skip bounding rather than clamp against an unknown length.
+    """
+    if source_duration <= 0:
+        return end_second, keep_segments
+    if start_second >= source_duration:
+        raise ValueError(
+            f"start_second ({start_second}s) is at or past the end of the "
+            f"source video ({source_duration:.2f}s)."
+        )
+    end_second = min(end_second, source_duration)
+    if keep_segments:
+        bounded_segments = []
+        for seg in keep_segments:
+            if seg["start"] >= source_duration:
+                continue
+            bounded_segments.append({**seg, "end": min(seg["end"], source_duration)})
+        keep_segments = bounded_segments or None
+    return end_second, keep_segments
+
+
 def _detect_scene_cuts(path: str, threshold: float = 0.22, max_cuts: int = 32) -> list[float]:
     """
     Detect hard visual changes likely to feel like jump cuts.
@@ -225,6 +264,7 @@ def _apply_local_transition_smoothing(
         "-i", input_path,
         "-vf", vf,
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         output_path,
@@ -295,7 +335,43 @@ def _transition_autofix_passes(jumps_possible: bool) -> int:
     return 2 if jumps_possible else 0
 
 
-def _auto_fix_transition_jumps(video_path: str, max_passes: int = 1) -> bool:
+def _render_transition_autofix_passes(
+    preserve_timing: bool,
+    reframe: bool,
+    crop_strategy: str,
+    crop_keyframes: list = None,
+    keep_segments: list = None,
+) -> int:
+    if preserve_timing:
+        return 0
+    return _transition_autofix_passes(
+        _reframe_can_jump(
+            reframe=reframe,
+            crop_strategy=crop_strategy,
+            crop_keyframes=crop_keyframes,
+            keep_segments=keep_segments,
+        )
+    )
+
+
+DESIGNED_CUT_TOLERANCE = 0.3
+
+
+def _designed_cuts(cards: Optional[list], offset: float = 0.0) -> list[float]:
+    times: list[float] = []
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        for key in ("start", "end"):
+            value = card.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                times.append(float(value) + offset)
+    return times
+
+
+def _auto_fix_transition_jumps(
+    video_path: str, max_passes: int = 1, designed: Optional[list[float]] = None,
+) -> bool:
     """
     Bounded auto-fix for jumpy transitions. Never loops indefinitely.
     Returns True if at least one fix pass succeeded.
@@ -308,7 +384,10 @@ def _auto_fix_transition_jumps(video_path: str, max_passes: int = 1) -> bool:
     for i in range(max_passes):
         duration = _get_media_duration(current)
         scene_threshold = 0.22 if i == 0 else 0.18
-        cuts = _detect_scene_cuts(current, threshold=scene_threshold)
+        cuts = [
+            t for t in _detect_scene_cuts(current, threshold=scene_threshold)
+            if all(abs(t - d) > DESIGNED_CUT_TOLERANCE for d in designed or [])
+        ]
         problematic = _select_problematic_scene_cuts(cuts, duration)
         if not problematic:
             break
@@ -453,6 +532,107 @@ def _build_tight_segments(
 _remotion_available = None  # True/False/None — environment availability, not per-clip success
 
 
+def _stop_process_tree(proc: subprocess.Popen) -> None:
+    if hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            os.killpg(pgid, signal.SIGKILL)
+            proc.wait()
+            return
+        except OSError:
+            pass
+    proc.kill()
+    proc.wait()
+
+
+def _run_streaming(
+    cmd: list[str],
+    *,
+    timeout: float,
+    cwd: str,
+    env: dict,
+) -> subprocess.CompletedProcess:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
+    captured: dict[str, list[str]] = {"out": [], "err": []}
+
+    def pump(stream, label: str) -> None:
+        for line in iter(stream.readline, ""):
+            captured[label].append(line)
+            text = line.rstrip()
+            if text:
+                print(f"  Remotion: {text[:200]}", file=sys.stderr, flush=True)
+        stream.close()
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _stop_process_tree(proc)
+        for t in threads:
+            t.join(timeout=5)
+        raise subprocess.TimeoutExpired(
+            cmd, timeout,
+            output="".join(captured["out"]),
+            stderr="".join(captured["err"]),
+        )
+    for t in threads:
+        t.join(timeout=5)
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode, "".join(captured["out"]), "".join(captured["err"]),
+    )
+
+
+def _report_remotion_failure(
+    stage: str,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+) -> None:
+    """Print why Remotion gave up, on the stream the worker reads.
+
+    The fallback to burned-in ASS is silent by design and was silent about its
+    cause too, so a render that never once used the caption components the
+    studio previews with looked exactly like one that did.
+
+    Takes bytes as well as text. A killed render reaches this through
+    TimeoutExpired, which carries whatever the child had written and does not
+    honour text mode when it does.
+    """
+    for label, stream in (("out", stdout), ("err", stderr)):
+        if isinstance(stream, bytes):
+            stream = stream.decode("utf-8", "replace")
+        lines = [line.strip() for line in (stream or "").strip().splitlines() if line.strip()]
+        for line in lines[-3:]:
+            print(f"  Remotion {stage} {label}: {line[:200]}", file=sys.stderr, flush=True)
+
+
+# Watermark.tsx's own numbers, so the ffmpeg fallback puts the mark where the
+# Remotion renderer would have put it. Authored against a 1920-tall frame and
+# scaled by the height a render actually produced, exactly as captionScale does.
+REMOTION_REFERENCE_HEIGHT = 1920
+REMOTION_LOGO_HEIGHT = 126
+REMOTION_LOGO_INSET = 180
+REMOTION_LOGO_EDGE = 108
+
+
 def _kept_caption_overlay_path(output_path: str) -> str:
     base, _ = os.path.splitext(os.path.abspath(output_path))
     return f"{base}_captions.mov"
@@ -465,10 +645,20 @@ def _render_with_remotion(
     output_path: str,
     time_offset: float = 0.0,
     logo_path: Optional[str] = None,
+    name_card: Optional[dict] = None,
+    motion: Optional[dict] = None,
     keep_caption_overlay: bool = False,
     caption_position: str = "auto",
     caption_font_scale: int = 100,
     logo_position: str = "top-left",
+    logo_scale: float = 1.0,
+    topic: Optional[dict] = None,
+    progress: Optional[dict] = None,
+    cards: Optional[list] = None,
+    brand: Optional[dict] = None,
+    font_family: Optional[str] = None,
+    theme: Optional[dict] = None,
+    captions: bool = True,
 ) -> tuple[bool, Optional[str]]:
     """
     Render captions using Remotion. Returns (success, optional_prores_overlay_path).
@@ -516,14 +706,22 @@ def _render_with_remotion(
             )
             if r.returncode != 0 or not os.path.exists(bundle_index):
                 _remotion_available = False
+                _report_remotion_failure("bundling", r.stdout, r.stderr)
                 return False, None
-        except Exception:
+        except Exception as exc:
             _remotion_available = False
+            print(f"  Remotion bundling: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
             return False, None
 
     # Prepare words JSON (adjust timestamps by offset)
+    #
+    # Captions off draws every other part and none of the words. The logo, the
+    # topic chip, the progress bar and the cards are all drawn by this one pass,
+    # so the alternative to an empty list here is skipping the pass and losing
+    # them with it, which is what "captions off" used to quietly mean.
     adjusted_words = []
-    for w in words:
+    for w in (words if captions else []):
         adjusted = {
             "word": w.get("word", ""),
             "start": round(w["start"] - time_offset, 3),
@@ -593,24 +791,56 @@ def _render_with_remotion(
             "--caption-position", caption_position,
             "--caption-font-scale", str(caption_font_scale),
             "--logo-position", logo_position,
+            "--logo-scale", str(logo_scale),
         ]
         if logo_path and os.path.exists(logo_path):
             cmd.extend(["--logo", os.path.abspath(logo_path)])
+        if name_card and name_card.get("title"):
+            cmd.extend(["--name-card", str(name_card["title"])])
+            if name_card.get("subtitle"):
+                cmd.extend(["--name-card-sub", str(name_card["subtitle"])])
+            if name_card.get("seconds"):
+                cmd.extend(["--name-card-seconds", str(name_card["seconds"])])
+            if name_card.get("accent"):
+                cmd.extend(["--name-card-accent", str(name_card["accent"])])
+        if motion:
+            cmd.extend(["--motion", json.dumps(motion)])
+        # The parts a template switches on. Each is only sent when it has a
+        # value, so a caller that passes none renders what it always rendered.
+        if topic and topic.get("label"):
+            cmd.extend(["--topic", str(topic["label"])])
+            if topic.get("position"):
+                cmd.extend(["--topic-position", str(topic["position"])])
+            if topic.get("color"):
+                cmd.extend(["--topic-color", str(topic["color"])])
+            if topic.get("background"):
+                cmd.extend(["--topic-background", str(topic["background"])])
+        if progress:
+            cmd.append("--progress")
+            if progress.get("color"):
+                cmd.extend(["--progress-color", str(progress["color"])])
+        if cards:
+            cmd.extend(["--cards", json.dumps(cards)])
+        if brand:
+            cmd.extend(["--brand", json.dumps(brand)])
+        if font_family:
+            cmd.extend(["--font-family", str(font_family)])
+        if theme:
+            cmd.extend(["--theme", json.dumps(theme)])
         if keep_caption_overlay:
             cmd.append("--keep-overlay")
 
-        # Redirect stderr to devnull to suppress Chrome/FFmpeg noise
-        # (avoids buffer deadlock and terminal spam)
-        with open(os.devnull, "w") as _devnull:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=_devnull,
-                text=True,
-                timeout=600,
-                cwd=project_root,
-                env=remotion_env,
-            )
+        # Both pipes are captured. subprocess.run drains them together, so the
+        # deadlock the old code avoided by pointing stderr at /dev/null could
+        # not happen, and what it threw away was the only description of the
+        # failure. Every clip on the Linux worker fell back to burned-in ASS
+        # for months and the reason went to /dev/null with the rest of it.
+        result = _run_streaming(
+            cmd,
+            timeout=2 * 50 * 60 + 300,
+            cwd=project_root,
+            env=remotion_env,
+        )
 
         if result.returncode == 0 and os.path.exists(output_path):
             _remotion_available = True
@@ -621,19 +851,19 @@ def _render_with_remotion(
                     overlay_path = None
             return True, overlay_path
 
-        stdout = result.stdout or ""
-        if stdout:
-            lines = [l.strip() for l in stdout.strip().split("\n") if l.strip()]
-            if lines:
-                print(f"  Remotion: {lines[-1][:120]}", file=sys.stderr, flush=True)
-
+        _report_remotion_failure("render", result.stdout, result.stderr)
         print("  Remotion: falling back to ASS for this clip", file=sys.stderr, flush=True)
         return False, None
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        # Whatever the render said before it was killed, which is the half of a
+        # hang worth having: a browser that never came up looks the same from
+        # out here as a composition that took too long to draw.
+        _report_remotion_failure("render", exc.stdout, exc.stderr)
         print("  Remotion: timed out, using ASS for this clip", file=sys.stderr, flush=True)
         return False, None
-    except Exception:
+    except Exception as exc:
+        print(f"  Remotion: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         print("  Remotion: render error, using ASS for this clip", file=sys.stderr, flush=True)
         return False, None
     finally:
@@ -651,6 +881,7 @@ def generate_clip(
     caption_position: str = "auto",
     caption_font_scale: int = 100,
     logo_position: str = "top-left",
+    logo_scale: float = 1.0,
     crop_strategy: str = "face",
     format: str = "vertical",
     crop_keyframes: list[dict] = None,
@@ -661,13 +892,27 @@ def generate_clip(
     logo_path: Optional[str] = None,
     outro_path: Optional[str] = None,
     intro_path: Optional[str] = None,
+    name_card: Optional[dict] = None,
+    motion: Optional[dict] = None,
+    bookend_fade: float = 0.0,
     clean_fillers: bool = True,
     keep_segments: list[dict] = None,
     ordered_segments: list[dict] = None,
+    hook: Optional[dict] = None,
     trim_opening: Optional[bool] = None,
+    preserve_timing: bool = False,
     allow_ass_fallback: bool = False,
     use_ass_captions: bool = False,
     keep_caption_overlay: bool = False,
+    write_clean_variant: bool = False,
+    topic: Optional[dict] = None,
+    progress: Optional[dict] = None,
+    cards: Optional[list] = None,
+    brand: Optional[dict] = None,
+    font_family: Optional[str] = None,
+    theme: Optional[dict] = None,
+    captions: bool = True,
+    write_subtitles: Optional[bool] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> dict:
     """
@@ -684,6 +929,13 @@ def generate_clip(
         title: Clip title (used in filename)
         output_dir: Where to save the final clip (defaults to temp)
         logo_path: Path to logo image (PNG). Used with "branded" style.
+        hook: Optional {"start", "end", "mode"} on the source clock: a passage
+            from inside the body played first. "repeat" plays it again in
+            place, "move" removes it from the body.
+        captions: Whether to burn captions into the video.
+        write_subtitles: Whether to write .srt/.vtt sidecars. Defaults to
+            following `captions` (no burned captions, no sidecars either);
+            pass True to request them for a clean (caption-free) export.
         progress_callback: Optional (percent, message) callback
 
     Returns:
@@ -716,8 +968,62 @@ def generate_clip(
         if not keep_segments:
             raise ValueError("ordered_segments must contain at least one valid range")
         face_map = None
+    # A video-only source (e.g. a silent screen recording) never gets an
+    # audio stream from any of the steps below, so requiring one would
+    # reject every render of it as "broken" instead of a legitimately
+    # silent clip.
+    source_has_audio = probe_has_audio_stream(video_path)
+
+    # ffmpeg's -ss/-t cut silently stops at EOF when end_second runs past the
+    # source, so without this the render "succeeds" with a shorter clip than
+    # requested while duration/end_second in the result still say the planned
+    # (too-long) window. Bound every range to what the source actually has.
+    source_duration = _get_media_duration(video_path)
+    if ordered_mode:
+        # Edited coordinates can exceed the source duration when a passage is
+        # repeated. Bound the source slices without changing the edited clock.
+        _, keep_segments = _bound_range_to_source(
+            min(s["start"] for s in keep_segments),
+            max(s["end"] for s in keep_segments),
+            keep_segments,
+            source_duration,
+        )
+        if not keep_segments:
+            raise ValueError("ordered_segments do not overlap the source video")
+    else:
+        end_second, keep_segments = _bound_range_to_source(
+            start_second, end_second, keep_segments, source_duration
+        )
+
+    # Checked against the requested body, before any tightening moves it.
+    hook = validate_hook(hook, start_second, end_second, keep_segments)
+    requested_start = start_second
 
     spec = get_format(format)
+
+    # An episode that was never filmed takes the other road entirely. Branching
+    # here rather than at the five call sites means every caller of this
+    # function gets it, and none of them has to know the difference: what comes
+    # back is the same dict describing the same window.
+    from services.audiogram import is_audio_only
+    if is_audio_only(video_path):
+        if hook:
+            raise ValueError(
+                "An opening hook needs a video source. Audiogram clips play one "
+                "continuous range. Drop the hook to render this audio-only clip."
+            )
+        from services.audiogram import render_audiogram
+        return render_audiogram(
+            audio_path=video_path,
+            start_second=start_second,
+            end_second=end_second,
+            caption_style=caption_style,
+            spec=spec,
+            transcript_words=transcript_words,
+            title=title,
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+        )
 
     if trim_opening is None:
         trim_opening = not (keep_segments and len(keep_segments) > 0) and not ordered_mode
@@ -812,7 +1118,22 @@ def generate_clip(
             keep_segments = None
             duration = end_second - start_second
 
+    # The body is final here. The hook is cut as given (widened only to whole
+    # words) and put ahead of it, so every later step reads play_ranges, in
+    # playback order, never re-sorted. None means one continuous range.
+    play_ranges = keep_segments if keep_segments and (ordered_mode or len(keep_segments) > 1) else None
+    if hook:
+        hook = snap_hook_to_words(hook, transcript_words)
+        body = keep_segments or [{"start": start_second, "end": end_second}]
+        play_ranges = order_with_hook(body, hook)
+        duration = sum(r["end"] - r["start"] for r in play_ranges)
+
     length_warning = None
+    # A clip that asks for captions and renders without them used to be
+    # indistinguishable from a clip that never wanted them. Two shipped clips
+    # went out silent that way.
+    caption_warning = None
+    glyph_warning = None
     if duration > spec.dur_max:
         length_warning = f"{duration:.0f}s, over the {spec.dur_max}s {spec.name} target"
         print(f"  {length_warning}", file=sys.stderr, flush=True)
@@ -831,41 +1152,54 @@ def generate_clip(
 
         # Step 1: Cut the segment(s) from the source video
         if progress_callback:
-            n_segs = len(keep_segments) if keep_segments else 1
+            n_segs = len(play_ranges) if play_ranges else 1
             msg = f"Cutting {n_segs} segment{'s' if n_segs > 1 else ''} (1/{total_steps})"
             progress_callback(10, msg)
 
         segment_path = os.path.join(work_dir, "segment.mp4")
-        assembled_segments = bool(keep_segments and (ordered_mode or len(keep_segments) > 1))
-        with timed("render", "cut", segments=len(keep_segments) if keep_segments else 1):
-            if assembled_segments:
-                cut_multi_segment(video_path, segment_path, keep_segments, declick=ordered_mode)
+        part_durations: Optional[list[float]] = None
+        with timed("render", "cut", segments=len(play_ranges) if play_ranges else 1):
+            if play_ranges:
+                _, part_durations = cut_multi_segment(video_path, segment_path, play_ranges, declick=ordered_mode)
             else:
                 cut_segment(video_path, segment_path, start_second, end_second)
 
-        # Remap transcript words for multi-segment clips.
+        # Remap transcript words for multi-segment clips, range by range in
+        # playback order, so a repeated hook's words appear twice.
         # Needed before crop (speaker detection) and captions.
-        if assembled_segments and transcript_words:
-            remapped_words = []
+        remapped_words: list[dict] = []
+        if play_ranges and transcript_words:
             cumulative_t = 0.0
-            for seg in keep_segments:
+            for i, seg in enumerate(play_ranges):
                 seg_words = [
                     w for w in transcript_words
                     if w["end"] > seg["start"] and w["start"] < seg["end"]
                 ]
-                seg_duration = seg["end"] - seg["start"]
+                # Each part is encoded separately before the concat, and an
+                # encoder snaps a cut to whole frames, so its real duration is
+                # typically a few ms off the requested end - start. Advancing
+                # cumulative_t by the planned length instead of the probed
+                # one drifts captions further out of sync with every segment
+                # concatenated in. Fall back to the planned length only if
+                # the part couldn't be probed.
+                requested_duration = seg["end"] - seg["start"]
+                actual_duration = (
+                    part_durations[i]
+                    if part_durations and part_durations[i] > 0
+                    else requested_duration
+                )
                 for w in seg_words:
                     # Clamp to segment bounds to avoid negative/overflow timestamps
                     # for words that straddle a segment boundary
-                    remapped_start = max(0, cumulative_t + (w["start"] - seg["start"]))
-                    remapped_end = min(cumulative_t + seg_duration, cumulative_t + (w["end"] - seg["start"]))
+                    remapped_start = max(cumulative_t, cumulative_t + (w["start"] - seg["start"]))
+                    remapped_end = min(cumulative_t + actual_duration, cumulative_t + (w["end"] - seg["start"]))
                     if remapped_end > remapped_start:
                         remapped_words.append({
                             **w,
                             "start": round(remapped_start, 3),
                             "end": round(remapped_end, 3),
                         })
-                cumulative_t += seg_duration
+                cumulative_t += actual_duration
             crop_words = remapped_words
             crop_clip_start = 0
             caption_time_offset = 0
@@ -882,6 +1216,13 @@ def generate_clip(
         if progress_callback:
             progress_callback(30, f"Resizing for {spec.name} format (2/{total_steps})")
 
+        playback_keyframes = keyframes_to_playback(
+            crop_keyframes,
+            requested_start,
+            play_ranges or [{"start": start_second, "end": end_second}],
+            part_durations,
+        ) if crop_keyframes else crop_keyframes
+
         cropped_path = os.path.join(work_dir, "cropped.mp4")
         with timed("render", "crop", strategy=crop_strategy if spec.reframe else "fit"):
             if spec.reframe:
@@ -891,30 +1232,92 @@ def generate_clip(
                     transcript_words=crop_words,
                     clip_start=crop_clip_start,
                     face_map=face_map,
-                    crop_keyframes=crop_keyframes,
+                    crop_keyframes=playback_keyframes,
                     target_dims=spec.dims,
                 )
             else:
                 fit_to_frame(segment_path, cropped_path, target_dims=spec.dims)
 
+        # Only Remotion draws the name card, and --fast forces the ASS renderer,
+        # which cannot. Refusing beats returning a clip that quietly lacks the
+        # overlay that was asked for.
+        #
+        # Permitting the fallback is no longer a reason to refuse: a card is an
+        # overlay, the pass that draws it runs for overlays whether or not there
+        # are words to caption, and a failure there raises rather than handing
+        # back a bare cut. Refusing on the permission alone meant every `studio`
+        # render, which always permits it, could never draw one.
+        if name_card and name_card.get("title") and use_ass_captions:
+            raise ValueError(
+                "A name card is drawn by the Remotion renderer, and --fast forces "
+                "the ASS one. Drop --name-card, or drop --fast."
+            )
+
         # Step 3: Render captions (Remotion-first; ASS fallback optional)
-        if transcript_words:
+        #
+        # The drawn layer is not only the words. The logo, topic chip, progress
+        # bar and cards are drawn by the same Remotion pass, so a clip that
+        # wants any of them needs that pass to run whether or not it is being
+        # captioned. Without this, "captions off" silently meant "nothing on
+        # screen at all", and a clip that had cards to draw ran the pass and
+        # burned the default caption style over a file that had asked for none.
+        wants_overlay = bool(
+            logo_path or topic or progress or cards or theme
+            or (name_card and name_card.get("title"))
+        )
+        # Default so the sidecar/clean-variant step below has something to
+        # check even when neither branch below runs (no transcript, no overlay).
+        clip_words = []
+        if not captions and wants_overlay:
+            print("  drawing the overlay without captions", flush=True)
+
+        if not transcript_words and not wants_overlay:
+            caption_warning = (
+                f"rendered without captions: no transcript words were passed, so the "
+                f"{caption_style} style had nothing to draw"
+            )
+            print(f"  {caption_warning}", file=sys.stderr, flush=True)
+
+        if transcript_words or wants_overlay:
             if progress_callback:
                 progress_callback(50, f"Adding {caption_style} captions (3/{total_steps})")
 
-            if assembled_segments:
+            if play_ranges:
                 clip_words = remapped_words
             else:
                 clip_words = [
-                    w for w in transcript_words
+                    w for w in (transcript_words or [])
                     if w["end"] > start_second and w["start"] < end_second
                 ]
+
+            words_in_range = len(clip_words)
 
             # Clean filler words
             if clean_fillers:
                 clip_words = _clean_transcript_words(clip_words)
 
-            if clip_words:
+            if not clip_words:
+                caption_warning = (
+                    "rendered without captions: filler cleaning removed every one of "
+                    f"the {words_in_range} words in range"
+                    if words_in_range
+                    else (
+                        "rendered without captions: no transcript words fall between "
+                        f"{start_second:.1f}s and {end_second:.1f}s"
+                    )
+                )
+                print(f"  {caption_warning}", file=sys.stderr, flush=True)
+
+            if clip_words and captions:
+                caption_text = " ".join(w.get("word", "") for w in clip_words)
+                glyph_warning = check_caption_font_coverage(
+                    caption_text, style_config["font_name"], bool(style_config["bold"]),
+                    use_ass=use_ass_captions,
+                )
+                if glyph_warning:
+                    print(f"  {glyph_warning}", file=sys.stderr, flush=True)
+
+            if (clip_words and captions) or wants_overlay:
                 if progress_callback:
                     progress_callback(65, f"Rendering captions into video (3/{total_steps})")
 
@@ -929,20 +1332,46 @@ def generate_clip(
                         caption_style=caption_style,
                         output_path=captioned_path,
                         time_offset=caption_time_offset,
-                        logo_path=logo_path if (style_config.get("logo_support", False) and logo_path) else None,
+                        logo_path=logo_path or None,
+                        name_card=name_card,
+                        motion=motion,
                         keep_caption_overlay=keep_caption_overlay,
                         caption_position=caption_position,
                         caption_font_scale=caption_font_scale,
                         logo_position=logo_position,
+                        logo_scale=logo_scale,
+                        topic=topic,
+                        progress=progress,
+                        cards=cards,
+                        brand=brand,
+                        font_family=font_family,
+                        theme=theme,
+                        captions=captions,
                     )
 
-                if not remotion_ok and not allow_ass_fallback:
+                if not remotion_ok and not captions:
+                    # Nothing else can draw a chip, a bar or a card: the ASS
+                    # path burns words and an overlay is not words. Handing
+                    # back the bare cut here would report success for a clip
+                    # missing everything it was asked for, which is the failure
+                    # this whole switch exists to stop being silent.
+                    if wants_overlay:
+                        raise RuntimeError(
+                            "The overlay could not be drawn: the Remotion renderer "
+                            "failed and nothing else draws a logo, chip, bar or card. "
+                            "The clip is not being delivered without them."
+                        )
+                    # Only a trim and a reframe were asked for, and both are
+                    # already in the cut.
+                    captioned_path = cropped_path
+
+                if not remotion_ok and captions and not allow_ass_fallback:
                     raise RuntimeError(
                         "Remotion caption render failed. ASS fallback is disabled "
                         "(set allow_ass_fallback=true to permit fallback)."
                     )
 
-                if not remotion_ok and allow_ass_fallback:
+                if not remotion_ok and captions and allow_ass_fallback:
                     # Optional fallback: ASS subtitle burn-in
                     ass_path = os.path.join(work_dir, "captions.ass")
                     render_captions(
@@ -956,7 +1385,22 @@ def generate_clip(
 
                     use_gradient = style_config.get("gradient_overlay", False)
                     gradient_opacity = style_config.get("gradient_opacity", 0.6)
-                    use_logo = style_config.get("logo_support", False) and logo_path
+                    use_logo = bool(logo_path)
+
+                    """
+                    The mark, the size Remotion would have drawn it.
+
+                    This path burns a logo with ffmpeg because Remotion could
+                    not run, and it used a flat 80px in a fixed corner: it read
+                    neither the frame height nor the template's logo scale. The
+                    same clip therefore carried a different mark depending on
+                    which renderer happened to succeed, and the studio preview
+                    only ever showed the Remotion one. These are Watermark.tsx's
+                    own numbers against the frame this render actually produced.
+                    """
+                    from services.video_processor import get_dimensions
+                    _, out_h = get_dimensions(cropped_path)
+                    logo_s = (out_h or REMOTION_REFERENCE_HEIGHT) / REMOTION_REFERENCE_HEIGHT
 
                     burn_captions(
                         input_path=cropped_path,
@@ -965,9 +1409,9 @@ def generate_clip(
                         gradient_overlay=use_gradient,
                         gradient_opacity=gradient_opacity,
                         logo_path=logo_path if use_logo else None,
-                        logo_height=style_config.get("logo_height", 80),
-                        logo_margin_x=style_config.get("logo_margin_x", 30),
-                        logo_margin_y=style_config.get("logo_margin_y", 40),
+                        logo_height=round(REMOTION_LOGO_HEIGHT * logo_s * logo_scale),
+                        logo_margin_x=round(REMOTION_LOGO_EDGE * logo_s),
+                        logo_margin_y=round(REMOTION_LOGO_INSET * logo_s),
                         logo_position=logo_position,
                     )
             else:
@@ -986,6 +1430,7 @@ def generate_clip(
         # concat_outro joins two clips head-to-tail, so passing the intro first
         # puts it in front of the clip.
         final_video_path = normalized_path
+        intro_offset = 0.0
         if intro_path and os.path.exists(intro_path):
             if progress_callback:
                 progress_callback(83, "Adding intro")
@@ -996,16 +1441,23 @@ def generate_clip(
             intro_scaled = os.path.join(work_dir, "intro_scaled.mp4")
             scale_to_frame(intro_path, intro_scaled, cw, ch)
             with_intro_path = os.path.join(work_dir, "with_intro.mp4")
-            concat_outro(intro_scaled, final_video_path, with_intro_path)
+            clip_duration = _get_media_duration(final_video_path)
+            concat_outro(intro_scaled, final_video_path, with_intro_path,
+                         crossfade_duration=bookend_fade)
             final_video_path = with_intro_path
+            intro_offset = max(0.0, _get_media_duration(with_intro_path) - clip_duration)
 
+        outro_offset = 0.0
         if outro_path and os.path.exists(outro_path):
             if progress_callback:
                 progress_callback(85, f"Adding outro ({total_steps}/{total_steps})")
 
+            pre_outro_duration = _get_media_duration(final_video_path)
             with_outro_path = os.path.join(work_dir, "with_outro.mp4")
-            concat_outro(final_video_path, outro_path, with_outro_path)
+            concat_outro(final_video_path, outro_path, with_outro_path,
+                         crossfade_duration=bookend_fade)
             final_video_path = with_outro_path
+            outro_offset = max(0.0, _get_media_duration(with_outro_path) - pre_outro_duration)
 
         # Step 6: Move to output
         if progress_callback:
@@ -1024,18 +1476,111 @@ def generate_clip(
 
         # Optional bounded QA/autofix pass for transition jumps.
         # Hard-capped to avoid any infinite rerender loop.
-        max_autofix_passes = _transition_autofix_passes(
-            _reframe_can_jump(
-                reframe=spec.reframe,
-                crop_strategy=crop_strategy,
-                crop_keyframes=crop_keyframes,
-                keep_segments=keep_segments,
-            )
+        max_autofix_passes = _render_transition_autofix_passes(
+            preserve_timing=preserve_timing,
+            reframe=spec.reframe,
+            crop_strategy=crop_strategy,
+            crop_keyframes=crop_keyframes,
+            keep_segments=play_ranges,
         )
         if max_autofix_passes > 0:
             if progress_callback:
                 progress_callback(97, "Quality gate: checking transitions...")
-            _auto_fix_transition_jumps(final_path, max_passes=max_autofix_passes)
+            # The cut from the hook into the body is deliberate. Smoothing
+            # it would blur the first beat the hook exists to land.
+            hook_cut = [intro_offset + (part_durations[0] if part_durations else 0.0)] if hook else []
+            _auto_fix_transition_jumps(
+                final_path,
+                max_passes=max_autofix_passes,
+                designed=_designed_cuts(cards, offset=intro_offset) + hook_cut,
+            )
+
+        # A 0-exit ffmpeg run can still have written a short, silent, or
+        # corrupt file (source ran out under the requested range, a crop/
+        # caption/normalize pass dropped the audio track, a concat mismatch).
+        # Catch that here instead of returning a "successful" result that
+        # describes a different clip than what landed on disk.
+        expected_duration = duration + intro_offset + outro_offset
+        actual_duration = _get_media_duration(final_path)
+        duration_tolerance = max(0.75, 0.05 * expected_duration)
+        if actual_duration <= 0 or abs(actual_duration - expected_duration) > duration_tolerance:
+            os.remove(final_path)
+            raise RuntimeError(
+                f"Render produced a {actual_duration:.2f}s file but expected "
+                f"~{expected_duration:.2f}s (body {duration:.2f}s"
+                f"{f' + intro {intro_offset:.2f}s' if intro_offset else ''}"
+                f"{f' + outro {outro_offset:.2f}s' if outro_offset else ''}). "
+                f"The source video likely ended before the requested range, or "
+                f"the render failed partway through."
+            )
+        if source_has_audio and not probe_has_audio_stream(final_path):
+            os.remove(final_path)
+            raise RuntimeError(
+                "Render completed but the output has no audio stream. "
+                "Re-check the source video and caption/crop pipeline."
+            )
+        decode_error = verify_full_decode(final_path)
+        if decode_error:
+            os.remove(final_path)
+            raise RuntimeError(f"Render produced an undecodable output: {decode_error}")
+
+        # Sidecar subtitles: the same words already burned into the video,
+        # on the same playback clock as the delivered file (clip-local time,
+        # shifted past whatever intro got prepended). clip_words is populated
+        # for overlay-only renders too (logo/cards with captions off), so
+        # gate on whether captions were actually requested rather than just
+        # "were there words": otherwise a captions-off render still gets an
+        # .srt/.vtt describing dialogue nothing on screen shows.
+        want_subtitles = write_subtitles if write_subtitles is not None else captions
+        output_base, _ = os.path.splitext(final_path)
+        sidecar_paths: dict = {}
+        # A re-render claims the same output path as last time
+        # (_reserve_output_path), so a sidecar this pass doesn't produce can
+        # be a leftover from a previous render of this clip, now describing
+        # dialogue or a style that no longer matches. Clear it before
+        # (maybe) writing a fresh one.
+        for stale_ext in (".srt", ".vtt"):
+            stale_sidecar = f"{output_base}{stale_ext}"
+            if os.path.exists(stale_sidecar):
+                os.remove(stale_sidecar)
+        if want_subtitles:
+            retimed_words = [
+                {
+                    "word": w.get("word", ""),
+                    "start": round(max(0.0, w["start"] - caption_time_offset + intro_offset), 3),
+                    "end": round(max(0.0, w["end"] - caption_time_offset + intro_offset), 3),
+                }
+                for w in clip_words
+            ]
+            sidecar_paths = write_sidecars(retimed_words, output_base)
+
+        # Optional clean variant: the same audio, loudness, and intro/outro,
+        # minus burned captions, built from the cropped (pre-caption)
+        # source with the identical normalize_audio/concat_outro calls the
+        # main render used, so the two files only differ in the overlay.
+        clean_output_path = None
+        stale_clean_path = f"{output_base}_clean.mp4"
+        if os.path.exists(stale_clean_path):
+            os.remove(stale_clean_path)
+        if write_clean_variant and os.path.exists(cropped_path):
+            clean_normalized_path = os.path.join(work_dir, "clean_normalized.mp4")
+            normalize_audio(cropped_path, clean_normalized_path)
+            clean_video_path = clean_normalized_path
+
+            if intro_path and os.path.exists(intro_path):
+                clean_with_intro_path = os.path.join(work_dir, "clean_with_intro.mp4")
+                concat_outro(intro_scaled, clean_video_path, clean_with_intro_path,
+                             crossfade_duration=bookend_fade)
+                clean_video_path = clean_with_intro_path
+
+            if outro_path and os.path.exists(outro_path):
+                clean_with_outro_path = os.path.join(work_dir, "clean_with_outro.mp4")
+                concat_outro(clean_video_path, outro_path, clean_with_outro_path,
+                             crossfade_duration=bookend_fade)
+                clean_video_path = clean_with_outro_path
+
+            clean_output_path = f"{output_base}_clean.mp4"
+            shutil.copy2(clean_video_path, clean_output_path)
 
         # Get file size
         file_size = os.path.getsize(final_path)
@@ -1044,9 +1589,21 @@ def generate_clip(
         if progress_callback:
             progress_callback(100, "Clip complete!")
 
+        # "duration" has always meant the content's own length: what
+        # clip_history and the learnings it feeds record, not however long
+        # the delivered file plays including intro/outro. Derive it from the
+        # probed actual_duration (not the planned `duration` window) so a
+        # source that ran out early still gets caught by the check above and
+        # reported as shorter, instead of silently reporting the plan.
+        content_duration = max(0.0, actual_duration - intro_offset - outro_offset)
+
         out = {
             "output_path": final_path,
-            "duration": round(duration, 2),
+            "duration": round(content_duration, 2),
+            # The probed duration of the file actually on disk, including any
+            # intro/outro, for callers that need the delivered file's full
+            # playback length rather than just its content.
+            "output_duration": round(actual_duration, 2),
             "file_size_mb": file_size_mb,
             "title": title,
             # Ordered edits may start in a later source section and finish in an
@@ -1057,9 +1614,15 @@ def generate_clip(
             "caption_style": caption_style,
             "crop_strategy": crop_strategy,
             "format": spec.name,
+            **sidecar_paths,
         }
-        if length_warning:
-            out["warning"] = length_warning
+        if clean_output_path:
+            out["clean_output_path"] = clean_output_path
+        if hook:
+            out["hook"] = hook
+        warnings = [w for w in (caption_warning, length_warning, glyph_warning) if w]
+        if warnings:
+            out["warning"] = "; ".join(warnings)
         if keep_caption_overlay and caption_overlay_path and os.path.exists(caption_overlay_path):
             # Copy out of work_dir before cleanup so the returned paths survive.
             base, _ = os.path.splitext(final_path)

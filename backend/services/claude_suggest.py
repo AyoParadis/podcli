@@ -7,9 +7,11 @@ Delegates moment selection to an AI CLI, which uses the PodStack knowledge base
 Priority: Claude Code → Codex → heuristic fallback.
 """
 
+import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from typing import Optional, Callable
@@ -19,7 +21,9 @@ from services.audio_analyzer import compute_energy_scores
 from services.audio_events import compute_event_scores, dominant_reaction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from presets import MIN_CLIP_DURATION, MAX_CLIP_DURATION, TARGET_CLIP_DURATION_MIN, TARGET_CLIP_DURATION_MAX
+from presets import DEFAULT_PRESET, MIN_CLIP_DURATION, MAX_CLIP_DURATION, TARGET_CLIP_DURATION_MIN, TARGET_CLIP_DURATION_MAX
+from services.formats import get_format
+from services.opening_hook import HOOK_MODES, validate_hook
 from utils.text import clean_title
 from services import ai_provider, podcli_cloud
 from services.ai_cli import (
@@ -34,31 +38,232 @@ from services.ai_cli import (
 
 
 def _load_existing_shorts(episodes_path: str) -> list[str]:
-    """Extract existing short titles from episode database to avoid duplicates."""
+    """Titles of shorts already published, so they are not suggested again.
+
+    Reads the shipped table shape and the older numbered-list shape. Cells left
+    as `[placeholder]` are not titles.
+    """
     if not os.path.exists(episodes_path):
         return []
     try:
         with open(episodes_path, encoding="utf-8") as f:
             content = f.read()
-        # Parse lines that look like shorts entries: "1. [title] — [category]"
-        shorts = []
-        for line in content.split("\n"):
-            line = line.strip()
-            if line and (line.startswith("1.") or line.startswith("2.") or
-                         line.startswith("3.") or line.startswith("4.") or
-                         line.startswith("5.") or line.startswith("6.") or
-                         line.startswith("7.") or line.startswith("8.") or
-                         line.startswith("9.")):
-                # Extract title between brackets or after number
-                title = line.split("—")[0].strip().lstrip("0123456789.").strip()
-                if title and title != "[Short title]":
-                    shorts.append(title)
-        return shorts
-    except Exception:
+    except OSError:
         return []
+
+    shorts: list[str] = []
+    for raw in content.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        title = ""
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            # | # | Moment | Title | Platform | Status |
+            if len(cells) >= 3 and cells[0].lower() not in ("#", "num", "no"):
+                if not all(set(c) <= set("-: ") for c in cells):
+                    status = cells[4].lower() if len(cells) >= 5 else ""
+                    # A dropped moment was considered and passed over, and the
+                    # template says it can be reconsidered. Anything else that
+                    # reached this table is a clip that exists.
+                    if "drop" not in status:
+                        title = cells[2]
+        elif re.match(r"^\d+[.)]\s", line):
+            title = re.split(r"\s[-\u2013\u2014]\s", line, maxsplit=1)[0]
+            title = re.sub(r"^\d+[.)]\s*", "", title).strip()
+
+        title = title.strip().strip("*`").strip()
+        if title and not (title.startswith("[") and title.endswith("]")):
+            shorts.append(title)
+    return shorts
+
+
+# (filename, max_chars) that reach the selection prompt, highest priority first.
+# Shared with kb_signature so the suggestion cache and the prompt cannot drift.
+class ClipBounds:
+    """Duration bounds and prompt framing for one output format.
+
+    formats.py calls itself the single source of truth for duration bounds and
+    every consumer honoured that except the one deciding which moments get
+    picked. Explicit overrides still win, so a Studio slider or a preset can
+    narrow a format without redefining it.
+    """
+
+    __slots__ = ("dur_min", "dur_max", "target_min", "target_max", "editor", "pacing", "lens")
+
+    def __init__(self, spec, dur_min=None, dur_max=None):
+        self.dur_min = int(dur_min) if dur_min else spec.dur_min
+        self.dur_max = int(dur_max) if dur_max else spec.dur_max
+        if self.dur_max < self.dur_min:
+            self.dur_min, self.dur_max = spec.dur_min, spec.dur_max
+        self.target_min = max(spec.target_min, self.dur_min)
+        self.target_max = min(spec.target_max, self.dur_max)
+        if self.target_max < self.target_min:
+            self.target_min, self.target_max = self.dur_min, self.dur_max
+        self.editor = spec.editor
+        self.pacing = spec.pacing
+        self.lens = spec.lens
+
+    @classmethod
+    def of(cls, fmt=None, dur_min=None, dur_max=None) -> "ClipBounds":
+        return cls(get_format(fmt), dur_min, dur_max)
+
+    def keeps(self, seconds: float) -> bool:
+        return self.dur_min <= seconds <= self.dur_max
+
+
+KB_FILES = [
+    ("04-shorts-creation-guide.md", 4000),   # moment selection criteria, content types
+    ("05-title-formulas.md", 3000),          # title rules, shapes, banned openers
+    ("02-voice-and-tone.md", 3000),          # banned words, voice fingerprint, coffee test
+    ("01-brand-identity.md", 1500),          # show context, positioning, audience
+    ("11-inspiration-channels.md", 2000),    # viral hook patterns, reference styles
+    ("12-quick-reference.md", 2000),         # hook bank, title formulas, hashtags
+    ("08-topics-themes.md", 1000),           # topic areas, audience interest map
+    ("00-master-instructions.md", 1500),     # quality gate, auto-detection rules
+]
+
+
+# Bump when the selection rules in _build_prompt change. Folded into the
+# suggestion cache key for the same reason the knowledge base is: replaying old
+# picks under new rules teaches people the rules do nothing.
+PROMPT_VERSION = 6
+
+
+def kb_signature() -> str:
+    """Fingerprint of exactly what the knowledge base contributes to the prompt.
+
+    Hashes the assembled text rather than file mtimes, so it survives a git
+    checkout that rewrites timestamps without changing content, and it already
+    accounts for per-file truncation and for files skipped as unfilled.
+    """
+    from services.knowledge_base import load_kb_context
+
+    kb_dir = paths["knowledge"]
+    parts = [load_kb_context(KB_FILES, kb_dir) or ""]
+    parts.extend(_load_existing_shorts(os.path.join(kb_dir, "03-episodes-database.md")))
+    return hashlib.sha256("\u0000".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+CAPTION_STYLES = ("branded", "hormozi", "karaoke", "subtle")
+
+
+def _preferred_caption_style(kb_dir: str) -> str:
+    """The show's caption style, from the knowledge base or the preset default.
+
+    04-shorts-creation-guide.md carries a "Caption style:" line that nothing
+    read, so every suggestion arrived asking for hormozi regardless of what the
+    show had written down or set as its preset.
+    """
+    path = os.path.join(kb_dir, "04-shorts-creation-guide.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r"^\s*[-*]?\s*caption style\s*:\s*(.+)$", line, re.I)
+                if not m:
+                    continue
+                value = m.group(1).strip().strip("*`").lower()
+                # Still the shipped "[branded / hormozi / karaoke / subtle]" list.
+                if value.startswith("["):
+                    break
+                for style in CAPTION_STYLES:
+                    if value == style:
+                        return style
+                break
+    except OSError:
+        pass
+    return DEFAULT_PRESET.get("caption_style", "branded")
+
+
+# Codex receives its prompt as an argv argument and silently truncates a long
+# one. Truncating the tail drops the end of the episode, which is exactly how a
+# run ends up with every clip in the opening minutes, so the transcript is
+# sampled across the whole timeline instead.
+CODEX_TRANSCRIPT_LIMIT = 48000
+
+
+def _sample_transcript(transcript_text: str, limit: int = CODEX_TRANSCRIPT_LIMIT) -> str:
+    """Thin a transcript to roughly `limit` characters, keeping its full span."""
+    if len(transcript_text) <= limit:
+        return transcript_text
+    lines = transcript_text.split("\n")
+    if len(lines) < 3:
+        return transcript_text[:limit]
+    keep_every = max(2, -(-len(transcript_text) // limit))
+    sampled = lines[::keep_every]
+    # The last line anchors the end of the timeline, which is the half a tail
+    # truncation would have thrown away.
+    if lines[-1] not in sampled[-1:]:
+        sampled.append(lines[-1])
+    return "\n".join(sampled)
+
+
+def _codex_adapter(transcript_text: str):
+    """An `adapt` callback that thins the transcript for Codex only."""
+    def adapt(engine: str, prompt: str) -> str:
+        if engine != "codex" or not transcript_text:
+            return prompt
+        sampled = _sample_transcript(transcript_text)
+        if sampled == transcript_text:
+            return prompt
+        note = (
+            "\n\nNOTE: this transcript is sampled across the full episode, so "
+            "consecutive lines may skip ahead. Timestamps remain exact.\n"
+        )
+        return prompt.replace(transcript_text, note + sampled, 1)
+
+    return adapt
+
+
+def _total_score(clip: dict) -> float:
+    """Sum the model's per-dimension scores, tolerating a malformed one.
+
+    The values are whatever the model emitted. A single string in there used to
+    raise TypeError inside the normalization loop and take down the whole
+    suggestion run rather than costing one clip.
+    """
+    scores = clip.get("scores")
+    if isinstance(scores, dict) and scores:
+        total = 0.0
+        usable = False
+        for value in scores.values():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+            total += float(value)
+            usable = True
+        if usable:
+            return total
+    fallback = clip.get("total_score", 0)
+    try:
+        return float(fallback)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 MAX_REACTION_ANCHORS = 40
+
+
+def _suggested_hook(clip: dict, start: float, end: float, segments: list[dict]) -> Optional[dict]:
+    """The opening hook the model proposed for this clip, or None.
+
+    A hook that is malformed or falls outside the clip it opens is dropped
+    rather than failing the clip: the moment is still worth rendering without it.
+    """
+    raw = clip.get("hook")
+    if not isinstance(raw, dict) or raw.get("mode") not in HOOK_MODES:
+        return None
+    try:
+        hook = {
+            "start": round(float(raw.get("start")), 1),
+            "end": round(float(raw.get("end")), 1),
+            "mode": raw["mode"],
+        }
+        return validate_hook(hook, start, end, segments)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_reaction_anchors(reaction_times: list[float] | None) -> str:
@@ -84,6 +289,7 @@ def _build_prompt(
     exclude_clips: list[dict] | None = None,
     reaction_times: list[float] | None = None,
     quality_only: bool = False,
+    bounds: "ClipBounds | None" = None,
 ) -> str:
     """Build the prompt for Claude to extract clips.
 
@@ -95,18 +301,7 @@ def _build_prompt(
     from services.knowledge_base import load_kb_context, warn_missing_context
 
     kb_dir = paths["knowledge"]
-    # (filename, max_chars) — higher priority files get more budget
-    _kb_files = [
-        ("04-shorts-creation-guide.md", 4000),   # moment selection criteria, content types
-        ("05-title-formulas.md", 3000),           # title rules, shapes, banned openers
-        ("02-voice-and-tone.md", 3000),           # banned words, voice fingerprint, coffee test
-        ("01-brand-identity.md", 1500),           # show context, positioning, audience
-        ("11-inspiration-channels.md", 2000),     # viral hook patterns, reference styles
-        ("12-quick-reference.md", 2000),          # hook bank, title formulas, hashtags
-        ("08-topics-themes.md", 1000),            # topic areas, audience interest map
-        ("00-master-instructions.md", 1500),      # quality gate, auto-detection rules
-    ]
-    kb_context = load_kb_context(_kb_files, kb_dir)
+    kb_context = load_kb_context(KB_FILES, kb_dir)
     if not kb_context:
         warn_missing_context("clip scoring")
 
@@ -129,6 +324,7 @@ def _build_prompt(
                 + "\n".join(lines)
             )
 
+    b = bounds or ClipBounds.of()
     selection_goal = (
         "Find every genuinely scroll-stopping moment in this podcast transcript. "
         "There is no clip quota: return all strong moments and skip every weak one."
@@ -145,7 +341,7 @@ def _build_prompt(
         else ""
     )
 
-    return f"""You are a viral clip editor for TikTok and YouTube Shorts. {selection_goal}
+    return f"""You are {b.editor}. {selection_goal}
 
 IMPORTANT: Return ONLY valid JSON. No markdown, no explanation, no code fences.
 {quality_gate}
@@ -154,25 +350,30 @@ TIMESTAMP FORMAT: All timestamps in the transcript are in SECONDS (e.g., [123.4s
 All timestamps you return MUST be in SECONDS as numbers (e.g., 123.4), NOT minutes:seconds.
 
 DURATION RULES (CRITICAL):
-- Target: {TARGET_CLIP_DURATION_MIN}-{TARGET_CLIP_DURATION_MAX} seconds (this is the viral sweet spot)
-- Maximum: {MAX_CLIP_DURATION} seconds (anything longer still renders, but gets flagged as over target)
-- Minimum: {MIN_CLIP_DURATION} seconds (too short = no payoff)
-- SHORTER IS BETTER. A punchy 25s clip outperforms a 40s clip every time.
-- If a thought takes longer than {TARGET_CLIP_DURATION_MAX}s, use segments to cut the filler in the middle
+- Target: {b.target_min}-{b.target_max} seconds (this is the sweet spot)
+- Maximum: {b.dur_max} seconds (anything longer still renders, but gets flagged as over target)
+- Minimum: {b.dur_min} seconds (too short = no payoff)
+- {b.pacing}
+- If a thought takes longer than {b.target_max}s, use segments to cut the filler in the middle
 
 CUTTING RULES (CRITICAL):
 - Cut TIGHT. Every second must earn its place.
 - Start at the exact moment the hook hits — no preamble, no "so", no "well"
+- ONE EXCEPTION: if the moment is an ANSWER, start on the QUESTION that prompted it.
+  A question is not preamble, it is the setup the viewer needs. Only leave it out when
+  it rambles past ~8 seconds, and then cut the rambling with "segments" or skip the moment.
 - End the MOMENT the point lands with a complete thought — don't trail off
 - NEVER cut mid-sentence or mid-thought. The viewer must feel closure.
 - The last sentence must feel like a natural ending, a punchline, or a mic-drop
 - If there's filler/tangent in the middle, use multiple segments to skip it
-- A 30s clip with zero dead weight beats a {MAX_CLIP_DURATION}s clip with fluff
+- A tight clip with zero dead weight beats a {b.dur_max}s clip with fluff
 
-MOMENT SELECTION (think like a TikTok editor):
+MOMENT SELECTION ({b.lens}):
 - Would YOU stop scrolling for this? If no, skip it.
 - First 3 seconds must HOOK — a bold claim, shocking number, or provocative question
 - Must make complete sense standalone — no "as I mentioned" or "going back to"
+- Must not OPEN on a word pointing back before the cut: "that", "it", "they", "yeah",
+  "so", "exactly", "right", "which is why". Widen the start until it is inside the clip.
 - Must end on a COMPLETE THOUGHT — sentence boundary, natural pause, or mic-drop moment
 - Single focused idea — one concept, fully delivered, no loose threads
 - Prioritize: controversial takes, surprising numbers, founder war stories, "wait what?" moments, emotional peaks
@@ -181,8 +382,21 @@ MOMENT SELECTION (think like a TikTok editor):
 
 {f"KNOWLEDGE BASE:{kb_context}" if kb_context else ""}
 
-{f"EXISTING SHORTS (avoid duplicating these moments):{chr(10).join('- ' + s for s in existing_shorts)}" if existing_shorts else ""}
+{f"ALREADY PUBLISHED (do NOT suggest these moments again):{chr(10)}{chr(10).join('- ' + s for s in existing_shorts)}" if existing_shorts else ""}
 {excluded_ranges}{_format_reaction_anchors(reaction_times)}
+
+CONTEXT RULES (CRITICAL):
+- State the PAYOFF first: one sentence, second person, on what the viewer walks away with.
+  If you cannot state it in one sentence, the moment is not a clip. Skip it.
+- WRITE the title from the payoff. Never copy the first sentence of the moment into
+  it. A transcript fragment is not a title: "Is it having a big?" and "Was not working
+  so well" are what copying produces, and they promise the viewer nothing.
+- The title must be a complete thought that reads on its own, under 60 characters.
+- In "needs", name what the viewer must already know. Write "nothing" when the clip
+  carries its own setup.
+- If "needs" is anything other than "nothing", move start_second back until the clip
+  covers it on camera. "context_line" is a note for the editor, not a fix: nothing burns
+  it into the video, so a clip that leans on it still ships with no setup.
 
 Score each moment on 4 dimensions (1-5 each):
 - standalone: Makes sense without episode context?
@@ -196,7 +410,7 @@ Return this exact JSON structure:
 {{
   "clips": [
     {{
-      "title": "First strong sentence from the moment",
+      "title": "Written from the payoff, never copied from the transcript",
       "start_second": 123.4,
       "end_second": 168.4,
       "segments": [
@@ -208,7 +422,10 @@ Return this exact JSON structure:
       "scores": {{"standalone": 4, "hook": 5, "relevance": 4, "quotability": 3}},
       "total_score": 16,
       "quote": "The key quote from this moment",
-      "why": "One sentence on why this works as a short"
+      "payoff": "What the viewer walks away with, one sentence, second person",
+      "needs": "nothing",
+      "context_line": "",
+      "why": "One sentence on why this earns 30 seconds of a stranger's attention"
     }}
   ]
 }}
@@ -223,8 +440,14 @@ SEGMENTS RULES:
 - "start_second" / "end_second" = outer bounds (first segment start, last segment end)
 - Example: speaker makes great point (10s), rambles (8s), delivers punchline (12s) → 2 segments, 22s total
 
+HOOK (optional):
+- If the sharpest line sits mid-clip, add "hook": {{"start": X, "end": Y, "mode": "repeat"}} so it plays first.
+- It must be 1-15 seconds of words actually spoken inside the clip's segments. Never invent text.
+- "repeat" plays it again where it belongs. "move" lifts it out of the body.
+- Leave "hook" out when the clip already opens on its strongest line.
+
 Rules:
-- Final clip duration (sum of segments) MUST be {MIN_CLIP_DURATION}-{MAX_CLIP_DURATION} seconds (target {TARGET_CLIP_DURATION_MIN}-{TARGET_CLIP_DURATION_MAX}s)
+- Final clip duration (sum of segments) MUST be {b.dur_min}-{b.dur_max} seconds (target {b.target_min}-{b.target_max}s)
 - Each segment must start and end on COMPLETE SENTENCES — never mid-thought
 - The LAST segment must end on a sentence that feels like a natural conclusion
 - Must make sense standalone when stitched together
@@ -337,12 +560,16 @@ def _drop_clips_overlapping(clips: list[dict], exclude_clips: list[dict]) -> lis
 
 
 def _select_top_by_score(clips: list[dict], top_n: int) -> list[dict]:
-    """Keep the highest-scored `top_n` clips, then order them by start time.
-    Ranking by score must come before truncation — otherwise the earliest clips
-    ship, not the best ones."""
+    """Keep the best `top_n` clips, then order them by start time.
+
+    An explicit `rank` wins over the score, but only when every clip has one.
+    """
     if len(clips) <= top_n:
         return sorted(clips, key=lambda c: c.get("start_second", 0))
-    ranked = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)[:top_n]
+    if clips and all(isinstance(c.get("rank"), int) for c in clips):
+        ranked = sorted(clips, key=lambda c: c["rank"])[:top_n]
+    else:
+        ranked = sorted(clips, key=lambda c: c.get("score", 0), reverse=True)[:top_n]
     return sorted(ranked, key=lambda c: c.get("start_second", 0))
 
 
@@ -352,12 +579,14 @@ def find_moments_from_text(
     existing_clips: Optional[list[dict]] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
     max_results: int = 3,
+    bounds: ClipBounds | None = None,
 ) -> list[dict]:
     """Locate the moment(s) the user described/pasted in the transcript.
     Returns clip dicts (same shape as suggest_with_claude). Status goes to
     progress_callback; warnings to stderr — never stdout, which is the task
     runner's JSON-RPC channel."""
     existing_clips = existing_clips or []
+    bounds = bounds or ClipBounds.of()
     if not ai_provider.available():
         print("No AI available for moment search", file=sys.stderr, flush=True)
         return []
@@ -382,15 +611,24 @@ RULES:
 - The user may list several moments — return one clip per distinct moment they mention
 - Return 1-{upper} matching moments (best match first)
 - All timestamps in SECONDS as numbers
-- Duration target: {TARGET_CLIP_DURATION_MIN}-{TARGET_CLIP_DURATION_MAX} seconds, max {MAX_CLIP_DURATION} seconds
+- Duration target: {bounds.target_min}-{bounds.target_max} seconds, max {bounds.dur_max} seconds
 - Cut tight: start at the hook, end when the point lands
 - Use segments to cut filler if needed
+- If the moment is an ANSWER, start on the QUESTION that prompted it. A question is
+  not preamble. If it rambles past ~8 seconds, cut the rambling with "segments".
+- State the PAYOFF: one sentence, second person, on what the viewer walks away with.
+  Write the title from it. Never copy the first sentence of the moment into the title.
+- In "needs", name what the viewer must already know, or "nothing". If it is anything
+  else, move start_second back until the clip covers it. "context_line" is a note for
+  the editor, not a fix: nothing burns it into the video.
+- Optional "hook": {{"start": X, "end": Y, "mode": "repeat" or "move"}}, 1-15 seconds of
+  words spoken inside the clip, played first. Leave it out when the clip opens strong.
 
 Return this JSON:
 {{
   "clips": [
     {{
-      "title": "First sentence of the moment",
+      "title": "Written for the viewer, never copied from the transcript",
       "start_second": 123.4,
       "end_second": 158.4,
       "segments": [{{"start": 123.4, "end": 158.4}}],
@@ -399,6 +637,9 @@ Return this JSON:
       "scores": {{"standalone": 4, "hook": 5, "relevance": 4, "quotability": 3}},
       "total_score": 16,
       "quote": "The key quote",
+      "payoff": "What the viewer walks away with, one sentence, second person",
+      "needs": "nothing",
+      "context_line": "",
       "why": "Why this matches what the user asked for"
     }}
   ]
@@ -413,15 +654,16 @@ Transcript:
         if progress_callback:
             progress_callback(40, f"Searching transcript with {label}...")
 
+    caption_style = _preferred_caption_style(paths["knowledge"])
     try:
         data, _result = ai_provider.generate_json(
             prompt, timeout=900, project_dir=project_dir, on_attempt=announce,
+            adapt=_codex_adapter(transcript_text),
         )
         if data:
             found = []
             for c in data.get("clips", []):
-                scores = c.get("scores", {})
-                total = sum(scores.values()) if scores else c.get("total_score", 0)
+                total = _total_score(c)
                 keep_segments = []
                 for seg in c.get("segments", []):
                     s = round(float(seg.get("start", 0)), 1)
@@ -435,20 +677,26 @@ Transcript:
                     keep_segments = [{"start": start_sec, "end": end_sec}]
 
                 kept_duration = sum(seg["end"] - seg["start"] for seg in keep_segments)
-                if kept_duration < MIN_CLIP_DURATION or kept_duration > MAX_CLIP_DURATION:
+                if not bounds.keeps(kept_duration):
                     continue
 
+                clip_start = keep_segments[0]["start"] if keep_segments else start_sec
+                clip_end = keep_segments[-1]["end"] if keep_segments else end_sec
                 found.append({
                     "title": clean_title(c.get("title", "Untitled")),
-                    "start_second": keep_segments[0]["start"] if keep_segments else start_sec,
-                    "end_second": keep_segments[-1]["end"] if keep_segments else end_sec,
+                    "start_second": clip_start,
+                    "end_second": clip_end,
                     "segments": keep_segments,
+                    "hook": _suggested_hook(c, clip_start, clip_end, keep_segments),
                     "duration": round(kept_duration),
                     "score": total,
                     "content_type": c.get("content_type", "unknown"),
                     "reasoning": c.get("why", ""),
+                    "payoff": c.get("payoff", ""),
+                    "standalone": c.get("needs", ""),
+                    "context_line": c.get("context_line", ""),
                     "preview_text": c.get("quote", "")[:120],
-                    "suggested_caption_style": "hormozi",
+                    "suggested_caption_style": caption_style,
                     "quote": c.get("quote", ""),
                     "why": c.get("why", ""),
                     "reasons": [c.get("content_type", "")],
@@ -474,6 +722,7 @@ def suggest_with_claude(
     error_sink: Optional[list[str]] = None,
     reaction_times: list[float] | None = None,
     quality_only: bool = False,
+    bounds: ClipBounds | None = None,
 ) -> Optional[list[dict]]:
     """
     Use an AI CLI (Claude Code or Codex) to extract the best clip moments.
@@ -484,6 +733,7 @@ def suggest_with_claude(
     providers = ai_provider.status()["providers"]
     if not providers:
         return None
+    bounds = bounds or ClipBounds.of()
 
     if progress_callback:
         progress_callback(0, f"Preparing transcript for {providers[0]['label']}...")
@@ -503,6 +753,7 @@ def suggest_with_claude(
         exclude_clips=exclude_clips,
         reaction_times=reaction_times,
         quality_only=quality_only,
+        bounds=bounds,
     )
 
     project_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -555,6 +806,8 @@ def suggest_with_claude(
     learned = podcli_cloud.prompt_block()
     if learned:
         instruction = f"{learned}\n\n{instruction}"
+        # local_prompt replaces the prompt outright, so local backends need it too.
+        prompt = f"{learned}\n\n{prompt}"
 
     attempt = ai_provider.generate(
         instruction,
@@ -567,6 +820,7 @@ def suggest_with_claude(
         # Local backends keep the prompt exactly as it has always been built;
         # only the cloud sees the split form.
         local_prompt=prompt,
+        adapt=_codex_adapter(transcript_text),
     )
 
     if not attempt.ok:
@@ -611,11 +865,10 @@ def suggest_with_claude(
     for alternate in attempt.alternates:
         clips.extend(records(ai_provider.extract_json(alternate)))
 
+    caption_style = _preferred_caption_style(paths["knowledge"])
     normalized = []
     for c in clips:
-        scores = c.get("scores")
-        scores = scores if isinstance(scores, dict) else {}
-        total = sum(scores.values()) if scores else c.get("total_score", 0)
+        total = _total_score(c)
 
         raw_segments = c.get("segments")
         raw_segments = raw_segments if isinstance(raw_segments, list) else []
@@ -635,20 +888,26 @@ def suggest_with_claude(
             keep_segments = [{"start": start_sec, "end": end_sec}]
 
         kept_duration = sum(seg["end"] - seg["start"] for seg in keep_segments)
-        if kept_duration < MIN_CLIP_DURATION or kept_duration > MAX_CLIP_DURATION:
+        if not bounds.keeps(kept_duration):
             continue
 
+        clip_start = keep_segments[0]["start"] if keep_segments else start_sec
+        clip_end = keep_segments[-1]["end"] if keep_segments else end_sec
         normalized.append({
             "title": clean_title(c.get("title", "Untitled")),
-            "start_second": keep_segments[0]["start"] if keep_segments else start_sec,
-            "end_second": keep_segments[-1]["end"] if keep_segments else end_sec,
+            "start_second": clip_start,
+            "end_second": clip_end,
             "segments": keep_segments,
+            "hook": _suggested_hook(c, clip_start, clip_end, keep_segments),
             "duration": round(kept_duration),
             "score": total,
             "content_type": c.get("content_type", "unknown"),
             "reasoning": c.get("why", ""),
+            "payoff": c.get("payoff", ""),
+            "standalone": c.get("needs", ""),
+            "context_line": c.get("context_line", ""),
             "preview_text": c.get("quote", "")[:120],
-            "suggested_caption_style": "hormozi",
+            "suggested_caption_style": caption_style,
             "quote": c.get("quote", ""),
             "why": c.get("why", ""),
             "reasons": [c.get("content_type", "")],
@@ -686,6 +945,7 @@ def suggest_initial_with_claude(
     error_sink: Optional[list[str]] = None,
     reaction_times: list[float] | None = None,
     quality_only: bool = False,
+    bounds: ClipBounds | None = None,
 ) -> Optional[list[dict]]:
     """
     Initial clip discovery entry point.
@@ -706,6 +966,7 @@ def suggest_initial_with_claude(
             timeout=180,
             reaction_times=reaction_times,
             **quality_kwargs,
+            bounds=bounds,
         )
 
     start_bound = float(segments[0].get("start", 0))
@@ -739,6 +1000,7 @@ def suggest_initial_with_claude(
             timeout=180,
             reaction_times=reaction_times,
             **quality_kwargs,
+            bounds=bounds,
         )
 
     if progress_callback:
@@ -773,6 +1035,7 @@ def suggest_initial_with_claude(
                 t for t in (reaction_times or []) if bucket["start"] <= t <= bucket["end"]
             ] or None,
             **quality_kwargs,
+            bounds=bounds,
         )
         if not bucket_clips:
             continue
@@ -798,6 +1061,7 @@ def suggest_initial_with_claude(
         timeout=120,
         reaction_times=reaction_times,
         **quality_kwargs,
+        bounds=bounds,
     )
     if fallback_clips:
         deduped = _dedupe_clips_by_range(deduped + fallback_clips)
@@ -846,14 +1110,119 @@ def blend_signal_scores(
     return clips
 
 
+MIN_RANKABLE_SURPLUS = 2
+
+
+def rank_clips_with_ai(
+    clips: list[dict],
+    top_n: int,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    timeout: int = 45,
+) -> list[dict]:
+    """Compare a whole candidate pool in one transcript-free pass.
+
+    Mutates and returns `clips`, writing a 1-based `rank` and leaving `score`
+    untouched. Falls back to score ordering on any failure.
+    """
+    if len(clips) < top_n + MIN_RANKABLE_SURPLUS:
+        return clips
+
+    lines = []
+    for idx, clip in enumerate(clips):
+        boost = clip.get("signal_boost")
+        lines.append(
+            f'{idx}. "{clip.get("title", "Untitled")}" '
+            f'[{clip.get("duration", 0)}s, {clip.get("content_type", "unknown")}, '
+            f'score {clip.get("score", 0)}'
+            + (f', audience reaction +{boost}' if boost else "")
+            + "]\n"
+            f'   quote: {str(clip.get("quote", ""))[:200]}\n'
+            f'   why: {str(clip.get("why", ""))[:200]}'
+        )
+
+    learned = podcli_cloud.prompt_block()
+    prompt = f"""You are choosing which {top_n} of these {len(clips)} podcast clips to publish.
+
+IMPORTANT: Return ONLY valid JSON. No markdown, no explanation, no code fences.
+
+Each candidate was found by a separate pass over one stretch of the episode, so
+their scores are not comparable to each other. Rank them against each other now.
+
+Rank on:
+- Would a stranger stop scrolling for this? That is the whole job.
+- Does it stand alone, with no missing setup?
+- Does it end on a complete thought rather than trailing off?
+- Variety across the set: {top_n} clips that make the same point is one clip.
+
+{f"{learned}{chr(10)}{chr(10)}" if learned else ""}CANDIDATES:
+{chr(10).join(lines)}
+
+Return this exact JSON structure, best first, every candidate listed exactly once:
+{{
+  "ranked": [
+    {{"id": 3, "why": "One sentence on why this outranks the rest"}},
+    {{"id": 0, "why": "..."}}
+  ]
+}}"""
+
+    label = {"value": "AI"}
+
+    def announce(name: str) -> None:
+        label["value"] = name
+        if progress_callback:
+            progress_callback(0, f"Ranking {len(clips)} candidates with {name}...")
+
+    project_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    payload, result = ai_provider.generate_json(
+        prompt,
+        timeout=timeout,
+        project_dir=project_dir,
+        on_attempt=announce,
+        purpose="rank_moments",
+    )
+
+    def give_up(reason: str) -> list[dict]:
+        if progress_callback:
+            progress_callback(100, f"Ranking unavailable, using scores ({reason})")
+        print(f"Clip ranking skipped: {reason}", file=sys.stderr, flush=True)
+        return clips
+
+    if not result.ok:
+        return give_up(result.error or "ranking pass produced no response")
+    if not isinstance(payload, dict) or not isinstance(payload.get("ranked"), list):
+        return give_up(f"{label['value']} returned a ranking in an unreadable shape")
+
+    order: list[int] = []
+    for entry in payload["ranked"]:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("id")
+        if isinstance(idx, int) and 0 <= idx < len(clips) and idx not in order:
+            order.append(idx)
+
+    if len(order) < len(clips):
+        return give_up(
+            f"{label['value']} ranked {len(order)} of {len(clips)} candidates"
+        )
+
+    for position, idx in enumerate(order, start=1):
+        clips[idx]["rank"] = position
+    if progress_callback:
+        progress_callback(100, f"{label['value']} ranked {len(clips)} candidates")
+    return clips
+
+
 def select_clips_with_signal_scores(
     clips: list[dict],
     top_n: int,
     energy_data: list[dict] | None = None,
     events_data: list[dict] | None = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> list[dict]:
+    """Blend the audio signals in, rank against each other, cut to `top_n`."""
     blended = blend_signal_scores(clips, energy_data=energy_data, events_data=events_data)
-    return _select_top_by_score(blended, top_n)
+    ranked = rank_clips_with_ai(blended, top_n, progress_callback=progress_callback)
+    return _select_top_by_score(ranked, top_n)
 
 
 def _bucket_coverage_seconds(existing_clips: list[dict], start: float, end: float) -> float:
@@ -881,6 +1250,7 @@ def suggest_more_with_claude(
     existing_clips: list[dict],
     top_n: int = 8,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    bounds: ClipBounds | None = None,
 ) -> Optional[list[dict]]:
     """
     Ask the AI for more clips by searching under-covered time buckets first.
@@ -922,6 +1292,7 @@ def suggest_more_with_claude(
             top_n=top_n,
             exclude_clips=existing_clips,
             progress_callback=progress_callback,
+            bounds=bounds,
         )
 
     buckets.sort(key=lambda b: (b["coverage_ratio"], b["coverage_seconds"], b["start"]))
@@ -947,6 +1318,7 @@ def suggest_more_with_claude(
                     f"{bucket_label}: {msg}" if msg else msg,
                 )
             ),
+            bounds=bounds,
         )
         if not bucket_clips:
             continue
@@ -972,6 +1344,7 @@ def suggest_more_with_claude(
                         f"{bucket_label}: {msg}" if msg else msg,
                     )
                 ),
+                bounds=bounds,
             )
             if not bucket_clips:
                 continue
@@ -992,6 +1365,7 @@ def suggest_more_with_claude(
                     f"global pass: {msg}" if msg else msg,
                 )
             ),
+            bounds=bounds,
         )
         if fallback_clips:
             aggregated.extend(fallback_clips)

@@ -74,7 +74,6 @@ STYLES = {
         "words_per_chunk": 3,                  # Show 3 words at a time
         "uppercase": True,
         "gradient_overlay": False,
-        "logo_support": False,
     },
     "karaoke": {
         "description": "Full sentence visible, words highlight progressively",
@@ -92,7 +91,6 @@ STYLES = {
         "words_per_chunk": 5,
         "uppercase": False,
         "gradient_overlay": False,
-        "logo_support": False,
     },
     "subtle": {
         "description": "Clean white text at bottom with shadow, professional look",
@@ -110,7 +108,23 @@ STYLES = {
         "words_per_chunk": 5,
         "uppercase": False,
         "gradient_overlay": False,
-        "logo_support": False,
+    },
+    "outline": {
+        "description": "A whole line at a time in white with a heavy black outline, no box. Stays readable without covering the shot.",
+        "font_name": DETECTED_FONT,
+        "font_size": 78,
+        "primary_color": "&H00FFFFFF",          # White
+        "active_color": None,                   # The line is the unit, no sweep
+        "outline_color": "&H00000000",          # Black
+        "back_color": "&H00000000",             # Transparent: the outline does the work
+        "bold": True,
+        "outline_width": 6,                     # Heavy enough to carry over any footage
+        "shadow_depth": 0,                      # An outline and a shadow together read as mud
+        "alignment": 2,
+        "margin_v": 460,                        # Clears the app's own title and handle
+        "words_per_chunk": 7,
+        "uppercase": False,
+        "gradient_overlay": False,
     },
     "branded": {
         "description": "Large bold text, 5-7 words wrapping across 2 lines, dark rounded pill on active word. Clean, no gradient.",
@@ -134,7 +148,6 @@ STYLES = {
         "uppercase": False,                     # Mixed case, natural capitalization
         "gradient_overlay": False,              # No gradient — clean direct-on-video
         "gradient_opacity": 0.0,
-        "logo_support": True,                   # Logo top-left
         "logo_margin_x": 40,                    # Logo X offset from left
         "logo_margin_y": 60,                    # Logo Y offset from top
         "logo_height": 100,                     # Logo height in px

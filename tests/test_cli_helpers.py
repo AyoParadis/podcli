@@ -55,3 +55,87 @@ class SharedWavTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectionSignatureTests(unittest.TestCase):
+    """The suggestions cache is only allowed to replay picks made under the
+    same rules."""
+
+    def _sig(self, config, kb="kb-a"):
+        with mock.patch("services.claude_suggest.kb_signature", return_value=kb):
+            return cli_mod._selection_signature(config)
+
+    def test_editing_the_knowledge_base_invalidates_an_ai_session(self):
+        cfg = {"ai_select": True}
+        self.assertNotEqual(self._sig(cfg, kb="kb-a"), self._sig(cfg, kb="kb-b"))
+
+    def test_editing_the_knowledge_base_leaves_a_saliency_session_alone(self):
+        cfg = {"ai_select": False}
+        self.assertEqual(self._sig(cfg, kb="kb-a"), self._sig(cfg, kb="kb-b"))
+
+    def test_changing_profile_invalidates(self):
+        a = self._sig({"ai_select": True, "profile": "party"})
+        b = self._sig({"ai_select": True})
+        self.assertNotEqual(a, b)
+
+    def test_turning_energy_off_invalidates(self):
+        a = self._sig({"ai_select": True, "energy_boost": False})
+        b = self._sig({"ai_select": True, "energy_boost": True})
+        self.assertNotEqual(a, b)
+
+    def test_an_unreadable_knowledge_base_does_not_raise(self):
+        with mock.patch("services.claude_suggest.kb_signature", side_effect=OSError("boom")):
+            self.assertIn("kb-unavailable", cli_mod._selection_signature({"ai_select": True}))
+
+    def test_two_failed_lookups_never_compare_equal(self):
+        # Otherwise a session saved during one failure replays during the next,
+        # after the knowledge base has changed underneath it.
+        with mock.patch("services.claude_suggest.kb_signature", side_effect=OSError("boom")):
+            a = cli_mod._selection_signature({"ai_select": True})
+            b = cli_mod._selection_signature({"ai_select": True})
+        self.assertNotEqual(a, b)
+
+
+class ExplicitClipBoundsTests(unittest.TestCase):
+    """config is seeded from DEFAULT_PRESET, which carries the vertical numbers.
+    Forwarding those unconditionally would make --format horizontal a no-op."""
+
+    def test_untouched_preset_values_do_not_override_the_format(self):
+        from presets import DEFAULT_PRESET
+
+        config = {**DEFAULT_PRESET, "format": "horizontal"}
+        self.assertEqual(cli_mod._explicit_clip_bounds(config), (None, None))
+
+    def test_a_value_the_user_changed_is_forwarded(self):
+        from presets import DEFAULT_PRESET
+
+        config = {**DEFAULT_PRESET, "min_clip_duration": 30}
+        self.assertEqual(cli_mod._explicit_clip_bounds(config), (30, None))
+
+    def test_horizontal_selection_uses_the_format_window(self):
+        from presets import DEFAULT_PRESET
+        from services.claude_suggest import ClipBounds
+
+        config = {**DEFAULT_PRESET, "format": "horizontal"}
+        bounds = ClipBounds.of(config["format"], *cli_mod._explicit_clip_bounds(config))
+        self.assertEqual((bounds.dur_min, bounds.dur_max), (60, 300))
+
+
+class JsonObjectArgTests(unittest.TestCase):
+    """`--style` is validated up front: malformed input stops the run rather
+    than rendering with a theme nobody asked for."""
+
+    def test_missing_value_is_none(self):
+        self.assertIsNone(cli_mod._json_object_arg(None, "--style"))
+
+    def test_a_valid_object_passes_through(self):
+        parsed = cli_mod._json_object_arg('{"pack": "collage"}', "--style")
+        self.assertEqual(parsed, {"pack": "collage"})
+
+    def test_malformed_json_exits(self):
+        with self.assertRaises(SystemExit):
+            cli_mod._json_object_arg("not json", "--style")
+
+    def test_a_json_array_is_not_an_object(self):
+        with self.assertRaises(SystemExit):
+            cli_mod._json_object_arg("[1, 2]", "--style")

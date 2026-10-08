@@ -115,7 +115,48 @@ class SuggestReactionTimesTests(unittest.TestCase):
     def test_quality_only_is_forwarded_to_ai_selection(self):
         captured, _ = self._run({"segments": SEGMENTS, "quality_only": True})
         self.assertTrue(captured["quality_only"])
+    def test_a_pool_is_requested_even_with_no_audio_to_analyse(self):
+        captured, _ = self._run({"segments": SEGMENTS, "top_n": 3})
+        self.assertEqual(captured["top_n"], 6)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SignalProfileReuseTests(unittest.TestCase):
+    """Scoring a cached profile is pure; the decode and the model pass are what
+    cost. Passing cached data must skip extraction, not redo it."""
+
+    SEGMENTS = [{"start": float(i), "end": float(i) + 1.0, "text": "x"} for i in range(5)]
+
+    def test_energy_profile_skips_extraction_when_given_data(self):
+        from services import audio_analyzer
+
+        with mock.patch.object(audio_analyzer, "extract_audio_energy") as extract:
+            profile = audio_analyzer.get_energy_profile(
+                "/video.mp4", self.SEGMENTS, energy_data=ENERGY_DATA
+            )
+        extract.assert_not_called()
+        self.assertEqual(profile["energy_data"], ENERGY_DATA)
+        self.assertEqual(len(profile["segment_scores"]), len(self.SEGMENTS))
+
+    def test_energy_profile_still_extracts_without_data(self):
+        from services import audio_analyzer
+
+        with mock.patch.object(
+            audio_analyzer, "extract_audio_energy", return_value=ENERGY_DATA
+        ) as extract:
+            audio_analyzer.get_energy_profile("/video.mp4", self.SEGMENTS)
+        extract.assert_called_once()
+
+    def test_event_profile_skips_extraction_when_given_data(self):
+        from services import audio_events
+
+        with mock.patch.object(audio_events, "is_available", return_value=True), \
+             mock.patch.object(audio_events, "extract_audio_events") as extract:
+            profile = audio_events.get_event_profile(
+                "/video.mp4", self.SEGMENTS, events_data=EVENTS_DATA
+            )
+        extract.assert_not_called()
+        self.assertEqual(profile["events_data"], EVENTS_DATA)

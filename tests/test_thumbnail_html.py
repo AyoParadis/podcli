@@ -14,6 +14,11 @@ from services import thumbnail_html as th
 
 
 class ThumbnailHtmlTests(unittest.TestCase):
+    def test_default_font_stack_covers_georgian(self):
+        cfg = th._load_config()
+        self.assertIn("Noto Sans Georgian", cfg["font_family"])
+        self.assertIn("Noto+Sans+Georgian", cfg["font_import_url"])
+
     def test_prepare_thumbnail_lines_compacts_long_sentence_title(self):
         line1, line2 = th._prepare_thumbnail_lines(
             "We build 10 megawatt data centers in 200 days — everyone is shocked",
@@ -121,6 +126,78 @@ class ThumbnailHtmlTests(unittest.TestCase):
 
         self.assertEqual(output, "/tmp/thumb.png")
         self.assertEqual(run_mock.call_args_list[0].args[0], ["node", "script", "a", "b", "1080", "1920", "1500"])
+
+
+class LayerTests(unittest.TestCase):
+    """
+    The parts a show adds itself, over a template whose anatomy is fixed.
+
+    A layer nobody can see is worse than one that fails to draw: the picture
+    goes out with a badge missing and nothing says so. Everything here is
+    about a layer either appearing where it was put or being skipped for a
+    reason.
+    """
+
+    def test_draws_a_badge_and_a_picture_in_the_order_given(self):
+        html = th._layer_html([
+            {"kind": "text", "text": "NEW", "top": "5%", "left": "6%", "size": 72},
+            {"kind": "image", "src": "https://example.com/badge.png", "width": "220px"},
+        ])
+        self.assertIn(">NEW<", html)
+        self.assertIn("https://example.com/badge.png", html)
+        # Later in the list is nearer the front, and both clear the logo.
+        self.assertLess(html.index("z-index:20"), html.index("z-index:21"))
+
+    def test_skips_what_it_cannot_draw_rather_than_drawing_it_wrong(self):
+        html = th._layer_html([
+            {"kind": "text", "text": "   "},
+            {"kind": "image", "src": ""},
+            {"kind": "sticker", "src": "x"},
+            {"kind": "text", "text": "off", "hidden": True},
+            "not a layer",
+        ])
+        self.assertEqual(html, "")
+
+    def test_a_local_path_is_given_the_scheme_a_browser_needs(self):
+        # Built from the path rather than asserted as one, because an absolute
+        # path is D:\tmp\badge.png on Windows and file:// glued to that is not
+        # a URI any browser will open.
+        from pathlib import Path
+
+        wanted = Path(os.path.abspath(os.path.join("tmp", "badge.png"))).as_uri()
+        html = th._layer_html([{"kind": "image", "src": os.path.join("tmp", "badge.png")}])
+        self.assertIn(wanted, html)
+        self.assertNotIn("\\", html)
+
+    def test_text_cannot_close_the_attribute_it_sits_in(self):
+        html = th._layer_html([
+            {"kind": "text", "text": '"><script>alert(1)</script>'},
+            {"kind": "image", "src": 'x" onerror="alert(1)'},
+        ])
+        self.assertNotIn("<script>", html)
+        self.assertNotIn('onerror="', html)
+
+    def test_nothing_at_all_when_no_layers_were_set(self):
+        self.assertEqual(th._layer_html(None), "")
+        self.assertEqual(th._layer_html([]), "")
+
+
+class GeorgianCasingTests(unittest.TestCase):
+    """Georgian is caseless; uppercasing for emphasis must not swap it to a
+    different alphabet (Mkhedruli -> Mtavruli), whether that uppercasing
+    happens in Python or in the CSS the HTML carries."""
+
+    def test_build_html_uppercases_latin_but_not_georgian(self):
+        html = th._build_html("hello მიშა", "second line", config={})
+        self.assertIn("HELLO", html)
+        self.assertIn("მიშა", html)
+        self.assertNotIn("Მიშა".upper(), html)
+
+    def test_build_html_css_does_not_redundantly_uppercase(self):
+        # text-transform: uppercase in the CSS would re-break Georgian in the
+        # headless browser even after the Python-side fix above.
+        html = th._build_html("hello world", "second line", config={})
+        self.assertNotIn("text-transform: uppercase", html)
 
 
 if __name__ == "__main__":

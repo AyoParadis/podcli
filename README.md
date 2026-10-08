@@ -140,6 +140,7 @@ Runs on macOS (Apple Silicon), Linux (x64 and arm64), and Windows (x64). Intel M
 ```bash
 podcli                       # interactive menu, opens the web studio
 podcli process episode.mp4   # transcribe, pick moments, render clips
+podcli multicam ~/ep12       # sync every camera and mic, cut to the speaker, render the episode
 ```
 
 Clips land in `podcli-clips/` in the directory you ran it from, so each show keeps its own renders. Everything else (knowledge, presets, assets, clip history, cache) lives in one managed folder that follows you between directories. Set `PODCLI_OUTPUT` to render somewhere fixed instead.
@@ -155,6 +156,15 @@ Clips land in `podcli-clips/` in the directory you ran it from, so each show kee
 - Logos, intros, outros, and background music from a reusable asset library
 - Loudness-normalized audio and hardware encoding on VideoToolbox, NVENC, and VAAPI, with a CPU fallback
 
+**Editing the full episode**
+
+- Multicam edit: point at one folder of camera and mic files, confirm who each file belongs to, and podcli syncs them by audio and corrects clock drift between devices
+- Automatic camera cuts that follow whoever is talking, with wide shots for crosstalk and a guest's answer held on the guest
+- Remote shows too: one file per person becomes a split screen, and a single gallery recording is split into a camera per tile. Questions stay on the split and the guest goes full frame on long answers
+- Render the episode as an MP4 with one WAV per person. Studio shoots can also go to Premiere or Final Cut as a timeline that points at your original files
+- Same edit from the studio (Multicam edit), the CLI (`podcli multicam <folder>`), or an agent (`manage_multicam`). Re-running reuses the sync and the cut, so only the step you changed runs again
+- With podcli Pro, steer the cut in the cloud editor: `podcli multicam <folder> --cloud` sends small previews and the transcript (your camera files stay on your computer), and `--pull` renders the cut you made there
+
 **Finding the moments**
 
 - Whisper transcription with speaker diarization, or bring your own transcript as `.txt`, `.srt`, or `.vtt`
@@ -164,7 +174,7 @@ Clips land in `podcli-clips/` in the directory you ran it from, so each show kee
 
 **The studio at `localhost:3847`**
 
-- Library, episode workspace, per-clip detail, highlights, thumbnails, content, analytics, assets, knowledge, config, integrations, and MCP setup
+- Library, episode workspace, multicam edit, per-clip detail, highlights, thumbnails, content, analytics, assets, knowledge, config, integrations, and MCP setup
 - `⌘K` command palette across pages, clips, and assets
 - Titles, descriptions, tags, and hashtags, with any section regenerated on your own guidance
 - Thumbnail studio for 16:9 and 9:16, with frame and text options
@@ -172,7 +182,7 @@ Clips land in `podcli-clips/` in the directory you ran it from, so each show kee
 
 **Shipping it**
 
-- 26 MCP tools, so an agent can transcribe, score, render, and publish through conversation
+- 30 MCP tools, so an agent can transcribe, score, render, and publish through conversation
 - YouTube publishing plus performance analytics to see which clips landed
 - DaVinci Resolve export as FCPXML when you want to finish by hand
 - Presets, clip history with duplicate detection, and a transcript cache
@@ -183,7 +193,7 @@ If you are weighing podcli against the cloud clippers, this is the difference:
 
 - Runs locally. Transcription and rendering happen on your machine by default, so episodes stay there. Only the optional cloud engine (AssemblyAI) and publishing to YouTube send anything out.
 - Free and open source under AGPL-3.0. Exports are unlimited, full quality, and watermark-free.
-- Agent-native. 26 MCP tools let Claude Code or Codex drive the whole flow, transcription through publishing.
+- Agent-native. 30 MCP tools let Claude Code or Codex drive the whole flow, transcription through publishing.
 - A knowledge base keeps titles, captions, and descriptions in your show's voice, and stops the engine from resuggesting moments you already published.
 - DaVinci Resolve handoff. Export any clip as FCPXML when you want to finish the edit yourself.
 
@@ -192,7 +202,7 @@ If you are weighing podcli against the cloud clippers, this is the difference:
 podcli is an [MCP](https://modelcontextprotocol.io) server, so an agent can transcribe, suggest clips, and render them through conversation.
 
 ```bash
-podcli mcp install    # registers it with Claude Code
+podcli mcp install    # registers it with Claude Code and Codex, whichever CLI is on PATH
 ```
 
 Claude Desktop and Codex setup is in the [MCP docs](https://podcli.com/docs/mcp-server).

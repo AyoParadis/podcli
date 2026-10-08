@@ -96,6 +96,37 @@ def _transcribe(video: str, language: str | None, engine: str | None):
     return res.get("words", [])
 
 
+def _load_transcript(path: str) -> list:
+    import json
+    import math
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"--transcript {path}: {exc}")
+    if isinstance(data, dict):
+        if "words" not in data:
+            raise SystemExit(f"--transcript {path}: expected {{\"words\": [...]}}")
+        words = data["words"]
+    else:
+        words = data
+    if not isinstance(words, list):
+        raise SystemExit(f"--transcript {path}: expected a list of words or {{\"words\": [...]}}")
+    out = []
+    for w in words:
+        try:
+            start, end = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end < start:
+            continue
+        out.append({"word": str(w.get("word", "")), "start": start, "end": end})
+    if not out:
+        raise SystemExit(f"--transcript {path}: no usable words in it")
+    print(f"  [transcript] using {len(out)} supplied words", flush=True)
+    return out
+
+
 def _find_paragraph(words: list, phrase: str) -> tuple[float, float]:
     """Find the time span of a paragraph by fuzzy-matching its text against
     the transcript word stream. Returns (start, end) seconds."""
@@ -119,14 +150,137 @@ def _find_paragraph(words: list, phrase: str) -> tuple[float, float]:
     return start, end
 
 
-def _render_fragment(video, start, end, words, style, crop, title, out_dir, fmt="vertical"):
+def _json_arg(raw, name):
+    """A JSON argument, or nothing. Malformed loses the part, never the clip."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        print(f"  Warning: {name} is not valid JSON; ignoring it", file=sys.stderr, flush=True)
+        return None
+
+
+def _json_object_arg(raw, name):
+    """A JSON object argument, or nothing. Malformed or non-object stops the run."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(f"Error: {name} is not valid JSON ({exc})")
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"Error: {name} must be a JSON object")
+    return parsed
+
+
+def _json_file(raw, name):
+    """JSON given inline or named as a file, or nothing.
+
+    Both, because the two callers differ: keyframes are a handful of numbers
+    and have always been passed inline, while a face map is a per-second record
+    of every face in the video and an argument list will not carry one. Telling
+    them apart by looking is cheaper than a second flag.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("{") or text.startswith("["):
+        return _json_arg(text, name)
+    try:
+        with open(text, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"  Warning: {name} could not be read ({exc}); ignoring it",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _hook_arg(raw, start, end):
+    """The --hook object checked against the fragment, or nothing.
+
+    Checked as soon as the fragment's range is known, so a bad hook stops the
+    run before the face scan and the render. It stops rather than drops,
+    because someone asked for it.
+    """
+    hook = _json_object_arg(raw, "--hook")
+    if hook is None:
+        return None
+    from services.opening_hook import validate_hook
+    try:
+        return validate_hook(hook, start, end)
+    except ValueError as exc:
+        raise SystemExit(f"Error: --hook {exc}")
+
+
+# The crops that cannot place a frame without knowing where the faces are.
+_WANTS_FACES = ("face", "speaker", "speaker-hardcut")
+
+
+def _face_map_for(video, crop, start, end):
+    """Where the faces are, scanned now, when the crop needs it and nobody said.
+
+    A face map used to arrive only from the diarizing transcriber, so a cut
+    made against a whisper transcript or an imported one had none, and every
+    rung of the crop ladder that needs one was skipped. What the caller got
+    instead was the whole wide frame letterboxed into the cut, reported as a
+    centre crop and looking deliberate.
+
+    Scanning here costs a few seconds on the window actually being cut, which
+    is the trade every one of those clips would have taken.
+    """
+    if crop not in _WANTS_FACES:
+        return None
+    try:
+        from services.face_analysis import analyze_faces
+    except ImportError:
+        return None
+
+    # The whole file's length rather than the fragment's: the scan spreads its
+    # samples across the file it is given, and sizing the count to a 40-second
+    # window would take twenty samples across an hour-long episode.
+    duration = _probe_duration(video) or max(0.0, (end or 0) - (start or 0))
+    if duration <= 0:
+        return None
+
+    print("  [fragment] no face map for this cut; scanning it", flush=True)
+    try:
+        # No speaker segments: those come from diarization, and the whole point
+        # of scanning here is that there was none. Clusters and the split
+        # screen are still found, which is what a crop needs to place a frame.
+        found = analyze_faces(video, [], duration)
+    except Exception as exc:
+        print(f"  Warning: face scan failed ({type(exc).__name__}: {exc}); "
+              "the crop will fall back", file=sys.stderr, flush=True)
+        return None
+
+    if not found or not found.get("clusters"):
+        print("  [fragment] no faces found in this cut", flush=True)
+        return None
+    print(f"  [fragment] found {len(found['clusters'])} face position(s)"
+          f"{' , split screen' if found.get('is_split_screen') else ''}", flush=True)
+    return found
+
+
+def _render_fragment(video, start, end, words, style, crop, title, out_dir, fmt="vertical",
+                     logo=None, name_card=None, motion=None, caption_position="auto",
+                     caption_scale=1.0, logo_position="top-left", logo_scale=1.0,
+                     topic=None, progress=None, cards=None, brand=None, theme=None, font_family=None,
+                     captions=True, face_map=None, crop_keyframes=None, hook=None):
     """Render the fragment with face-crop + captions via the existing engine."""
     from services.clip_generator import generate_clip
     print(f"  [fragment] rendering {start:.1f}s–{end:.1f}s ({style}, crop={crop}, {fmt})", flush=True)
     res = generate_clip(
         video_path=video, start_second=start, end_second=end,
-        caption_style=style, crop_strategy=crop, format=fmt,
+        caption_style=style, caption_position=caption_position,
+        caption_font_scale=round(caption_scale * 100),
+        logo_position=logo_position, logo_scale=logo_scale,
+        crop_strategy=crop, format=fmt,
+        face_map=face_map, crop_keyframes=crop_keyframes,
         transcript_words=words, title=title, output_dir=out_dir,
+        logo_path=logo, name_card=name_card, motion=motion,
+        topic=topic, progress=progress, cards=cards, brand=brand, theme=theme, font_family=font_family,
+        captions=captions, hook=hook,
         clean_fillers=True, allow_ass_fallback=True,
         progress_callback=lambda p, m: print(f"    {p}% {m}", flush=True),
     )
@@ -213,11 +367,55 @@ def main():
     ap.add_argument("--paragraph", help="Find fragment by matching this text in the transcript")
     ap.add_argument("--language", default=None, help="Transcription language (e.g. es). Auto-detect if omitted.")
     ap.add_argument("--engine", choices=["whisper-py", "whispercpp", "assemblyai"], default=None, help="Transcription engine")
-    ap.add_argument("--caption-style", default="hormozi", choices=["hormozi", "karaoke", "subtle", "branded"])
+    ap.add_argument("--transcript", default=None, help="Word timings JSON for this video (list of {word,start,end} or {words:[...]}); skips transcription")
+    ap.add_argument("--caption-style", default="hormozi", choices=["hormozi", "karaoke", "subtle", "branded", "outline"])
+    ap.add_argument("--caption-position", default="auto", choices=["auto", "upper", "center", "lower"])
+    ap.add_argument("--caption-scale", type=float, default=1.0)
     ap.add_argument("--crop", default="face", choices=["center", "face", "speaker", "speaker-hardcut"])
     ap.add_argument("--format", default="vertical", choices=["vertical", "horizontal", "square"],
                     help="Output aspect ratio (default: vertical)")
     ap.add_argument("--output", default=None, help="Final output path")
+    ap.add_argument("--logo", default=None, help="Logo image (asset name or path)")
+    ap.add_argument("--logo-position", default="top-left", choices=["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"])
+    ap.add_argument("--logo-scale", type=float, default=1.0)
+    # Read out of args since name cards existed, and never declared, so the
+    # launcher had nowhere to hand them even once it started trying.
+    ap.add_argument("--name-card", dest="name_card", default=None,
+                    help="Lower third naming the speaker, shown for the first seconds")
+    ap.add_argument("--name-card-sub", dest="name_card_sub", default=None,
+                    help="Second line of the lower third")
+    ap.add_argument("--name-card-seconds", dest="name_card_seconds", type=float,
+                    default=None, help="How long the lower third holds")
+    ap.add_argument("--name-card-accent", dest="name_card_accent", default=None,
+                    help="Colour of the rule under the lower third")
+    ap.add_argument("--no-captions", dest="no_captions", action="store_true",
+                    help="Draw the overlay and burn no words")
+    ap.add_argument("--topic", default=None,
+                    help="Standing label saying what the clip is about")
+    ap.add_argument("--topic-position", default="top-left",
+                    choices=["top-left", "top-center", "top-right",
+                             "bottom-left", "bottom-center", "bottom-right"])
+    ap.add_argument("--progress", action="store_true",
+                    help="Draw how much of the clip is left along the bottom edge")
+    ap.add_argument("--progress-color", default=None)
+    ap.add_argument("--face-map", dest="face_map", default=None,
+                    help="Path to a JSON face map for this video. Lets speaker framing work "
+                         "on a transcript that carries no speaker labels.")
+    ap.add_argument("--crop-keyframes", dest="crop_keyframes", default=None,
+                    help="Path to hand-placed crop positions as JSON. Used by --crop manual.")
+    ap.add_argument("--cards", default=None,
+                    help="On-screen cards as JSON, each with kind/start/end")
+    ap.add_argument("--hook", default=None,
+                    help='Opening hook as JSON on the source clock: {"start","end","mode"}. '
+                         'mode is "repeat" or "move"')
+    ap.add_argument("--brand", default=None,
+                    help='Show colours as JSON: {"accent":"#4C9DF5","ink":"#FFF","surface":"#000"}')
+    ap.add_argument("--style", default=None,
+                    help='Visual theme as JSON: {"pack":"collage","motion":"stop-motion"}')
+    ap.add_argument("--font-family", default=None,
+                    help="The show's own typeface, ahead of the built-in stack")
+    ap.add_argument("--intro", default=None, help="Intro video (asset name or path)")
+    ap.add_argument("--outro", default=None, help="Outro video (asset name or path)")
     # bookends (defaults are None so we can tell what the user explicitly set;
     # unset values fall back to the saved brand config, then BRAND_DEFAULTS)
     ap.add_argument("--intro-title", default=None, help="Intro headline (default: derived from first words)")
@@ -233,6 +431,8 @@ def main():
     ap.add_argument("--save-brand", action="store_true",
                     help="Save the given handle/platforms/outro-title/accent/bg as the default brand and exit")
     args = ap.parse_args()
+
+    style_theme = _json_object_arg(args.style, "--style")
 
     # Resolve brand fields: CLI flag > saved brand.json > BRAND_DEFAULTS
     brand = {**BRAND_DEFAULTS, **_load_brand()}
@@ -259,8 +459,7 @@ def main():
     out_dir = os.path.join(data_dir, "output")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Need a transcript if cutting by paragraph or if rendering captions.
-    words = _transcribe(video, args.language, args.engine)
+    words = _load_transcript(args.transcript) if args.transcript else _transcribe(video, args.language, args.engine)
 
     if args.paragraph:
         start, end = _find_paragraph(words, args.paragraph)
@@ -269,22 +468,82 @@ def main():
     else:
         raise SystemExit("Provide either --start/--end or --paragraph")
 
+    hook = _hook_arg(args.hook, start, end)
+
     # The canvas every part is rendered and stitched on. One lookup, so the
     # fragment, the bookends and the concat cannot disagree about the shape.
     from services.formats import get_format
     spec = get_format(args.format)
 
     # 1. Fragment
+    from services.asset_store import resolve, resolve_logo
+
+    def media_path(value: str | None, kind: str) -> str | None:
+        if not value:
+            return None
+        found = resolve(value) or value
+        found = found if os.path.isabs(found) else os.path.join(_INVOKE_CWD, found)
+        found = os.path.abspath(found)
+        if not os.path.exists(found):
+            raise SystemExit(f"{kind.capitalize()} not found: {value}")
+        return found
+
+    name_card = None
+    if getattr(args, "name_card", None):
+        name_card = {
+            "title": args.name_card,
+            "subtitle": getattr(args, "name_card_sub", None),
+            "seconds": getattr(args, "name_card_seconds", None),
+            # The card's own rule, when one was named. Falls back to the
+            # show's accent, which is what it has always used.
+            "accent": getattr(args, "name_card_accent", None) or accent,
+        }
+
+    motion = None
+    if getattr(args, "motion", None):
+        try:
+            motion = json.loads(args.motion)
+        except (TypeError, ValueError):
+            print("  Warning: --motion is not valid JSON; using each style's own motion",
+                  flush=True)
+
+    face_map = _json_file(args.face_map, "--face-map")
+    if face_map is None:
+        face_map = _face_map_for(video, args.crop, start, end)
+
     fragment = _render_fragment(
         video, start, end, words, args.caption_style, args.crop, "fragment", out_dir,
         fmt=args.format,
+        logo=resolve_logo(getattr(args, "logo", None)),
+        name_card=name_card,
+        motion=motion,
+        caption_position=args.caption_position,
+        caption_scale=max(0.7, min(1.5, args.caption_scale)),
+        logo_position=args.logo_position,
+        logo_scale=max(0.5, min(1.5, args.logo_scale)),
+        topic=({"label": args.topic, "position": args.topic_position} if args.topic else None),
+        progress=(
+            ({"color": args.progress_color} if args.progress_color else {})
+            if args.progress else None
+        ),
+        cards=_json_arg(args.cards, "--cards"),
+        brand=_json_arg(args.brand, "--brand"),
+        theme=style_theme,
+        font_family=args.font_family,
+        captions=not args.no_captions,
+        face_map=face_map,
+        crop_keyframes=_json_file(args.crop_keyframes, "--crop-keyframes"),
+        hook=hook,
     )
 
     platforms = [p.strip() for p in platforms_str.split(",") if p.strip()]
     parts = []
 
     # 2. Intro (optional)
-    if not args.no_intro:
+    external_intro = media_path(args.intro, "intro")
+    if external_intro and not args.no_intro:
+        parts.append(external_intro)
+    elif not args.no_intro:
         intro_title = args.intro_title
         if not intro_title:
             # derive a short headline from the first ~4 words of the fragment
@@ -300,7 +559,10 @@ def main():
     parts.append(fragment)
 
     # 3. Outro (optional)
-    if not args.no_outro:
+    external_outro = media_path(args.outro, "outro")
+    if external_outro and not args.no_outro:
+        parts.append(external_outro)
+    elif not args.no_outro:
         outro = _render_bookend(
             "outro", outro_title, handle, platforms,
             args.outro_seconds, os.path.join(out_dir, "_outro.mp4"), accent, bg,

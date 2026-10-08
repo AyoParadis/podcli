@@ -109,7 +109,7 @@ class AIFallbackTests(unittest.TestCase):
 
         calls = []
 
-        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None):
+        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None, **_kw):
             calls.append({
                 "start": segments[0]["start"],
                 "end": segments[-1]["end"],
@@ -155,7 +155,7 @@ class AIFallbackTests(unittest.TestCase):
 
         calls = []
 
-        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None):
+        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None, **_kw):
             calls.append({
                 "start": segments[0]["start"],
                 "end": segments[-1]["end"],
@@ -196,7 +196,7 @@ class AIFallbackTests(unittest.TestCase):
 
         calls = []
 
-        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None, timeout=300, error_sink=None, reaction_times=None):
+        def fake_suggest(*, segments, top_n, exclude_clips=None, progress_callback=None, timeout=300, error_sink=None, reaction_times=None, **_kw):
             calls.append({
                 "start": segments[0]["start"],
                 "end": segments[-1]["end"],
@@ -425,13 +425,19 @@ class AICliDiscoveryTests(unittest.TestCase):
             self.assertEqual(found, cli)
 
     def test_find_cli_falls_back_to_shell_lookup(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
             cli = os.path.join(tmp, "claude")
             with open(cli, "w", encoding="utf-8") as fh:
                 fh.write("#!/bin/sh\n")
-            with mock.patch.object(ai, "_shell_lookup", return_value=cli):
-                with mock.patch("shutil.which", return_value=None):
-                    found = ai._find_cli("claude", [])
+            # Without redirecting HOME, _find_cli's fixed lookup dirs (e.g.
+            # ~/.local/bin) hit the real filesystem. On a machine with an
+            # actual claude CLI installed there, it wins before shell lookup
+            # ever runs, and this test passes for the wrong reason.
+            with mock.patch.dict(os.environ, {"HOME": home, "PATH": ""}, clear=False):
+                with mock.patch("os.path.expanduser", side_effect=lambda p: p.replace("~", home)):
+                    with mock.patch.object(ai, "_shell_lookup", return_value=cli):
+                        with mock.patch("shutil.which", return_value=None):
+                            found = ai._find_cli("claude", [])
             self.assertEqual(found, cli)
 
     def test_get_ai_cli_status_reports_candidates(self):
@@ -472,6 +478,183 @@ class AICliDiscoveryTests(unittest.TestCase):
             self.assertIn("stdin", kwargs)
             self.assertFalse(kwargs.get("shell"))
 
+    def test_codex_exec_uses_current_read_only_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt_file = os.path.join(tmp, "prompt.txt")
+            cli = os.path.join(tmp, "codex")
+
+            with mock.patch("services.ai_cli.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    args=[cli, "exec"],
+                    returncode=0,
+                    stdout="{}",
+                    stderr="",
+                )
+                ai._run_ai_command(
+                    cli_path=cli,
+                    engine="codex",
+                    prompt="find clips",
+                    prompt_file=prompt_file,
+                    project_dir=tmp,
+                    timeout=30,
+                )
+
+            args, kwargs = run_mock.call_args
+            self.assertEqual(
+                args[0],
+                [
+                    cli, "exec",
+                    "--sandbox", "read-only",
+                    "--skip-git-repo-check",
+                    "-o", prompt_file + ".out",
+                    "find clips",
+                ],
+            )
+            self.assertNotIn("--full-auto", args[0])
+            self.assertEqual(kwargs["cwd"], tmp)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RankClipsTests(unittest.TestCase):
+    def _pool(self):
+        return [
+            {"title": "a", "start_second": 30, "end_second": 60, "duration": 30, "score": 18,
+             "quote": "q", "why": "w", "content_type": "hot_take"},
+            {"title": "b", "start_second": 90, "end_second": 120, "duration": 30, "score": 17,
+             "quote": "q", "why": "w", "content_type": "guest_story"},
+            {"title": "c", "start_second": 150, "end_second": 180, "duration": 30, "score": 17,
+             "quote": "q", "why": "w", "content_type": "hot_take"},
+            {"title": "d", "start_second": 210, "end_second": 240, "duration": 30, "score": 16,
+             "quote": "q", "why": "w", "content_type": "hot_take"},
+        ]
+
+    def _run(self, stdout, clips=None, top_n=2):
+        pool = clips if clips is not None else self._pool()
+        with mock.patch.object(cs.podcli_cloud, "prompt_block", return_value=""), \
+             mock.patch.object(ap, "_chain", return_value=[("cli", "/tmp/claude", "claude")]), \
+             mock.patch.object(
+                 ai,
+                 "_run_ai_command",
+                 return_value=subprocess.CompletedProcess(
+                     args=["claude"], returncode=0, stdout=stdout, stderr=""
+                 ),
+             ):
+            return cs.rank_clips_with_ai(pool, top_n), pool
+
+    def test_ranking_decides_the_cut_that_tied_scores_cannot(self):
+        ranked, _ = self._run(json.dumps({
+            "ranked": [{"id": 2}, {"id": 0}, {"id": 3}, {"id": 1}],
+        }))
+        selected = cs._select_top_by_score(ranked, 2)
+        self.assertEqual([c["title"] for c in selected], ["a", "c"])
+
+    def test_selection_is_returned_in_timeline_order(self):
+        ranked, _ = self._run(json.dumps({"ranked": [{"id": 3}, {"id": 1}, {"id": 0}, {"id": 2}]}))
+        selected = cs._select_top_by_score(ranked, 2)
+        self.assertEqual([c["start_second"] for c in selected], [90, 210])
+
+    def test_a_partial_ranking_is_discarded_whole(self):
+        narrated = []
+        pool = self._pool()
+        with mock.patch.object(cs.podcli_cloud, "prompt_block", return_value=""), \
+             mock.patch.object(ap, "_chain", return_value=[("cli", "/tmp/claude", "claude")]), \
+             mock.patch.object(
+                 ai,
+                 "_run_ai_command",
+                 return_value=subprocess.CompletedProcess(
+                     args=["claude"], returncode=0,
+                     stdout=json.dumps({"ranked": [{"id": 2}, {"id": 0}]}), stderr="",
+                 ),
+             ):
+            cs.rank_clips_with_ai(pool, 2, progress_callback=lambda _p, m: narrated.append(m))
+        self.assertTrue(all("rank" not in c for c in pool))
+        self.assertEqual([c["title"] for c in cs._select_top_by_score(pool, 2)], ["a", "b"])
+        self.assertTrue(any("Ranking unavailable" in m for m in narrated))
+
+    def test_an_unreadable_answer_leaves_score_ordering_alone(self):
+        pool = self._pool()
+        self._run("not json at all", clips=pool)
+        self.assertTrue(all("rank" not in c for c in pool))
+
+    def test_no_ai_available_is_not_an_error(self):
+        pool = self._pool()
+        with mock.patch.object(cs.podcli_cloud, "prompt_block", return_value=""), \
+             mock.patch.object(ap, "_chain", return_value=[]):
+            out = cs.rank_clips_with_ai(pool, 2)
+        self.assertIs(out, pool)
+        self.assertTrue(all("rank" not in c for c in pool))
+
+    def test_a_pool_with_nothing_to_drop_makes_no_call(self):
+        pool = self._pool()[:3]
+        with mock.patch.object(ap, "_chain") as chain:
+            cs.rank_clips_with_ai(pool, 2)
+        chain.assert_not_called()
+
+    def test_the_pass_is_metered_under_its_own_purpose(self):
+        seen = {}
+        original = ap.generate_json
+
+        def capture(prompt, **kwargs):
+            seen.update(kwargs)
+            seen["prompt"] = prompt
+            return original(prompt, **kwargs)
+
+        with mock.patch.object(cs.podcli_cloud, "prompt_block", return_value="RETAINS BEST: hot takes"), \
+             mock.patch.object(ap, "generate_json", capture), \
+             mock.patch.object(ap, "_chain", return_value=[("cli", "/tmp/claude", "claude")]), \
+             mock.patch.object(
+                 ai,
+                 "_run_ai_command",
+                 return_value=subprocess.CompletedProcess(
+                     args=["claude"], returncode=0,
+                     stdout=json.dumps({"ranked": [{"id": i} for i in range(4)]}), stderr="",
+                 ),
+             ):
+            cs.rank_clips_with_ai(self._pool(), 2)
+
+        self.assertEqual(seen["purpose"], "rank_moments")
+        self.assertNotIn("stable_prefix", seen)
+        self.assertIn("RETAINS BEST: hot takes", seen["prompt"])
+
+
+class WorkspaceLearningsTests(unittest.TestCase):
+    def _prompt_sent_to_cli(self, learned):
+        sent = {}
+
+        def capture(**kwargs):
+            with open(kwargs["prompt_file"], encoding="utf-8") as fh:
+                sent["prompt"] = fh.read()
+            return subprocess.CompletedProcess(
+                args=["claude"], returncode=0,
+                stdout=json.dumps({"clips": [{
+                    "title": "A moment",
+                    "start_second": 10.0,
+                    "end_second": 40.0,
+                    "segments": [{"start": 10.0, "end": 40.0}],
+                    "scores": {"standalone": 5, "hook": 5, "relevance": 4, "quotability": 4},
+                    "quote": "q", "why": "w",
+                }]}),
+                stderr="",
+            )
+
+        segments = [
+            {"start": float(i * 5), "end": float(i * 5 + 5), "text": f"line {i}", "speaker": "A"}
+            for i in range(12)
+        ]
+        with mock.patch.object(cs.podcli_cloud, "prompt_block", return_value=learned), \
+             mock.patch.object(ap, "_chain", return_value=[("cli", "/tmp/claude", "claude")]), \
+             mock.patch.object(ai, "_run_ai_command", side_effect=capture):
+            cs.suggest_with_claude(segments=segments, top_n=1)
+        return sent.get("prompt", "")
+
+    def test_a_local_cli_receives_the_workspace_learnings(self):
+        prompt = self._prompt_sent_to_cli("WHAT WORKS ON THIS CHANNEL: founder stories.")
+        self.assertIn("WHAT WORKS ON THIS CHANNEL: founder stories.", prompt)
+
+    def test_the_free_path_prompt_is_untouched(self):
+        prompt = self._prompt_sent_to_cli("")
+        self.assertFalse(prompt.startswith("\n"))
+        self.assertTrue(prompt.startswith("You are a viral clip editor"))

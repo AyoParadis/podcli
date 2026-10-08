@@ -3,29 +3,30 @@ import {
   useCurrentFrame,
   useVideoConfig,
   spring,
-  Img,
-  staticFile,
 } from "remotion";
 import type { Word, CaptionStyle, CaptionPosition, LogoPosition } from "../types";
-import { captionScale } from "../types";
+import {
+  captionScale, LOGO_CAPTION_GAP, LOGO_HEIGHT, LOGO_INSET,
+} from "../types";
 import { buildChunks, activeChunkAt, splitCaptionLines } from "../chunks";
 
 interface Props {
   words: Word[];
   style: CaptionStyle;
-  logoSrc?: string;
   faceY?: number | null; // normalized 0-1 (0=top, 1=bottom)
   captionPosition?: CaptionPosition;
+  /**
+   * Whether a logo is on the frame, and where. The mark itself is drawn by
+   * Watermark one level up so all four styles carry it; this component still
+   * has to know, because a bottom-anchored logo and a low caption want the
+   * same band of pixels.
+   */
+  hasLogo?: boolean;
   logoPosition?: LogoPosition;
   singleLine?: boolean;
 }
 
 const MAX_CHARS_PER_CHUNK = 18;
-
-// Shared with caption-margin guard below so logo placement cannot drift.
-const LOGO_INSET = 180;
-const LOGO_HEIGHT = 126;
-const LOGO_CAPTION_GAP = 24;
 
 /**
  * Active pill rendered as an absolutely positioned background behind the word.
@@ -36,7 +37,9 @@ const WordWithPill: React.FC<{
   isActive: boolean;
   frame: number;
   fps: number;
-}> = ({ word, isActive, frame, fps }) => {
+  emphasisColor?: string;
+  background?: string;
+}> = ({ word, isActive, frame, fps, emphasisColor, background }) => {
   const { height } = useVideoConfig();
   const s = captionScale(height);
   const wordEntryFrame = Math.round(word.start * fps);
@@ -59,7 +62,7 @@ const WordWithPill: React.FC<{
           left: -16 * s,
           right: -16 * s,
           bottom: -4 * s,
-          backgroundColor: "rgba(0, 0, 0, 0.85)",
+          backgroundColor: background ?? "rgba(0, 0, 0, 0.85)",
           borderRadius: 18 * s,
           boxShadow: "0 4px 20px rgba(0, 0, 0, 0.5)",
           opacity: pillOpacity,
@@ -67,7 +70,15 @@ const WordWithPill: React.FC<{
         }}
       />
       {/* Word text — always inline, never shifts */}
-      <span style={{ position: "relative", zIndex: 1 }}>{word.word}</span>
+      <span
+        style={{
+          position: "relative",
+          zIndex: 1,
+          ...(word.emphasis && emphasisColor ? { color: emphasisColor } : {}),
+        }}
+      >
+        {word.word}
+      </span>
     </span>
   );
 };
@@ -107,6 +118,8 @@ const CaptionLine: React.FC<{
               isActive={isActive}
               frame={frame}
               fps={fps}
+              emphasisColor={style.emphasisColor}
+              background={style.background}
             />
           </React.Fragment>
         );
@@ -118,9 +131,9 @@ const CaptionLine: React.FC<{
 export const BrandedCaptions: React.FC<Props> = ({
   words,
   style,
-  logoSrc,
   faceY,
   captionPosition = "auto",
+  hasLogo = false,
   logoPosition = "top-left",
   singleLine = false,
 }) => {
@@ -152,30 +165,12 @@ export const BrandedCaptions: React.FC<Props> = ({
   }
   // A bottom-anchored logo spans 180-306 scaled units. Captions sitting inside
   // that band (captionPosition "lower" starts at 220) would render over it.
-  if (logoSrc && logoPosition.startsWith("bottom-")) {
+  if (hasLogo && logoPosition.startsWith("bottom-")) {
     dynamicMargin = Math.max(dynamicMargin, (LOGO_INSET + LOGO_HEIGHT + LOGO_CAPTION_GAP) * s);
   }
 
   return (
     <>
-      {logoSrc && (
-        <Img
-          src={logoSrc.startsWith("http") ? logoSrc : staticFile(logoSrc)}
-          style={{
-            position: "absolute",
-            ...(logoPosition.startsWith("top-") ? { top: LOGO_INSET * s } : { bottom: LOGO_INSET * s }),
-            ...(logoPosition.endsWith("-left")
-              ? { left: 108 * s }
-              : logoPosition.endsWith("-right")
-                ? { right: 108 * s }
-                : { left: "50%", transform: "translateX(-50%)" }),
-            width: 255 * s,
-            height: LOGO_HEIGHT * s,
-            objectFit: "contain",
-          }}
-        />
-      )}
-
       {activeChunk && (() => {
         const [line1, line2] = splitCaptionLines(activeChunk.words, 2, singleLine);
 

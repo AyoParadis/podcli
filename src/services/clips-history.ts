@@ -4,9 +4,9 @@ import { basename, join } from "path";
 import { v4 as uuidv4 } from "uuid";
 import { paths } from "../config/paths.js";
 import { writeFileAtomic } from "../utils/atomic-file.js";
-import { sliceTranscript, sliceWords } from "../utils/transcript.js";
+import { sliceTranscript, sliceWords, findGroundingText } from "../utils/transcript.js";
 import { isDemoMode, demoClips } from "../ui/demo-fixtures.js";
-import type { BatchClipsResult, ClipHistoryEntry, Format, WordTimestamp } from "../models/index.js";
+import type { BatchClipsResult, ClipHistoryEntry, ClipHook, Format, WordTimestamp } from "../models/index.js";
 
 type BatchResultRow = BatchClipsResult["results"][number];
 
@@ -20,6 +20,13 @@ interface BatchRecordContext {
   editProjectId?: string;
   editRevision?: number;
   orderedSegmentsFor?: (row: BatchResultRow) => Array<{ start: number; end: number }> | undefined;
+  suggestions?: Array<{
+    start_second: number;
+    end_second: number;
+    payoff?: string;
+    context_line?: string;
+    preview_text?: string;
+  }> | null;
 }
 
 export interface BatchClipSpec {
@@ -27,6 +34,7 @@ export interface BatchClipSpec {
   end_second: number;
   keep_segments?: Array<{ start: number; end: number }>;
   ordered_segments?: Array<{ start: number; end: number }>;
+  hook?: ClipHook | null;
 }
 
 export interface BatchRecipeContext {
@@ -191,6 +199,7 @@ export class ClipsHistory {
           edit_project_id: ctx.editProjectId,
           edit_revision: ctx.editRevision,
           ordered_segments: ctx.orderedSegmentsFor?.(r),
+          ...findGroundingText(ctx.suggestions, start, end),
         }),
       );
     }
@@ -218,6 +227,7 @@ export class ClipsHistory {
         cleanFillers: ctx.cleanFillers,
         keepSegments: spec?.keep_segments,
         orderedSegments: spec?.ordered_segments,
+        hook: spec?.hook,
       });
     }
   }
@@ -232,6 +242,7 @@ export class ClipsHistory {
       cleanFillers?: boolean;
       keepSegments?: Array<{ start: number; end: number }>;
       orderedSegments?: Array<{ start: number; end: number }>;
+      hook?: ClipHook | null;
     },
   ): Promise<void> {
     const sourceWords = ctx.transcriptWords ?? [];
@@ -252,6 +263,7 @@ export class ClipsHistory {
       transcript_words: words,
       ...(ctx.keepSegments?.length && { keep_segments: ctx.keepSegments }),
       ...(ctx.orderedSegments?.length && { ordered_segments: ctx.orderedSegments }),
+      ...(ctx.hook && { hook: ctx.hook }),
     });
     if (ctx.keepSegments?.length) {
       await this.update(rec.id, { keep_segments: ctx.keepSegments });
@@ -291,6 +303,19 @@ export class ClipsHistory {
         return existsSync(e.output_path);
       }) || null
     );
+  }
+
+  // mine_channel's yt-dlp download writes "<title> [<video_id>].<ext>" (see
+  // ytdlp-args.ts's output template), so the id survives in source_video even
+  // though nothing else in the schema tracks where a video came from.
+  async minedYouTubeVideoIds(): Promise<Set<string>> {
+    const entries = await this.load();
+    const ids = new Set<string>();
+    for (const e of entries) {
+      const m = basename(e.source_video || "").match(/\[([A-Za-z0-9_-]{6,})\]\.[^.]+$/);
+      if (m) ids.add(m[1]);
+    }
+    return ids;
   }
 
   async list(limit = 50): Promise<ClipHistoryEntry[]> {

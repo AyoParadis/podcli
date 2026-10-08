@@ -1,4 +1,5 @@
 import type { CSSProperties } from "react";
+import type { ThumbnailPerson } from "../../utils/thumbnail-layout";
 
 // Rolls into hours past 3600s: podcast timestamps ran past "78:31" without it.
 export const fmt = (s: number) => {
@@ -10,6 +11,16 @@ export const fmt = (s: number) => {
   const ss = String(seconds).padStart(2, "0");
   return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
 };
+
+/** "guest at 0:12, host at 0:41": where each face on a pair thumbnail came from. */
+export function describePeople(people: ThumbnailPerson[]): string {
+  return people
+    .map((p) => {
+      const who = p.role ?? `${p.side} person`;
+      return p.source_time == null ? who : `${who} at ${fmt(p.source_time)}`;
+    })
+    .join(", ");
+}
 
 export const fmtMs = (s: number) =>
   `${fmt(s)}.${String(Math.floor((s % 1) * 1000)).padStart(3, "0")}`;
@@ -28,6 +39,37 @@ export const labelStyle: CSSProperties = {
   marginBottom: 10,
   display: "block",
 };
+
+// Scripts with no case distinction whose letters Unicode nonetheless assigns
+// an uppercase mapping for display styling (Georgian Mkhedruli -> Mtavruli).
+// Kept in sync with remotion/src/text.ts and backend/utils/text.py's
+// safe_upper. This is the same fix for the studio's live caption/thumbnail
+// preview, so it doesn't show a different alphabet than the final render.
+const CASELESS_SCRIPT_RANGES: Array<[number, number]> = [
+  [0x10a0, 0x10ff], // Georgian (Mkhedruli, Asomtavruli)
+  [0x1c90, 0x1cbf], // Georgian Extended (Mtavruli)
+  [0x2d00, 0x2d2f], // Georgian Supplement
+];
+
+function isCaselessScriptChar(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  return CASELESS_SCRIPT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+}
+
+export function safeUpper(text: string): string {
+  if (!text) return text;
+  let hasCaseless = false;
+  for (const ch of text) {
+    if (isCaselessScriptChar(ch)) {
+      hasCaseless = true;
+      break;
+    }
+  }
+  if (!hasCaseless) return text.toUpperCase();
+  return Array.from(text)
+    .map((ch) => (isCaselessScriptChar(ch) ? ch : ch.toUpperCase()))
+    .join("");
+}
 
 export class ApiError extends Error {
   constructor(
@@ -321,4 +363,28 @@ export function findClipResult<T extends ClipResultRow>(
   }
   const row = results[positionalIdx];
   return row && !resultBoundsKey(row) ? row : undefined;
+}
+
+/**
+ * Body for the combined POST /api/ui-state sync. Transcript rides in this
+ * same request whenever it changed, rather than a request of its own:
+ * after silence removal, videoPath and transcript update together in one
+ * render, and splitting them into separate fetches raced on the server. A
+ * videoPath-only request landing after the transcript-only one looked
+ * exactly like a bare set_video (videoPath with no transcript), which
+ * clears the transcript server-side as if it were stale. One request can't
+ * race with itself.
+ */
+export function buildUiStateSyncPayload(
+  syncable: Record<string, unknown>,
+  filePath: string,
+  transcript: unknown,
+  transcriptChanged: boolean,
+): Record<string, unknown> {
+  return {
+    _source: "ui",
+    filePath,
+    ...syncable,
+    ...(transcriptChanged && { transcript }),
+  };
 }

@@ -63,6 +63,37 @@ describe("edit project timeline", () => {
     })).toThrow(/invalid edited range/);
   });
 
+  it("repeats a hook across a reordered edit boundary on the source clock", () => {
+    expect(mapEditedClipToSource([segment("late", 10, 15), segment("early", 0, 5)], {
+      start_second: 0,
+      end_second: 10,
+      hook: { start: 4, end: 6, mode: "repeat" },
+    })).toEqual([
+      { start: 14, end: 15 }, { start: 0, end: 1 },
+      { start: 10, end: 15 }, { start: 0, end: 5 },
+    ]);
+  });
+
+  it("moves a hook without playing it again in the edited body", () => {
+    expect(mapEditedClipToSource([segment("late", 10, 15), segment("early", 0, 5)], {
+      start_second: 0,
+      end_second: 10,
+      hook: { start: 4, end: 6, mode: "move" },
+    })).toEqual([
+      { start: 14, end: 15 }, { start: 0, end: 1 },
+      { start: 10, end: 14 }, { start: 1, end: 5 },
+    ]);
+  });
+
+  it("rejects hooks excluded from the edited clip selection", () => {
+    expect(() => mapEditedClipToSource([segment("a", 10, 20)], {
+      start_second: 0,
+      end_second: 10,
+      segments: [{ start: 0, end: 3 }, { start: 7, end: 10 }],
+      hook: { start: 4, end: 6, mode: "repeat" },
+    })).toThrow(/not inside the clip body/);
+  });
+
   it("intersects silence keep ranges per timeline occurrence", () => {
     const result = retainSourceRanges(
       [segment("late", 10, 20), segment("early", 0, 10), segment("repeat", 10, 20)],

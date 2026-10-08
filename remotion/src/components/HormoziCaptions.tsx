@@ -2,20 +2,24 @@ import React from "react";
 import {
   useCurrentFrame,
   useVideoConfig,
-  interpolate,
-  spring,
 } from "remotion";
 import type { Word, CaptionStyle } from "../types";
 import { captionScale } from "../types";
 import { buildChunks, activeChunkAt } from "../chunks";
+import { MOTION, motionAt } from "../motion";
+import type { Motion } from "../motion";
+import { safeUpper } from "../text";
 
 interface Props {
   words: Word[];
   style: CaptionStyle;
   singleLine?: boolean;
+  motion?: Motion;
 }
 
-export const HormoziCaptions: React.FC<Props> = ({ words, style, singleLine = false }) => {
+export const HormoziCaptions: React.FC<Props> = ({
+  words, style, singleLine = false, motion,
+}) => {
   const frame = useCurrentFrame();
   const { fps, height, durationInFrames } = useVideoConfig();
   const s = captionScale(height);
@@ -30,20 +34,12 @@ export const HormoziCaptions: React.FC<Props> = ({ words, style, singleLine = fa
 
   if (!activeChunk) return null;
 
-  const entryFrame = Math.round(activeChunk.start * fps);
-
-  const scale = spring({
-    frame: frame - entryFrame,
-    fps,
-    config: { damping: 12, stiffness: 180, mass: 0.5 },
+  const { opacity, scale } = motionAt({
+    frame, fps,
+    start: activeChunk.start,
+    end: activeChunk.end,
+    motion: motion ?? MOTION.hormozi,
   });
-
-  const opacity = interpolate(
-    frame - entryFrame,
-    [0, 3],
-    [0, 1],
-    { extrapolateRight: "clamp" }
-  );
 
   return (
     <div
@@ -60,7 +56,7 @@ export const HormoziCaptions: React.FC<Props> = ({ words, style, singleLine = fa
     >
       <div
         style={{
-          backgroundColor: "rgba(0, 0, 0, 0.8)",
+          backgroundColor: style.background ?? "rgba(0, 0, 0, 0.8)",
           borderRadius: 16 * s,
           padding: `${14 * s}px ${32 * s}px`,
           maxWidth: `calc(100% - ${120 * s}px)`,
@@ -78,15 +74,21 @@ export const HormoziCaptions: React.FC<Props> = ({ words, style, singleLine = fa
         {activeChunk.words.map((word, i) => {
           const isActive = currentTime >= word.start && currentTime < word.end;
           const text = style.uppercase
-            ? word.word.toUpperCase()
+            ? safeUpper(word.word)
             : word.word;
+          // The word being spoken still wins: the sweep is what this style is.
+          // Emphasis colours it for the rest of the chunk, which is the part
+          // somebody reads with the sound off.
+          const emphasis = word.emphasis
+            ? style.emphasisColor ?? style.activeColor
+            : null;
 
           return (
             <React.Fragment key={i}>
               {i > 0 ? " " : ""}
               <span
                 style={{
-                  color: isActive ? style.activeColor : style.color,
+                  color: isActive ? style.activeColor : emphasis ?? style.color,
                   textShadow: isActive
                     ? `0 0 30px ${style.activeColor}60, 0 0 60px ${style.activeColor}30`
                     : "none",

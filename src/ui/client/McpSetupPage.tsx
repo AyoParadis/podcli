@@ -5,6 +5,13 @@ import CopyButton from "./CopyButton";
 
 type StatusKind = "warn" | "ok" | "err";
 
+// macOS installs live under "~/Library/Application Support/...", so the
+// server path reliably contains a space. Wrapped in single quotes (with any
+// embedded single quote escaped) it pastes safely into sh/bash/zsh.
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 const STATUS_STYLE: Record<StatusKind, React.CSSProperties> = {
   ok: { background: "var(--green-subtle)", color: "var(--green)", border: "1px solid var(--green-border)" },
   err: { background: "var(--red-subtle)", color: "var(--red)", border: "1px solid var(--red-border)" },
@@ -17,6 +24,7 @@ export default function McpSetupPage() {
   const [statusText, setStatusText] = useState("Checking…");
   const desktopRef = useRef<HTMLPreElement>(null);
   const codeRef = useRef<HTMLPreElement>(null);
+  const codexRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
     api<any>("/integration-info")
@@ -76,6 +84,21 @@ export default function McpSetupPage() {
             <CopyButton className="btn btn-ghost btn-sm" style={{ padding: "3px 10px" }} getText={() => codeRef.current?.innerText ?? ""} />
           </div>
           <pre ref={codeRef}>podcli mcp install</pre>
+        </div>
+      </div>
+
+      <div className="section">
+        <div className="section-label">Codex</div>
+        <p style={{ fontSize: 13, color: "var(--text2)", marginTop: -4 }}>
+          <code>podcli mcp install</code> registers with Codex too when the <code>codex</code> CLI is on PATH. To
+          register by hand instead:
+        </p>
+        <div className="code-block">
+          <div className="code-block-head">
+            <span>terminal</span>
+            <CopyButton className="btn btn-ghost btn-sm" style={{ padding: "3px 10px" }} getText={() => codexRef.current?.innerText ?? ""} />
+          </div>
+          <pre ref={codexRef}>{`codex mcp add podcli -- node ${shellQuote(serverPath)}`}</pre>
         </div>
       </div>
     </div>

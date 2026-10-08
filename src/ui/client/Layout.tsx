@@ -13,6 +13,7 @@ import {
   Scissors,
   Package,
   Search,
+  Video,
 } from "lucide-react";
 import CommandPalette from "./CommandPalette";
 import AccountChip from "./AccountChip";
@@ -30,6 +31,7 @@ const icons: Record<string, typeof LayoutGrid> = {
   highlights: Scissors,
   assets: Package,
   editor: Scissors,
+  multicam: Video,
 };
 
 function Icon({ name }: { name: string }) {
@@ -58,6 +60,7 @@ export default function Layout() {
         <NavLink to="/" end className="sidebar-link"><Icon name="library" /> Library</NavLink>
         <NavLink to="/episode" className="sidebar-link"><Icon name="episode" /> New episode</NavLink>
         <NavLink to="/editor" className="sidebar-link"><Icon name="editor" /> Editor</NavLink>
+        <NavLink to="/multicam" className="sidebar-link"><Icon name="multicam" /> Multicam edit</NavLink>
         <NavLink to="/content" className="sidebar-link"><Icon name="content" /> Content</NavLink>
         <NavLink to="/highlights" className="sidebar-link"><Icon name="highlights" /> Highlights</NavLink>
         <NavLink to="/thumbnails" className="sidebar-link"><Icon name="thumbnail" /> Thumbnails</NavLink>

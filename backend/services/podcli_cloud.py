@@ -111,6 +111,16 @@ def entitled() -> bool:
     return plan in PAID_PLANS
 
 
+def revoke_session() -> None:
+    """
+    End this machine's session at the server, not just on disk.
+
+    Deleting the file alone leaves the token live for its full month, so a
+    laptop signed out because it was about to be lost stays signed in.
+    """
+    request("POST", "/v1/auth/logout", {}, timeout=15)
+
+
 def clear_token() -> None:
     try:
         os.unlink(_auth_path())
@@ -176,7 +186,8 @@ def _describe(exc: urllib.error.HTTPError) -> tuple[str, bool]:
     if exc.code == 401:
         return ("podcli Pro session expired — run `podcli login` again", False)
     if exc.code == 402:
-        return ("this workspace has no active podcli Pro subscription", False)
+        # A plan's own limits (footage, cameras) say which one; a bare 402 means no plan at all.
+        return (detail or "this workspace has no active podcli Pro subscription", False)
     if exc.code == 403:
         return (detail or "your role does not allow this", False)
     if exc.code == 429:
@@ -292,6 +303,9 @@ def backfill_clips(limit: int = 200) -> tuple[int, int]:
     return synced, failed
 
 
+_PROMPT_BLOCK_CACHE: dict[str, str] = {}
+
+
 def prompt_block() -> str:
     """What this workspace has learned, phrased for the selection prompt.
 
@@ -300,15 +314,52 @@ def prompt_block() -> str:
     something that waits for every user to upgrade their CLI.
 
     Short timeout and silent on failure: better clips are the point, but not at
-    the cost of blocking a suggestion run behind a slow network.
+    the cost of blocking a suggestion run behind a slow network. Held for the
+    life of the process, keyed on the token so a workspace switch cannot serve
+    one workspace's learnings into another's prompt.
     """
-    if not signed_in():
+    token = read_token()
+    if not token:
         return ""
+    if token in _PROMPT_BLOCK_CACHE:
+        return _PROMPT_BLOCK_CACHE[token]
     try:
         payload = request("GET", "/v1/insights/prompt-block", timeout=10)
-    except CloudError:
-        return ""
-    return (payload or {}).get("block") or ""
+        block = (payload or {}).get("block") or ""
+    except Exception:
+        # Never raises: a stall gives TimeoutError and a non-JSON 200 gives
+        # JSONDecodeError, neither of them a CloudError.
+        block = ""
+    _PROMPT_BLOCK_CACHE[token] = block
+    return block
+
+
+def templates() -> list[dict]:
+    """The looks this account cuts in.
+
+    Templates are a Pro feature and they belong to the account, not to a
+    machine: signed in on a laptop, `--template "Bold cuts"` means the same
+    thing it means in the studio. The look itself is still only the flags this
+    CLI already takes, so nothing about a free, offline render changes.
+    """
+    payload = request("GET", "/v1/templates", timeout=30) or {}
+    return payload.get("templates", [])
+
+
+def find_template(name_or_id: str) -> Optional[dict]:
+    """Match on id first, then on name, case-insensitively."""
+    wanted = (name_or_id or "").strip()
+    if not wanted:
+        return None
+
+    found = templates()
+    for template in found:
+        if template.get("id") == wanted:
+            return template
+    for template in found:
+        if (template.get("name") or "").lower() == wanted.lower():
+            return template
+    return None
 
 
 def list_workspaces() -> list[dict]:
@@ -336,21 +387,43 @@ def me() -> dict:
     return request("GET", "/v1/auth/me", timeout=30)
 
 
-def login(email: str, password: str) -> dict:
-    """Exchange credentials for a session token. Does not require an existing one."""
-    data = json.dumps({"email": email, "password": password}).encode("utf-8")
+def start_cli_auth(label: str) -> dict:
+    """
+    Open a sign-in that the browser will approve.
+
+    Returns the device code the CLI keeps to itself, the short code the person
+    matches across the two screens, and the link to approve it at. No existing
+    session is needed, and no credential is taken here.
+    """
+    return _unauthenticated("POST", "/v1/auth/cli", {"label": label})
+
+
+def poll_cli_auth(device_code: str) -> Optional[dict]:
+    """
+    Ask whether the browser has approved yet.
+
+    None means keep waiting. A dict is the session, and is written to disk
+    before returning so a crash between here and the caller cannot lose the one
+    token this device code will ever mint.
+    """
+    payload = _unauthenticated("POST", "/v1/auth/cli/poll", {"deviceCode": device_code})
+    if payload.get("status") == "pending":
+        return None
+    write_token(payload["token"], payload.get("workspaceId", ""))
+    return payload
+
+
+def _unauthenticated(method: str, path: str, body: dict) -> dict:
+    """Like `request`, for the endpoints that run before there is a session."""
     req = urllib.request.Request(
-        f"{api_url()}/v1/auth/login", data=data, method="POST",
+        f"{api_url()}{path}", data=json.dumps(body).encode("utf-8"), method=method,
         headers={"content-type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail, _ = _describe(exc)
-        raise CloudError(detail, status=exc.code) from None
+        detail, retryable = _describe(exc)
+        raise CloudError(detail, status=exc.code, retryable=retryable) from None
     except urllib.error.URLError as exc:
         raise CloudError(f"could not reach {api_url()}: {exc.reason}") from None
-
-    write_token(payload["token"], payload.get("workspaceId", ""))
-    return payload

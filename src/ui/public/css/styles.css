@@ -29,6 +29,7 @@
   --blue-border: rgba(96, 165, 250, 0.22);
   --yellow: #facc15;
   --amber: #fbbf24;
+  --amber-subtle: rgba(251, 191, 36, 0.09);
   --glass-bg: rgba(22, 21, 15, 0.6);
   --glass-border: rgba(255, 255, 255, 0.07);
   --glass-hi: rgba(255, 255, 255, 0.06);
@@ -866,6 +867,16 @@ select {
 .clip-meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
 .clip-meta .err { color: var(--red); }
 .clip-meta .warn { color: var(--amber); }
+.clip-payoff {
+  font-size: 12px; color: var(--text2); line-height: 1.45; margin-top: 3px;
+  overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.clip-context {
+  font-size: 11px; color: var(--text3); line-height: 1.45; margin-top: 5px;
+  padding-left: 8px; border-left: 2px solid var(--border); overflow-wrap: anywhere;
+}
+.clip-context span { color: var(--accent-2); font-weight: 600; margin-right: 4px; }
 .clip-actions { display: flex; gap: 4px; flex-shrink: 0; }
 .clip-status { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 11px; font-weight: 700; }
 .clip-status.pending { border: 1.5px dashed var(--border); }
@@ -1340,8 +1351,8 @@ input[type="range"]::-webkit-slider-thumb {
   margin-bottom: 12px;
 }
 .clip-edit-panel .edit-field label {
-  font-size: 11px; color: var(--text2); font-weight: 600;
-  display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px;
+  font-size: 12px; color: var(--text2); font-weight: 600;
+  display: block; margin-bottom: 4px;
 }
 .clip-edit-panel .edit-field input,
 .clip-edit-panel .edit-field textarea {
@@ -2136,3 +2147,9 @@ p, li, figcaption, blockquote, .subtitle, .file-preview, .card-desc, .int-row .d
   .silence-start-row, .silence-active { align-items: stretch; flex-direction: column; }
   .silence-start-row .btn, .silence-actions .btn, .silence-actions a { justify-content: center; }
 }
+
+/* ─── Multicam ─── */
+.pill-green { background: var(--green-subtle); color: var(--green); }
+.pill-amber { background: var(--amber-subtle); color: var(--amber); }
+.pill-red { background: var(--red-subtle); color: var(--red); }
+.pill-sky { background: var(--blue-subtle); color: var(--blue); }
