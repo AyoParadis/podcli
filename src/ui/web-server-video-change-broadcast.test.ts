@@ -135,15 +135,25 @@ describe("POST /api/ui-state video change broadcast", () => {
     const { EditProjectStore } = await import("../services/edit-project-store.js");
     const videoA = join(tmp, "edited-source.mp4");
     writeFileSync(videoA, "source");
-    const activated = {
+    const activated: ReturnType<InstanceType<typeof EditProjectStore>["activate"]> = {
       project: {
+        schema_version: 1,
         id: "edited-project",
+        name: "Edited episode",
         revision: 1,
-        source: { path: videoA },
+        created_at: "2026-10-08T00:00:00Z",
+        updated_at: "2026-10-08T00:00:00Z",
+        source: {
+          path: videoA, fingerprint: "source", filename: "edited-source.mp4",
+          duration: 10, width: 320, height: 240, fps: 25, has_audio: true,
+        },
         timeline: [{ id: "part", source_start: 0, source_end: 10 }],
       },
-      transcript: { words: [] },
-    } as ReturnType<InstanceType<typeof EditProjectStore>["activate"]>;
+      transcript: {
+        transcript: "", duration: 10, language: "en", words: [], segments: [],
+        speakers: { num_speakers: 0, speakers: {} }, speaker_segments: [],
+      },
+    };
     const activate = vi.spyOn(EditProjectStore.prototype, "activate").mockReturnValue(activated);
     try {
       const response = await fetch(`http://127.0.0.1:${PORT}/api/edit-projects/edited-project/activate`, {
